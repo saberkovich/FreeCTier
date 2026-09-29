@@ -1,0 +1,56 @@
+name: Windows release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      FREECTIER_GITHUB_REPOSITORY: ${{ github.repository }}
+      FREECTIER_UPDATER_PUBLIC_KEY: ${{ vars.FREECTIER_UPDATER_PUBLIC_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client/gui/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Validate signing configuration
+        shell: pwsh
+        run: |
+          if (-not $env:TAURI_SIGNING_PRIVATE_KEY -or -not $env:FREECTIER_UPDATER_PUBLIC_KEY) { throw 'Configure updater public key variable and private key secret first.' }
+      - name: Build portable
+        run: .\build.bat --no-pause
+      - name: Check Rust
+        run: |
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --workspace --locked
+      - name: UI regression tests
+        working-directory: client/gui
+        run: npm test
+      - name: Build signed installer and update manifest
+        run: node scripts/release.mjs --signed
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FreeC-Tier-windows-x64
+          path: dist/releases/*
+      - name: Create draft release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $assets = (Get-ChildItem -LiteralPath dist/releases -File).FullName
+          gh release create "$env:GITHUB_REF_NAME" @assets --verify-tag --draft --title "FreeC Tier PREVIEW $env:GITHUB_REF_NAME" --generate-notes

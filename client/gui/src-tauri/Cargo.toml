@@ -1,0 +1,28 @@
+[package]
+name = "freec-tier"
+version.workspace = true
+edition.workspace = true
+
+# Desktop entry point has a requireAdministrator manifest and no unit tests.
+# Policy/storage tests live in freec-core; UI behavior uses Playwright.
+[[bin]]
+name = "freec-tier"
+path = "src/main.rs"
+test = false
+bench = false
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+freec-runtime = { path = "../../runtime" }
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-updater = "2"
+tauri-plugin-single-instance = "2"
+tempfile = "3"
+serde.workspace = true
+serde_json.workspace = true
