@@ -13,6 +13,14 @@ const repo = process.env.FREECTIER_GITHUB_REPOSITORY;
 if (signed && (!/^[\w.-]+\/[\w.-]+$/.test(repo || '') || !process.env.FREECTIER_UPDATER_PUBLIC_KEY || !process.env.TAURI_SIGNING_PRIVATE_KEY)) {
   throw new Error('Signed release needs FREECTIER_GITHUB_REPOSITORY, FREECTIER_UPDATER_PUBLIC_KEY and TAURI_SIGNING_PRIVATE_KEY.');
 }
+// Tauri config expects the base64 minisign public key (the `.key.pub` content).
+// Accept either that form or the decoded two-line text pasted from documentation.
+function normalizePublicKey(raw) {
+  const value = raw.trim();
+  if (!value) throw new Error('FREECTIER_UPDATER_PUBLIC_KEY is empty.');
+  if (value.includes('untrusted comment:')) return Buffer.from(value, 'utf8').toString('base64');
+  return value.replace(/\s+/g, '');
+}
 if (process.env.GITHUB_REF_TYPE === 'tag' && process.env.GITHUB_REF_NAME !== `v${version}`) throw new Error('Git tag must match package version');
 const target = path.join(root, 'target/x86_64-pc-windows-msvc/release');
 const portable = path.join(root, 'dist/FreeC-Tier-release');
@@ -34,6 +42,8 @@ const config = {
     windows: { nsis: { installMode: 'perMachine', languages: ['Russian', 'English'], displayLanguageSelector: true } },
   },
 };
+// Without a decodable pubkey Tauri aborts updater signing, so only pass it when signing.
+if (signed) config.plugins = { updater: { pubkey: normalizePublicKey(process.env.FREECTIER_UPDATER_PUBLIC_KEY) } };
 const configPath = path.join(root, '.cache/release.conf.json');
 await writeFile(configPath, JSON.stringify(config, null, 2));
 execFileSync(process.execPath, [path.join(gui, 'node_modules/@tauri-apps/cli/tauri.js'), 'build', '--target', 'x86_64-pc-windows-msvc', '--config', configPath, '--', '--locked'], { cwd: gui, stdio: 'inherit' });
