@@ -31,6 +31,7 @@ test('real state rendering is escaped and adapter action reaches IPC', async ({ 
     };
     Object.assign(window, { isTauri: true, __TAURI_INTERNALS__: { invoke: async (command: string, args: unknown) => {
       if (command === 'snapshot') { fixture.sent++; fixture.received += 2; fixture.dropped++; fixture.networks[0].revision++; return structuredClone(fixture); }
+      if (command === 'version') return '0.2.1-preview';
       if (command === 'settings') return { minimize_to_tray: true, check_updates: false };
       if (command === 'save_settings') Object.assign(window, { savedSettings: args });
       if (command === 'check_update') return { configured: false, version: null };
@@ -38,6 +39,7 @@ test('real state rendering is escaped and adapter action reaches IPC', async ({ 
     } } });
   });
   await page.goto('/');
+  await expect(page.locator('#brand-version')).toHaveText('0.2.1-preview');
   await expect(page.getByRole('heading', { name: 'Minecraft' })).toBeVisible();
   await expect(page.getByText('<script>unsafe</script>', { exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Включить', exact: true }).click();

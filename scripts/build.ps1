@@ -31,6 +31,15 @@ try {
         throw 'Node.js 20.19+ or 22.12+ is required.'
     }
 
+    # Release version comes from FREECTIER_VERSION or the git tag, falling back to
+    # package.json. It is injected through TAURI_CONFIG so the EXE reports it.
+    $version = $env:FREECTIER_VERSION
+    if (-not $version -and $env:GITHUB_REF_TYPE -eq 'tag') { $version = $env:GITHUB_REF_NAME }
+    if (-not $version) { $version = (Get-Content -Raw (Join-Path $root 'client\gui\package.json') | ConvertFrom-Json).version }
+    $version = $version -replace '^v', ''
+    if ($version -notmatch '^\d+\.\d+\.\d+([-+][\w.-]+)?$') { throw "Invalid release version '$version'. Use semver such as 0.2.1 or 0.2.1-preview." }
+    Write-Host "Version: $version"
+
     Write-Host "[1/5] Fetching locked Rust dependencies, including Steamworks SDK libraries..."
     # Use a predictable local target path, independently of user Cargo settings.
     $env:CARGO_TARGET_DIR = Join-Path $root 'target'
@@ -55,6 +64,7 @@ try {
     Invoke-Checked 'npm.cmd' @('--prefix', 'client/gui', 'run', 'build')
 
     Write-Host "[4/5] Building Windows x64 desktop and diagnostic client ($profile)..."
+    $env:TAURI_CONFIG = (@{ version = $version } | ConvertTo-Json -Compress)
     $cargoArgs = @('build', '--locked', '--target', $target, '-p', 'freec-tier', '-p', 'freec-runtime')
     if ($profile -eq 'release') { $cargoArgs += '--release' }
     Invoke-Checked 'cargo.exe' $cargoArgs

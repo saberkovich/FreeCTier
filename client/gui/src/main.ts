@@ -17,13 +17,14 @@ let updateMessage = 'Проверка обновлений выполняетс�
 let updateVersion: string | null = null;
 let updating = false;
 let busy = false;
+let appVersion = '';
 const app = document.querySelector<HTMLDivElement>('#app')!;
 app.innerHTML = `
-  <header class="topbar"><a class="brand" href="#" aria-label="FreeC Tier — мои сети"><span class="brand-mark">F</span> FreeC Tier <small>PREVIEW 0.2</small></a><div id="session" role="status"></div></header>
+  <header class="topbar"><a class="brand" href="#" aria-label="FreeC Tier — мои сети"><span class="brand-mark">F</span> FreeC Tier <small id="brand-version"></small></a><div id="session" role="status"></div></header>
   <div class="workspace"><aside class="sidebar"><div class="rail-heading"><h2>Мои сети</h2><span id="network-count">0</span></div><nav id="network-list" aria-label="Сохранённые сети"></nav>
   <button class="button primary create" id="create">＋ Создать сеть</button>
   <div class="sidebar-bottom"><button class="button subtle" id="settings">Настройки <span>⚙</span></button><p>Друзья рядом.<br />Даже из другого города.</p></div></aside>
-  <main id="content"></main></div><footer class="statusbar"><span>FreeC Tier · PREVIEW 0.2</span><span>Закрытие окна сворачивает приложение в трей</span></footer>
+  <main id="content"></main></div><footer class="statusbar"><span id="build-label">FreeC Tier</span><span>Закрытие окна сворачивает приложение в трей</span></footer>
   <div id="notice" role="status" hidden></div>
   <dialog id="create-dialog"><form id="create-form"><div class="dialog-heading"><h2>Новая сеть</h2><button class="icon-button close" type="button" aria-label="Закрыть">×</button></div><p>Пригласите друзей через Steam. Каждый получит постоянный виртуальный IP.</p><label for="network-name">Название сети</label><input id="network-name" name="name" maxlength="64" required placeholder="Например, Minecraft" autocomplete="off" /><label>Подсеть</label><div class="readonly">Автоматически <span>10.77.x.0/24</span></div><p class="helper">Выбирается свободная подсеть среди сохранённых сетей. Создание не включает адаптер.</p><div class="dialog-actions"><button type="button" class="button close">Отмена</button><button class="button primary" type="submit">Создать сеть</button></div></form></dialog>
   <dialog id="join-dialog"><form id="join-form"><div class="dialog-heading"><h2>Подключиться к сети</h2><button class="icon-button close" type="button" aria-label="Закрыть">×</button></div><p>Обычно достаточно принять приглашение в Steam. Для диагностики можно указать ID существующего lobby.</p><label for="lobby-id">Steam Lobby ID</label><input id="lobby-id" name="lobby" required inputmode="numeric" pattern="[0-9]{1,20}" placeholder="64-битный Steam Lobby ID" /><div class="dialog-actions"><button type="button" class="button close">Отмена</button><button class="button primary" type="submit">Присоединиться</button></div></form></dialog>
@@ -48,6 +49,12 @@ function escape(value: string) { return value.replace(/[&<>"']/g, c => ({ '&': '
 const labels: Record<string, string> = { connected: 'Подключён', connecting: 'Подключение…', reconnecting: 'Переподключение…', offline: 'Не в сети', local: 'Этот компьютер', removed: 'Доступ отозван' };
 function status(value: string) { return `<span class="peer-status ${escape(value)}"><i aria-hidden="true"></i>${escape(labels[value] || value)}</span>`; }
 function network() { return state.networks.find(n => n.id === selected); }
+function appLabel() { return appVersion ? `FreeC Tier ${appVersion}` : 'FreeC Tier'; }
+function setVersion(value: string) {
+  appVersion = value;
+  const brand = document.querySelector('#brand-version'); if (brand) brand.textContent = value;
+  const label = document.querySelector('#build-label'); if (label) label.textContent = appLabel();
+}
 function notice(message: string) { const el = document.querySelector<HTMLElement>('#notice')!; el.textContent = message; el.hidden = false; setTimeout(() => { el.hidden = true; }, 7000); }
 async function send(command: Command): Promise<boolean> {
   if (!isTauri()) { notice('Это браузерный просмотр. Для работы со Steam запустите desktop-клиент.'); return false; }
@@ -102,7 +109,7 @@ function updateDynamic() {
   if (log) patch(log, state.events.length ? state.events.slice().reverse().map(e => `<p>${escape(e)}</p>`).join('') : '<p>Событий пока нет.</p>');
 }
 function renderSettings() {
-  contentHTML(`<section class="network-detail" id="settings-page"><div class="detail-header"><div><h1>Настройки</h1><p>FreeC Tier · PREVIEW 0.2</p></div></div><h2>Поведение приложения</h2><label class="setting-row" for="minimize-tray"><span>Сворачивать в трей<small>При нажатии кнопки сворачивания окна</small></span><input id="minimize-tray" type="checkbox" ${preferences.minimize_to_tray ? 'checked' : ''} /></label><p class="helper">Кнопка закрытия всегда оставляет сети работать в фоне. Для завершения работы выберите «Выйти» здесь или в меню трея.</p><div class="section-heading"><h2>Обновления</h2></div><label class="setting-row" for="auto-update"><span>Проверять при запуске<small>Установка начинается только по вашему нажатию</small></span><input id="auto-update" type="checkbox" ${preferences.check_updates ? 'checked' : ''} /></label><p class="helper" id="update-message" role="status">${escape(updateMessage)}</p><div class="settings-actions"><button class="button" id="check-update" ${updating ? 'disabled' : ''}>${updating ? 'Подождите…' : 'Проверить обновления'}</button>${updateVersion ? `<button class="button primary" id="install-update" ${updating ? 'disabled' : ''}>Установить ${escape(updateVersion)}</button>` : ''}</div><div class="section-heading"><h2>Дополнительно</h2></div><div class="settings-actions"><button id="diagnostics" class="button">Диагностика</button><button id="quit" class="button">Выйти из FreeC Tier</button></div><p class="helper">Тема: тёмно-красная</p></section>`);
+  contentHTML(`<section class="network-detail" id="settings-page"><div class="detail-header"><div><h1>Настройки</h1><p>${escape(appLabel())}</p></div></div><h2>Поведение приложения</h2><label class="setting-row" for="minimize-tray"><span>Сворачивать в трей<small>При нажатии кнопки сворачивания окна</small></span><input id="minimize-tray" type="checkbox" ${preferences.minimize_to_tray ? 'checked' : ''} /></label><p class="helper">Кнопка закрытия всегда оставляет сети работать в фоне. Для завершения работы выберите «Выйти» здесь или в меню трея.</p><div class="section-heading"><h2>Обновления</h2></div><label class="setting-row" for="auto-update"><span>Проверять при запуске<small>Установка начинается только по вашему нажатию</small></span><input id="auto-update" type="checkbox" ${preferences.check_updates ? 'checked' : ''} /></label><p class="helper" id="update-message" role="status">${escape(updateMessage)}</p><div class="settings-actions"><button class="button" id="check-update" ${updating ? 'disabled' : ''}>${updating ? 'Подождите…' : 'Проверить обновления'}</button>${updateVersion ? `<button class="button primary" id="install-update" ${updating ? 'disabled' : ''}>Установить ${escape(updateVersion)}</button>` : ''}</div><div class="section-heading"><h2>Дополнительно</h2></div><div class="settings-actions"><button id="diagnostics" class="button">Диагностика</button><button id="quit" class="button">Выйти из FreeC Tier</button></div><p class="helper">Тема: тёмно-красная</p></section>`);
   document.querySelector<HTMLInputElement>('#minimize-tray')!.onchange = e => { void savePreferences({ ...preferences, minimize_to_tray: (e.target as HTMLInputElement).checked }); };
   document.querySelector<HTMLInputElement>('#auto-update')!.onchange = e => { void savePreferences({ ...preferences, check_updates: (e.target as HTMLInputElement).checked }); };
   document.querySelector<HTMLButtonElement>('#diagnostics')!.onclick = () => { page = 'diagnostics'; render(); };
@@ -179,5 +186,6 @@ async function poll() {
   setTimeout(poll, 1000);
 }
 render();
+if (isTauri()) void invoke<string>('version').then(value => { if (value) { setVersion(value); if (page === 'settings') renderSettings(); } }).catch(() => {});
 if (isTauri()) void invoke<Settings>('settings').then(result => { if (result) preferences = result; if (page === 'settings') renderSettings(); if (preferences.check_updates) void checkUpdate(); }).catch(error => notice(`Не удалось загрузить настройки: ${String(error)}`));
 void poll();

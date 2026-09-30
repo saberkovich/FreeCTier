@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const gui = path.join(root, 'client/gui');
-const version = JSON.parse(await readFile(path.join(gui, 'package.json'), 'utf8')).version;
+const packageVersion = JSON.parse(await readFile(path.join(gui, 'package.json'), 'utf8')).version;
 const signed = process.argv.includes('--signed');
 const repo = process.env.FREECTIER_GITHUB_REPOSITORY;
 if (signed && (!/^[\w.-]+\/[\w.-]+$/.test(repo || '') || !process.env.FREECTIER_UPDATER_PUBLIC_KEY || !process.env.TAURI_SIGNING_PRIVATE_KEY)) {
@@ -21,7 +21,14 @@ function normalizePublicKey(raw) {
   if (value.includes('untrusted comment:')) return Buffer.from(value, 'utf8').toString('base64');
   return value.replace(/\s+/g, '');
 }
-if (process.env.GITHUB_REF_TYPE === 'tag' && process.env.GITHUB_REF_NAME !== `v${version}`) throw new Error('Git tag must match package version');
+// Release version is taken from the tag so a pushed tag defines the build.
+// Precedence: FREECTIER_VERSION, then the git tag, then package.json.
+const tag = process.env.GITHUB_REF_TYPE === 'tag' ? process.env.GITHUB_REF_NAME : null;
+const version = (process.env.FREECTIER_VERSION || tag || packageVersion).replace(/^v/, '');
+if (!/^\d+\.\d+\.\d+([-+][\w.-]+)?$/.test(version)) throw new Error(`Invalid release version "${version}". Use semver like 0.2.1 or 0.2.1-preview.`);
+if (tag && tag.replace(/^v/, '') !== version) console.warn(`Warning: git tag "${tag}" does not match release version "${version}".`);
+const releaseTag = tag ?? `v${version}`;
+
 const target = path.join(root, 'target/x86_64-pc-windows-msvc/release');
 const portable = path.join(root, 'dist/FreeC-Tier-release');
 const output = path.join(root, 'dist/releases');
@@ -36,6 +43,7 @@ if (!icon) throw new Error('Run build.bat --no-pause first');
 const iconPath = path.join(root, '.cache/release.ico');
 await writeFile(iconPath, icon);
 const config = {
+  version,
   bundle: {
     active: true, targets: ['nsis'], createUpdaterArtifacts: signed, icon: [iconPath],
     resources: Object.fromEntries(['steam_api64.dll', 'wintun.dll', 'WINTUN-LICENSE.txt'].map(name => [path.join(portable, name), name])),
@@ -57,7 +65,7 @@ if (signed) {
   await writeFile(path.join(output, `${installer}.sig`), signature);
   await writeFile(path.join(output, 'latest.json'), JSON.stringify({
     version, notes: `FreeC Tier PREVIEW ${version}`, pub_date: new Date().toISOString(),
-    platforms: { 'windows-x86_64': { signature, url: `https://github.com/${repo}/releases/download/v${version}/${installer}` } },
+    platforms: { 'windows-x86_64': { signature, url: `https://github.com/${repo}/releases/download/${releaseTag}/${installer}` } },
   }, null, 2));
 }
 const zip = path.join(output, `FreeC-Tier_${version}_x64-portable.zip`);

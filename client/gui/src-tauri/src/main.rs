@@ -131,6 +131,10 @@ async fn install_update(state: tauri::State<'_, Desktop>) -> Result<(), String> 
 fn quit(app: tauri::AppHandle) {
     app.exit(0);
 }
+#[tauri::command]
+fn version(app: tauri::AppHandle) -> String {
+    app.package_info().version.to_string()
+}
 fn show(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.unminimize();
@@ -283,7 +287,8 @@ fn main() {
             save_settings,
             check_update,
             install_update,
-            quit
+            quit,
+            version
         ])
         .build(tauri::generate_context!())
         .expect("Cannot initialize FreeC Tier")
