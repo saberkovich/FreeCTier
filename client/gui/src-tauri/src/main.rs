@@ -131,11 +131,38 @@ async fn install_update(state: tauri::State<'_, Desktop>) -> Result<(), String> 
 }
 #[tauri::command]
 fn quit(app: tauri::AppHandle) {
-    app.exit(0);
+    quit_app(&app);
 }
 #[tauri::command]
 fn version(app: tauri::AppHandle) -> String {
     app.package_info().version.to_string()
+}
+fn shutdown(app: &tauri::AppHandle) {
+    let _ = app.state::<Handle>().send(Command::Shutdown);
+}
+/// Stop the worker so `SteamAPI_Shutdown` runs, then terminate the process
+/// directly. Returning to the event loop would end in `ExitProcess`, whose DLL
+/// unload can block on `steam_api64.dll` and leave a background process behind.
+fn quit_app(app: &tauri::AppHandle) {
+    app.state::<Handle>().shutdown();
+    force_exit();
+}
+fn force_exit() -> ! {
+    #[cfg(windows)]
+    unsafe {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetCurrentProcess() -> *mut std::ffi::c_void;
+            fn TerminateProcess(handle: *mut std::ffi::c_void, code: u32) -> i32;
+        }
+        // TerminateProcess skips DLL unload, so a hung DllMain cannot keep the app alive.
+        let _ = TerminateProcess(GetCurrentProcess(), 0);
+    }
+    // TerminateProcess normally does not return; block rather than fall back to
+    // ExitProcess if it ever does.
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
 }
 fn show(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -196,7 +223,8 @@ fn main() {
             log_path.display()
         ));
     }));
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    builder
         .plugin(tauri_plugin_single_instance::init(|app, args, _| {
             show(app);
             if let Some(pair) = args.windows(2).find(|p| p[0] == "+connect_lobby") {
@@ -211,7 +239,8 @@ fn main() {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(freec_runtime::DEFAULT_APP_ID);
-            app.manage(freec_runtime::start(None, app_id)?);
+            let root = std::env::var_os("FREECTIER_DATA_DIR").map(std::path::PathBuf::from);
+            app.manage(freec_runtime::start(root, app_id)?);
             let path = app.path().app_config_dir()?.join("settings.json");
             let settings = if path.exists() {
                 serde_json::from_slice(&std::fs::read(path)?)?
@@ -245,7 +274,7 @@ fn main() {
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "open" => show(app),
-                    "quit" => app.exit(0),
+                    "quit" => quit_app(app),
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {
@@ -296,7 +325,7 @@ fn main() {
         .expect("Cannot initialize FreeC Tier")
         .run(|app, event| {
             if matches!(event, tauri::RunEvent::Exit) {
-                let _ = app.state::<Handle>().send(Command::Shutdown);
+                shutdown(app);
             }
         });
 }

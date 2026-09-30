@@ -84,6 +84,7 @@ pub enum Command {
 pub struct Handle {
     tx: mpsc::SyncSender<Command>,
     pub snapshot: Arc<Mutex<Snapshot>>,
+    worker: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
 }
 
 impl Handle {
@@ -97,6 +98,24 @@ impl Handle {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
+    }
+    /// Stop the worker and wait for it to drop the Steam client. `steam_api64.dll`
+    /// can hang on process unload if `SteamAPI_Shutdown` has not run yet.
+    pub fn shutdown(&self) {
+        let worker = self.worker.lock().unwrap_or_else(|p| p.into_inner()).take();
+        let _ = self.tx.try_send(Command::Shutdown);
+        if let Some(join) = worker {
+            let (done_tx, done_rx) = mpsc::channel();
+            let joined = thread::Builder::new()
+                .name("freec-join".into())
+                .spawn(move || {
+                    let _ = join.join();
+                    let _ = done_tx.send(());
+                });
+            if joined.is_ok() {
+                let _ = done_rx.recv_timeout(Duration::from_secs(3));
+            }
+        }
     }
 }
 
@@ -126,13 +145,16 @@ pub fn start(root: Option<PathBuf>, app_id: u32) -> Result<Handle> {
     let handle = Handle {
         tx,
         snapshot: snapshot.clone(),
+        worker: Arc::new(Mutex::new(None)),
     };
-    thread::Builder::new()
+    let worker = handle.worker.clone();
+    let join = thread::Builder::new()
         .name("freec-steam".into())
         .spawn(move || {
             let _instance_lock = lock;
             run(root, app_id, rx, snapshot)
         })?;
+    *worker.lock().unwrap_or_else(|p| p.into_inner()) = Some(join);
     Ok(handle)
 }
 
