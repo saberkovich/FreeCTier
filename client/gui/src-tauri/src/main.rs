@@ -20,7 +20,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             minimize_to_tray: true,
-            check_updates: false,
+            check_updates: true,
         }
     }
 }

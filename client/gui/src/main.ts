@@ -12,7 +12,7 @@ let selected: string | undefined;
 let previous = '';
 let page: 'networks' | 'settings' | 'diagnostics' = 'networks';
 type Settings = { minimize_to_tray: boolean; check_updates: boolean };
-let preferences: Settings = { minimize_to_tray: true, check_updates: false };
+let preferences: Settings = { minimize_to_tray: true, check_updates: true };
 let updateMessage = 'Проверка обновлений выполняется через GitHub Releases.';
 let updateVersion: string | null = null;
 let updating = false;
