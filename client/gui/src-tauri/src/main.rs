@@ -137,6 +137,37 @@ fn quit(app: tauri::AppHandle) {
 fn version(app: tauri::AppHandle) -> String {
     app.package_info().version.to_string()
 }
+/// Steam has no API to hide the "in-game" status; the player changes it in
+/// their own account privacy settings. Open that page in the default browser.
+#[tauri::command]
+fn open_steam_privacy() {
+    #[cfg(windows)]
+    unsafe {
+        #[link(name = "shell32")]
+        extern "system" {
+            fn ShellExecuteW(
+                window: *mut std::ffi::c_void,
+                operation: *const u16,
+                file: *const u16,
+                parameters: *const u16,
+                directory: *const u16,
+                show: i32,
+            ) -> *mut std::ffi::c_void;
+        }
+        let operation: Vec<u16> = "open\0".encode_utf16().collect();
+        let url: Vec<u16> = "https://steamcommunity.com/my/edit/settings\0"
+            .encode_utf16()
+            .collect();
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            url.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+        );
+    }
+}
 fn shutdown(app: &tauri::AppHandle) {
     let _ = app.state::<Handle>().send(Command::Shutdown);
 }
@@ -319,7 +350,8 @@ fn main() {
             check_update,
             install_update,
             quit,
-            version
+            version,
+            open_steam_privacy
         ])
         .build(tauri::generate_context!())
         .expect("Cannot initialize FreeC Tier")

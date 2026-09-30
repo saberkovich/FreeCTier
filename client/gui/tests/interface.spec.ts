@@ -61,6 +61,12 @@ test('real state rendering is escaped and adapter action reaches IPC', async ({ 
   await expect(page.getByLabel('Steam Lobby ID', { exact: true })).toBeFocused();
   await page.keyboard.press('Escape');
   await page.locator('#back-settings').click();
+  await page.getByRole('button', { name: 'Скрыть статус' }).click();
+  await expect(page.getByRole('dialog')).toBeVisible();
+  await expect(page.getByText('Приватность профиля')).toBeVisible();
+  await expect(page.getByText('Скрыть игру в библиотеке')).toBeVisible();
+  await page.screenshot({ path: '../../.cache/screenshots/steam-help.png' });
+  await page.keyboard.press('Escape');
   await page.getByRole('button', { name: 'Светлая' }).click();
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'light');
   await page.getByLabel('Сворачивать в трей').uncheck();

@@ -184,6 +184,17 @@ dialog input::placeholder { color: var(--faint); }
 .friend-choice:hover { color: var(--accent); }
 .friend-choice span:last-child { color: var(--accent); font-size: 12px; }
 
+dialog#steam-help-dialog { width: min(620px, calc(100vw - 40px)); }
+.steam-help-note { margin-top: 12px; }
+.steam-help { display: grid; gap: 12px; max-height: 62vh; overflow-y: auto; margin-top: 14px; padding-right: 4px; }
+.step { display: grid; grid-template-columns: 26px 1fr; gap: 12px; align-items: start; padding: 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-2); }
+.step-num { width: 26px; height: 26px; display: grid; place-items: center; border-radius: 50%; background: var(--accent); color: #fff; font-size: 12px; font-weight: 700; }
+.step-body h3 { margin: 0 0 6px; font-size: 14px; }
+.step-body p { margin: 0 0 10px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.step-shot { display: block; width: 100%; border: 1px solid var(--line); border-radius: 10px; }
+.step-shot.missing { display: none; }
+.step-body .button { margin-top: 10px; }
+
 @media (max-width: 760px) {
   .workspace { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); }
   .sidebar { border-right: 0; border-bottom: 1px solid var(--line); overflow: visible; }
