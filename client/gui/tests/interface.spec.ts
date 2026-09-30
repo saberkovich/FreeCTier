@@ -2,10 +2,10 @@ import { test, expect } from '@playwright/test';
 
 test('first run, keyboard create flow, browser fallback and responsive layout', async ({ page }) => {
   await page.goto('/');
-  await expect(page.getByText('Ожидание Steam')).toBeVisible();
+  await expect(page.getByText('Steam не запущен')).toBeVisible();
   await page.getByRole('button', { name: 'Создать первую сеть' }).click();
   await expect(page.getByRole('dialog')).toBeVisible();
-  await page.getByLabel('Название сети').fill('Minecraft');
+  await page.getByLabel('Название').fill('Minecraft');
   await page.getByRole('dialog').getByRole('button', { name: 'Создать сеть' }).click();
   await expect(page.getByText('Это браузерный просмотр.', { exact: false })).toBeVisible();
   await page.keyboard.press('Escape');
@@ -32,7 +32,7 @@ test('real state rendering is escaped and adapter action reaches IPC', async ({ 
     Object.assign(window, { isTauri: true, __TAURI_INTERNALS__: { invoke: async (command: string, args: unknown) => {
       if (command === 'snapshot') { fixture.sent++; fixture.received += 2; fixture.dropped++; fixture.networks[0].revision++; return structuredClone(fixture); }
       if (command === 'version') return '0.2.1-preview';
-      if (command === 'settings') return { minimize_to_tray: true, check_updates: false };
+      if (command === 'settings') return { minimize_to_tray: true, check_updates: false, theme: 'dark' };
       if (command === 'save_settings') Object.assign(window, { savedSettings: args });
       if (command === 'check_update') return { configured: false, version: null };
       if (command === 'dispatch') Object.assign(window, { lastCommand: args });
@@ -61,10 +61,12 @@ test('real state rendering is escaped and adapter action reaches IPC', async ({ 
   await expect(page.getByLabel('Steam Lobby ID', { exact: true })).toBeFocused();
   await page.keyboard.press('Escape');
   await page.locator('#back-settings').click();
+  await page.getByRole('button', { name: 'Светлая' }).click();
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'light');
   await page.getByLabel('Сворачивать в трей').uncheck();
   await expect(page.getByLabel('Сворачивать в трей')).not.toBeChecked();
-  expect(await page.evaluate(() => (window as unknown as {savedSettings: unknown}).savedSettings)).toEqual({ settings: { minimize_to_tray: false, check_updates: false } });
-  await page.getByRole('button', { name: 'Проверить обновления' }).click();
+  expect(await page.evaluate(() => (window as unknown as {savedSettings: unknown}).savedSettings)).toEqual({ settings: { minimize_to_tray: false, check_updates: false, theme: 'light' } });
+  await page.getByRole('button', { name: 'Проверить', exact: true }).click();
   await expect(page.locator('#update-message')).toContainText('Обновления не настроены');
   await page.screenshot({ path: '../../.cache/screenshots/settings.png', fullPage: true });
   await page.getByRole('link', { name: 'FreeC Tier — мои сети' }).click();

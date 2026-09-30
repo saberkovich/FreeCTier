@@ -15,12 +15,14 @@ use tauri_plugin_updater::UpdaterExt;
 struct Settings {
     minimize_to_tray: bool,
     check_updates: bool,
+    theme: String,
 }
 impl Default for Settings {
     fn default() -> Self {
         Self {
             minimize_to_tray: true,
             check_updates: true,
+            theme: "dark".into(),
         }
     }
 }
