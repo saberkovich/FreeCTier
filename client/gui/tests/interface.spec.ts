@@ -107,6 +107,12 @@ test('first run, keyboard create flow, browser fallback and responsive layout', 
   await page.getByRole('button', { name: 'Диагностика' }).click();
   await expect(page.getByRole('heading', { name: 'Диагностика' })).toBeVisible();
   await expect(page.getByText('Браузерный просмотр — Steam недоступен')).toBeVisible();
+  // Browser preview keeps the normal context menu.
+  expect(await page.evaluate(() => {
+    const event = new MouseEvent('contextmenu', { cancelable: true });
+    document.dispatchEvent(event);
+    return event.defaultPrevented;
+  })).toBe(false);
 });
 
 test('real state rendering is escaped and adapter action reaches IPC', async ({ page }) => {
@@ -136,6 +142,12 @@ test('real state rendering is escaped and adapter action reaches IPC', async ({ 
   await page.goto('/');
   await expect(page.locator('#brand-version')).toHaveText('0.2.1-preview');
   await expect(page.getByRole('heading', { name: 'Minecraft' })).toBeVisible();
+  // The desktop webview must not show its default right-click menu.
+  expect(await page.evaluate(() => {
+    const event = new MouseEvent('contextmenu', { cancelable: true });
+    document.dispatchEvent(event);
+    return event.defaultPrevented;
+  })).toBe(true);
   await expect(page.getByText('<script>unsafe</script>', { exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Включить', exact: true }).click();
   expect(await page.evaluate(() => (window as unknown as {lastCommand: unknown}).lastCommand)).toEqual({ command: { type: 'set_adapter', network: '67ae3f2d-0734-47f8-bf1b-e5e2bc64a289', enabled: true } });

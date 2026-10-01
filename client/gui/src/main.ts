@@ -270,6 +270,9 @@ async function poll() {
 }
 applyTheme(preferences.theme);
 render();
+// The webview's default context menu (back/reload/print/view source) has no
+// place in this utility; right click stays inert until custom actions exist.
+if (isTauri()) document.addEventListener('contextmenu', e => e.preventDefault());
 if (isTauri()) void invoke<string>('version').then(value => { if (value) { setVersion(value); if (page === 'settings') renderSettings(); } }).catch(() => {});
 if (isTauri()) void invoke<Settings>('settings').then(result => { if (result) { preferences = result; applyTheme(preferences.theme); } if (page === 'settings') renderSettings(); if (preferences.check_updates) void checkUpdate(); }).catch(error => notice(`Не удалось загрузить настройки: ${String(error)}`));
 void poll();
