@@ -7,6 +7,11 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  # Re-pushing a tag supersedes the previous run instead of racing it.
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   windows:
     runs-on: windows-latest
@@ -17,6 +22,10 @@ jobs:
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
+      - name: Validate signing configuration
+        shell: pwsh
+        run: |
+          if (-not $env:TAURI_SIGNING_PRIVATE_KEY -or -not $env:FREECTIER_UPDATER_PUBLIC_KEY) { throw 'Configure updater public key variable and private key secret first.' }
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -25,12 +34,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: Validate signing configuration
-        shell: pwsh
+      # Rust has no cache by default: without this every run recompiles the
+      # whole dependency tree (Tauri, Steamworks) from scratch.
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-all-targets: true
+      - name: Prepare frontend
         run: |
-          if (-not $env:TAURI_SIGNING_PRIVATE_KEY -or -not $env:FREECTIER_UPDATER_PUBLIC_KEY) { throw 'Configure updater public key variable and private key secret first.' }
-      - name: Build portable
-        run: .\build.bat --no-pause
+          npm --prefix client/gui ci --no-audit --no-fund
+          npm --prefix client/gui run build
+      # Cheap checks gate the expensive release build. clippy/test build the
+      # debug profile once and share it, and the release build below reuses the
+      # cached registry/index from this step.
       - name: Check Rust
         run: |
           cargo fmt --all -- --check
@@ -41,6 +57,8 @@ jobs:
       - name: UI regression tests
         working-directory: client/gui
         run: npm test
+      - name: Build portable
+        run: .\build.bat --no-pause
       - name: Build signed installer and update manifest
         run: node scripts/release.mjs --signed
       - uses: actions/upload-artifact@v4
