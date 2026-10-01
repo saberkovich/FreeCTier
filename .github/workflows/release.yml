@@ -2,10 +2,6 @@ name: Windows release
 on:
   push:
     tags: ['v*']
-    # Main pushes keep the Rust cache warm: Actions scopes caches to the ref
-    # they were saved on, and only default-branch caches are visible to tag
-    # runs. Without this every release tag would compile from scratch.
-    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -39,12 +35,16 @@ jobs:
         with:
           components: rustfmt, clippy
       # Rust has no cache by default: without this every run recompiles the
-      # whole dependency tree (Tauri, Steamworks) from scratch. Failure runs
-      # still save the cache so the next attempt starts warm.
+      # whole dependency tree (Tauri, Steamworks) from scratch. The shared key
+      # matches the "Rust cache" workflow that warms it on the default branch;
+      # tag runs restore that cache but never save — a cache saved on a tag ref
+      # is invisible to every other tag.
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
-          cache-on-failure: true
+          shared-key: freectier
+          add-job-id-key: false
+          save-if: 'false'
       - name: Prepare frontend
         run: |
           npm --prefix client/gui ci --no-audit --no-fund

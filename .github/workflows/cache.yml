@@ -1,0 +1,51 @@
+name: Rust cache
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  # Weekly refresh also covers the 7-day eviction of untouched caches during
+  # quiet weeks without commits.
+  schedule:
+    - cron: '0 4 * * 0'
+
+permissions:
+  contents: read
+
+concurrency:
+  # Rapid commits supersede each other: only the latest key state matters.
+  group: rust-cache-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  warm:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client/gui/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      # The cache key is content-based (Cargo.lock, rustc, Cargo.toml): when
+      # dependencies did not change, the restore is a hit and the build steps
+      # below are near no-ops; when they did, this job recompiles once and
+      # saves the new cache on the default branch, where release tag runs can
+      # restore it. add-job-id-key must stay false in both workflows so their
+      # keys match.
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: freectier
+          add-job-id-key: false
+          cache-on-failure: true
+      - name: Prepare frontend
+        run: |
+          npm --prefix client/gui ci --no-audit --no-fund
+          npm --prefix client/gui run build
+      - name: Warm debug artifacts
+        run: cargo clippy --workspace --all-targets --locked
+      - name: Warm release artifacts
+        run: cargo build --release --locked -p freec-tier -p freec-runtime
