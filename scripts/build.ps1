@@ -72,7 +72,7 @@ try {
     Write-Host '[5/5] Assembling launch folder...'
     $destination = Join-Path $root "dist\FreeC-Tier-$profile"
     New-Item -ItemType Directory -Force -Path $destination | Out-Null
-    foreach ($file in @('freec-tier.exe', 'freec-runtime.exe', 'steam_api64.dll', 'wintun.dll', 'WINTUN-LICENSE.txt')) {
+    foreach ($file in @('freec-tier.exe', 'freec-runtime.exe', 'steam_api64.dll', 'wintun.dll', 'WINTUN-LICENSE.txt', 'MicrosoftEdgeWebview2Setup.exe')) {
         Copy-Item -LiteralPath (Join-Path $nativeOutput $file) -Destination $destination -Force
     }
     Copy-Item -LiteralPath (Join-Path $root 'README.md') -Destination $destination -Force

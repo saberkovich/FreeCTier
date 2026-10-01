@@ -46,7 +46,16 @@ const config = {
   bundle: {
     active: true, targets: ['nsis'], createUpdaterArtifacts: signed, icon: [iconPath],
     resources: Object.fromEntries(['steam_api64.dll', 'wintun.dll', 'WINTUN-LICENSE.txt'].map(name => [path.join(portable, name), name])),
-    windows: { nsis: { installMode: 'perMachine', languages: ['Russian', 'English'], displayLanguageSelector: true } },
+    windows: {
+      nsis: {
+        installMode: 'perMachine',
+        languages: ['Russian', 'English'],
+        displayLanguageSelector: true,
+        // The installer carries the WebView2 bootstrapper and installs the
+        // runtime automatically when the machine lacks it.
+        webviewInstallMode: { type: 'embedBootstrapper' },
+      },
+    },
   },
 };
 // Without a decodable pubkey Tauri aborts updater signing, so only pass it when signing.

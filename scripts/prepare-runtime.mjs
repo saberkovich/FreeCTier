@@ -47,4 +47,40 @@ await writeFile(zip, bytes);
 execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'Expand-Archive -LiteralPath $env:FCT_ZIP -DestinationPath $env:FCT_EXTRACT -Force'], { env: { ...process.env, FCT_ZIP: zip, FCT_EXTRACT: cache }, stdio: 'inherit' });
 await copyFile(path.join(cache, 'wintun', 'bin', 'amd64', 'wintun.dll'), path.join(output, 'wintun.dll'));
 await copyFile(path.join(cache, 'wintun', 'LICENSE.txt'), path.join(output, 'WINTUN-LICENSE.txt'));
+
+// The portable build carries the WebView2 Evergreen bootstrapper so a trimmed
+// Windows can install the missing runtime in one click at first launch; the
+// NSIS installer embeds its own copy. Microsoft re-signs the file over time,
+// so Authenticode verification replaces the hash pinning used for Wintun.
+const bootstrapperUrl = 'https://go.microsoft.com/fwlink/p/?LinkId=2124703';
+const bootstrapperCache = path.join(root, '.cache', 'webview2');
+await mkdir(bootstrapperCache, { recursive: true });
+const bootstrapperFile = path.join(bootstrapperCache, 'MicrosoftEdgeWebview2Setup.exe');
+let bootstrapper;
+try {
+  bootstrapper = await readFile(bootstrapperFile);
+} catch (error) {
+  if (error.code !== 'ENOENT') throw error;
+  console.log(`Downloading WebView2 bootstrapper from ${bootstrapperUrl}`);
+  try {
+    const response = await fetch(bootstrapperUrl, { signal: AbortSignal.timeout(45000) });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    bootstrapper = Buffer.from(await response.arrayBuffer());
+  } catch (fetchError) {
+    console.log(`Node download failed (${fetchError.message}); retrying with Windows curl...`);
+    try {
+      bootstrapper = execFileSync('curl.exe', ['--fail', '--location', '--silent', '--show-error', '--proto', '=https', '--proto-redir', '=https', '--connect-timeout', '20', '--max-time', '120', '--retry', '2', '--retry-max-time', '240', bootstrapperUrl], { timeout: 300000, maxBuffer: 16 * 1024 * 1024 });
+    } catch (downloadError) {
+      throw new Error(`Cannot download the WebView2 bootstrapper. Download it manually from ${bootstrapperUrl} to ${bootstrapperFile} and rerun the build. ${downloadError.message}`);
+    }
+  }
+}
+await writeFile(bootstrapperFile, bootstrapper);
+const signature = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `
+$s = Get-AuthenticodeSignature -LiteralPath $env:FCT_BOOTSTRAP
+if ($s.Status -ne 'Valid' -or $s.SignerCertificate.Subject -notlike '*Microsoft Corporation*') {
+  throw "Untrusted WebView2 bootstrapper: $($s.Status) / $($s.SignerCertificate.Subject)"
+}`], { env: { ...process.env, FCT_BOOTSTRAP: bootstrapperFile }, stdio: 'pipe' });
+await copyFile(bootstrapperFile, path.join(output, 'MicrosoftEdgeWebview2Setup.exe'));
+console.log(`WebView2 bootstrapper staged in ${output} (signed by Microsoft)`);
 console.log(`Native libraries staged in ${output}`);

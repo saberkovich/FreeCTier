@@ -137,40 +137,44 @@ fn quit(app: tauri::AppHandle) {
 fn version(app: tauri::AppHandle) -> String {
     app.package_info().version.to_string()
 }
+/// Open a URL or file path in the default handler. ShellExecuteW returns a
+/// value greater than 32 on success.
+#[cfg(windows)]
+fn open_url(target: &str) -> Result<(), String> {
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn ShellExecuteW(
+            window: *mut std::ffi::c_void,
+            operation: *const u16,
+            file: *const u16,
+            parameters: *const u16,
+            directory: *const u16,
+            show: i32,
+        ) -> *mut std::ffi::c_void;
+    }
+    let operation: Vec<u16> = "open\0".encode_utf16().collect();
+    let file: Vec<u16> = format!("{target}\0").encode_utf16().collect();
+    let launched = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+        )
+    };
+    if launched as usize <= 32 {
+        return Err(format!("Не удалось открыть: {target}"));
+    }
+    Ok(())
+}
 /// Steam has no API to hide the "in-game" status; the player changes it in
 /// their own account privacy settings. Open that page in the default browser.
 #[tauri::command]
 fn open_steam_privacy() -> Result<(), String> {
     #[cfg(windows)]
-    unsafe {
-        #[link(name = "shell32")]
-        extern "system" {
-            fn ShellExecuteW(
-                window: *mut std::ffi::c_void,
-                operation: *const u16,
-                file: *const u16,
-                parameters: *const u16,
-                directory: *const u16,
-                show: i32,
-            ) -> *mut std::ffi::c_void;
-        }
-        let operation: Vec<u16> = "open\0".encode_utf16().collect();
-        let url: Vec<u16> = "https://steamcommunity.com/my/edit/settings\0"
-            .encode_utf16()
-            .collect();
-        // ShellExecuteW returns a value greater than 32 on success.
-        let launched = ShellExecuteW(
-            std::ptr::null_mut(),
-            operation.as_ptr(),
-            url.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-            1,
-        );
-        if launched as usize <= 32 {
-            return Err("Не удалось открыть настройки приватности Steam".into());
-        }
-    }
+    open_url("https://steamcommunity.com/my/edit/settings")?;
     Ok(())
 }
 fn shutdown(app: &tauri::AppHandle) {
@@ -230,7 +234,71 @@ fn show_startup_error(message: &str) {
     }
 }
 
+/// The UI renders through Microsoft's WebView2 runtime — stock Windows 10
+/// (2004+) and 11 ship it, but LTSC and trimmed builds often strip it. Left
+/// alone, Tauri only shows its own English dialog and exits, so check first
+/// and offer a guided install from the bootstrapper staged beside the exe.
+#[cfg(windows)]
+fn ensure_webview2() {
+    if tauri::webview_version().is_ok() {
+        return;
+    }
+    let bootstrapper = std::env::current_exe()
+        .ok()
+        .and_then(|exe| {
+            exe.parent()
+                .map(|dir| dir.join("MicrosoftEdgeWebview2Setup.exe"))
+        })
+        .filter(|path| path.is_file());
+    if let Some(path) = bootstrapper {
+        let question: Vec<u16> = "Для интерфейса FreeC Tier нужен компонент Microsoft WebView2 Runtime — в обычных Windows 10/11 он уже есть, но на этой системе его не нашлось.\n\nУстановить его сейчас? Понадобится интернет (около 2 МБ).".encode_utf16().chain(Some(0)).collect();
+        let caption: Vec<u16> = "FreeC Tier — установка WebView2"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn MessageBoxW(
+                window: *mut std::ffi::c_void,
+                text: *const u16,
+                caption: *const u16,
+                flags: u32,
+            ) -> i32;
+        }
+        // MB_YESNO | MB_ICONQUESTION; IDYES == 6.
+        let confirmed = unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                question.as_ptr(),
+                caption.as_ptr(),
+                0x24,
+            ) == 6
+        };
+        if confirmed {
+            use std::os::windows::process::CommandExt;
+            // The Evergreen bootstrapper downloads and installs the runtime;
+            // /silent /install runs it without UI. We are already elevated.
+            let installed = std::process::Command::new(&path)
+                .args(["/silent", "/install"])
+                .creation_flags(0x0800_0000)
+                .status()
+                .is_ok_and(|status| status.success())
+                && tauri::webview_version().is_ok();
+            if installed {
+                return;
+            }
+        }
+    }
+    show_startup_error(
+        "Не удалось установить WebView2 Runtime.\n\nУстановите его вручную с официальной страницы Microsoft и запустите FreeC Tier снова. Сейчас страница загрузки откроется.",
+    );
+    let _ = open_url("https://developer.microsoft.com/microsoft-edge/webview2/");
+    force_exit();
+}
+
 fn main() {
+    #[cfg(windows)]
+    ensure_webview2();
     // Release builds have no console: retain startup panics for diagnosis.
     let log_path = std::env::var_os("APPDATA")
         .map(std::path::PathBuf::from)
