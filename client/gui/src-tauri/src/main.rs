@@ -15,6 +15,7 @@ use tauri_plugin_updater::UpdaterExt;
 struct Settings {
     minimize_to_tray: bool,
     check_updates: bool,
+    skip_uac: bool,
     autostart: bool,
     theme: String,
 }
@@ -23,6 +24,7 @@ impl Default for Settings {
         Self {
             minimize_to_tray: true,
             check_updates: true,
+            skip_uac: false,
             autostart: false,
             theme: "dark".into(),
         }
@@ -171,48 +173,71 @@ fn open_url(target: &str) -> Result<(), String> {
     }
     Ok(())
 }
-/// Autostart uses Task Scheduler instead of the Run registry key: the app
-/// manifest requires administrator, and a scheduled task with highest
-/// privileges starts at logon without a UAC prompt every time.
-#[tauri::command]
-fn set_autostart(enabled: bool) -> Result<(), String> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        let run = |args: &[&str]| -> Result<bool, String> {
-            std::process::Command::new("schtasks.exe")
-                .args(args)
-                .creation_flags(0x0800_0000)
-                .output()
-                .map(|output| output.status.success())
-                .map_err(|e| e.to_string())
-        };
-        if enabled {
-            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-            let task = format!("\"{}\"", exe.display());
-            if !run(&[
-                "/Create",
-                "/F",
-                "/TN",
-                "FreeC Tier",
-                "/TR",
-                &task,
-                "/SC",
-                "ONLOGON",
-                "/RL",
-                "HIGHEST",
-            ])? {
-                return Err("Не удалось создать задачу автозапуска".into());
-            }
-        } else if !run(&["/Delete", "/TN", "FreeC Tier", "/F"])?
-            && run(&["/Query", "/TN", "FreeC Tier"])?
-        {
-            // Delete failed and the task still exists — report it. A missing
-            // task is already the disabled state the user asked for.
-            return Err("Не удалось отключить автозапуск".into());
-        }
+/// The app manifest requires administrator, so every direct launch raises a
+/// UAC prompt. An elevated scheduled task starts without one: the skip-UAC
+/// setting registers the task for manual starts, and autostart adds a logon
+/// trigger to the same task. Battery and time-limit defaults are overridden —
+/// otherwise the system would not start the task on battery and would kill the
+/// long-running process after 72 hours.
+#[cfg(windows)]
+fn apply_task(elevated_task: bool, start_at_logon: bool) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+$name = 'FreeC Tier'
+$existing = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+if ($env:FCT_TASK -eq '0') {
+  if ($existing) { Unregister-ScheduledTask -TaskName $name -Confirm:$false }
+  exit 0
+}
+$action = New-ScheduledTaskAction -Execute $env:FCT_EXE
+$principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Highest
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
+if ($env:FCT_LOGON -eq '1') {
+  Register-ScheduledTask -TaskName $name -Action $action -Principal $principal -Settings $settings -Trigger (New-ScheduledTaskTrigger -AtLogOn) -Force | Out-Null
+} else {
+  Register-ScheduledTask -TaskName $name -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+}"#;
+    let status = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .creation_flags(0x0800_0000)
+        .env("FCT_TASK", if elevated_task { "1" } else { "0" })
+        .env("FCT_LOGON", if start_at_logon { "1" } else { "0" })
+        .env("FCT_EXE", &exe)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !status.status.success() {
+        let output = String::from_utf8_lossy(&status.stderr);
+        return Err(format!(
+            "Не удалось обновить задачу планировщика: {}",
+            output.trim()
+        ));
     }
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn apply_task(_elevated_task: bool, _start_at_logon: bool) -> Result<(), String> {
+    Ok(())
+}
+
+#[tauri::command]
+fn set_skip_uac(state: tauri::State<'_, Desktop>, enabled: bool) -> Result<(), String> {
+    let autostart = state.settings.lock().unwrap().autostart;
+    if !enabled && autostart {
+        return Err("Сначала отключите автозапуск".into());
+    }
+    apply_task(enabled || autostart, autostart)
+}
+
+#[tauri::command]
+fn set_autostart(state: tauri::State<'_, Desktop>, enabled: bool) -> Result<(), String> {
+    if enabled && !state.settings.lock().unwrap().skip_uac {
+        return Err("Сначала включите пропуск предупреждения User Account Control".into());
+    }
+    let skip_uac = enabled || state.settings.lock().unwrap().skip_uac;
+    apply_task(skip_uac, enabled)
 }
 fn shutdown(app: &tauri::AppHandle) {
     let _ = app.state::<Handle>().send(Command::Shutdown);
@@ -457,6 +482,7 @@ fn main() {
             dispatch,
             settings,
             save_settings,
+            set_skip_uac,
             set_autostart,
             check_update,
             install_update,
