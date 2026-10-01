@@ -22,6 +22,8 @@ fn main() -> Result<()> {
                 "status" => println!("{}", serde_json::to_string_pretty(&handle.snapshot())?),
                 "create" => handle.send(Command::Create {
                     name: value.to_owned(),
+                    public: false,
+                    password: String::new(),
                 })?,
                 "invite" => handle.send(Command::Invite {
                     network: value.parse()?,

@@ -6,7 +6,8 @@ pub const DEFAULT_APP_ID: u32 = 324810;
 use anyhow::{ensure, Context, Result};
 use ed25519_dalek::SigningKey;
 use freec_core::{
-    config::{Network, SignedNetwork},
+    admission::{self, Password},
+    config::{Access, Network, Operation, SignedNetwork},
     packet::Packet,
     storage::Store,
     wire::{Frame, Kind},
@@ -36,6 +37,28 @@ pub struct Snapshot {
     pub received: u64,
     pub sent: u64,
     pub dropped: u64,
+    pub joins: Vec<JoinView>,
+    pub public_networks: Vec<PublicView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct JoinView {
+    pub id: String,
+    pub name: String,
+    pub password: bool,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct PublicView {
+    pub lobby: String,
+    pub name: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JoinRequest {
+    public_key: String,
+    snapshot: String,
+    proof: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -52,6 +75,12 @@ pub struct PeerView {
     pub active: bool,
     pub state: String,
     pub ping_ms: Option<i32>,
+    /// Stored member preference, including while the network is private.
+    pub can_invite: bool,
+    /// Effective permission after applying access mode and active membership.
+    pub may_invite: bool,
+    pub can_kick: bool,
+    pub may_kick: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -63,20 +92,73 @@ pub struct NetworkView {
     pub revision: u64,
     pub adapter: bool,
     pub lobby: Option<String>,
+    /// True when access is public.
+    pub public: bool,
+    /// Whether the local client may invite for this network.
+    pub can_invite: bool,
+    pub password: bool,
     pub members: Vec<PeerView>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
-    Create { name: String },
-    Invite { network: Uuid },
-    InviteFriend { network: Uuid, steam_id: String },
-    Join { lobby: String },
-    SetAdapter { network: Uuid, enabled: bool },
-    Revoke { network: Uuid, steam_id: String },
-    Readmit { network: Uuid, steam_id: String },
-    Delete { network: Uuid },
+    Create {
+        name: String,
+        #[serde(default)]
+        public: bool,
+        #[serde(default)]
+        password: String,
+    },
+    Invite {
+        network: Uuid,
+    },
+    InviteFriend {
+        network: Uuid,
+        steam_id: String,
+    },
+    Join {
+        lobby: String,
+    },
+    SetAdapter {
+        network: Uuid,
+        enabled: bool,
+    },
+    Revoke {
+        network: Uuid,
+        steam_id: String,
+    },
+    Readmit {
+        network: Uuid,
+        steam_id: String,
+    },
+    SetAccess {
+        network: Uuid,
+        public: bool,
+    },
+    SetMemberInvite {
+        network: Uuid,
+        steam_id: String,
+        can_invite: bool,
+    },
+    SetPermissions {
+        network: Uuid,
+        steam_id: String,
+        can_invite: bool,
+        can_kick: bool,
+    },
+    SetPassword {
+        network: Uuid,
+        password: String,
+    },
+    SubmitPassword {
+        network: Uuid,
+        password: String,
+    },
+    Discover,
+    Delete {
+        network: Uuid,
+    },
     Shutdown,
 }
 
@@ -162,6 +244,8 @@ enum Event {
     Created(Uuid, std::result::Result<LobbyId, String>),
     JoinRequested(LobbyId),
     Joined(std::result::Result<LobbyId, String>),
+    Found(std::result::Result<Vec<LobbyId>, String>),
+    Published(Uuid, std::result::Result<LobbyId, String>),
 }
 
 struct Engine {
@@ -185,6 +269,18 @@ struct Engine {
     last_view: Instant,
     restore: Vec<Uuid>,
     refresh_configs: Instant,
+    /// Rate limit for forwarding admit requests to the owner, keyed by invitee.
+    requested: BTreeMap<(Uuid, u64), Instant>,
+    offers: BTreeMap<Uuid, (u64, SignedNetwork)>,
+    pins: BTreeMap<Uuid, String>,
+    public_networks: Vec<PublicView>,
+    last_hello: Instant,
+    published: BTreeMap<Uuid, LobbyId>,
+    publishing: Option<Uuid>,
+    publish_retry: Instant,
+    join_sent: BTreeMap<Uuid, (String, Instant)>,
+    grace: BTreeMap<u64, Instant>,
+    guests: BTreeMap<(Uuid, u64), Instant>,
 }
 
 impl Engine {
@@ -194,11 +290,23 @@ impl Engine {
         let local = client.user().steam_id().raw().to_string();
         let store = Store::new(root.join("accounts").join(&local))?;
         let key = store.owner_key()?;
-        let networks = store
+        let mut networks: BTreeMap<_, _> = store
             .load()?
             .into_iter()
             .map(|n| (n.network.id, n))
             .collect();
+        for signed in networks.values_mut() {
+            if signed.network.owner == local {
+                let mut next = signed.network.clone();
+                if signed.delegation.is_some() {
+                    next.revision += 1;
+                }
+                next.upgrade(&local)?;
+                next.bind_key(&local, &local, hex::encode(key.verifying_key().as_bytes()))?;
+                *signed = SignedNetwork::sign(next, &key)?;
+                store.save(signed)?;
+            }
+        }
         let restore = store.load_enabled()?;
         let transport = steam::Transport::new(&client)?;
         let (tx, rx) = mpsc::channel();
@@ -226,6 +334,17 @@ impl Engine {
             last_view: Instant::now() - Duration::from_secs(1),
             restore,
             refresh_configs: Instant::now(),
+            requested: BTreeMap::new(),
+            offers: BTreeMap::new(),
+            pins: BTreeMap::new(),
+            public_networks: Vec::new(),
+            last_hello: Instant::now() - Duration::from_secs(10),
+            published: BTreeMap::new(),
+            publishing: None,
+            publish_retry: Instant::now() - Duration::from_secs(30),
+            join_sent: BTreeMap::new(),
+            grace: BTreeMap::new(),
+            guests: BTreeMap::new(),
         })
     }
 
@@ -238,9 +357,87 @@ impl Engine {
         });
     }
 
+    fn admission_lobby(&self, id: Uuid) -> Option<LobbyId> {
+        self.published.get(&id).copied().or_else(|| {
+            self.lobby
+                .filter(|(network, _)| *network == id)
+                .map(|(_, lobby)| lobby)
+        })
+    }
+
+    fn applicant_in_lobby(&self, id: Uuid, peer: u64) -> bool {
+        if self
+            .guests
+            .get(&(id, peer))
+            .is_some_and(|time| time.elapsed() < Duration::from_secs(20))
+        {
+            return true;
+        }
+        self.admission_lobby(id).is_some_and(|lobby| {
+            self.client
+                .matchmaking()
+                .lobby_members(lobby)
+                .iter()
+                .any(|m| m.raw() == peer)
+        })
+    }
+
+    fn publish_metadata(&self, id: Uuid, lobby: LobbyId) -> Result<()> {
+        let config = &self.networks.get(&id).context("Unknown network")?.network;
+        let mm = self.client.matchmaking();
+        ensure!(
+            mm.set_lobby_data(lobby, "freectier_protocol", "2")
+                && mm.set_lobby_data(lobby, "freectier_network", &id.to_string())
+                && mm.set_lobby_data(lobby, "freectier_owner", &config.owner)
+                && mm.set_lobby_data(lobby, "freectier_key", &config.owner_key)
+                && mm.set_lobby_data(
+                    lobby,
+                    "freectier_public",
+                    if config.access == Access::Public {
+                        "1"
+                    } else {
+                        "0"
+                    }
+                )
+                && mm.set_lobby_data(lobby, "name", &config.name),
+            "Cannot publish network"
+        );
+        Ok(())
+    }
+
+    fn save_network(&mut self, signed: SignedNetwork) -> Result<()> {
+        self.store.save(&signed)?;
+        let id = signed.network.id;
+        if let Some(previous) = self.networks.get(&id) {
+            for member in previous
+                .network
+                .members
+                .iter()
+                .filter(|m| m.active && signed.network.member(&m.steam_id).is_none())
+            {
+                let peer = member.steam_id.parse()?;
+                self.grace.insert(peer, Instant::now());
+                let _ = self.transport.send(
+                    peer,
+                    &Frame::encode(Kind::Config, id, &serde_json::to_vec(&signed)?)?,
+                    true,
+                );
+            }
+        }
+        if signed.network.member(&self.local).is_none() {
+            self.adapters.remove(&id);
+        }
+        self.networks.insert(id, signed);
+        Ok(())
+    }
+
     fn command(&mut self, command: Command) -> Result<()> {
         match command {
-            Command::Create { name } => {
+            Command::Create {
+                name,
+                public,
+                password,
+            } => {
                 let index = (0..=255)
                     .find(|index| {
                         !self
@@ -249,25 +446,31 @@ impl Engine {
                             .any(|n| n.network.subnet.octets()[2] == *index)
                     })
                     .context("No free subnet")?;
-                let network = SignedNetwork::sign(
-                    Network::new(name, self.local.parse()?, index, &self.key)?,
-                    &self.key,
-                )?;
+                let mut config = Network::new(name, self.local.parse()?, index, &self.key)?;
+                if public {
+                    config.set_access(&self.local, Access::Public)?;
+                }
+                if !password.is_empty() {
+                    config.set_password(&self.local, Some(Password::new(&password)?))?;
+                }
+                let network = SignedNetwork::sign(config, &self.key)?;
                 self.store.save(&network)?;
                 let id = network.network.id;
                 self.networks.insert(id, network);
                 self.command(Command::Invite { network: id })?;
             }
             Command::Invite { network } => {
-                ensure!(
-                    self.networks
-                        .get(&network)
-                        .context("Unknown network")?
-                        .network
-                        .owner
-                        == self.local,
-                    "Only owner can invite"
-                );
+                let can = self
+                    .networks
+                    .get(&network)
+                    .context("Unknown network")?
+                    .network
+                    .may_invite(&self.local);
+                ensure!(can, "You are not allowed to invite to this network");
+                if let Some(lobby) = self.published.get(&network) {
+                    self.client.friends().activate_invite_dialog(*lobby);
+                    return Ok(());
+                }
                 ensure!(!self.creating, "Lobby creation already in progress");
                 if let Some((id, lobby)) = self.lobby {
                     if id == network {
@@ -279,11 +482,17 @@ impl Engine {
                 }
                 self.creating = true;
                 let tx = self.events_tx.clone();
-                self.client
-                    .matchmaking()
-                    .create_lobby(LobbyType::Private, 32, move |result| {
+                self.client.matchmaking().create_lobby(
+                    if self.networks[&network].network.access == Access::Public {
+                        LobbyType::Public
+                    } else {
+                        LobbyType::Private
+                    },
+                    32,
+                    move |result| {
                         let _ = tx.send(Event::Created(network, result.map_err(|e| e.to_string())));
-                    });
+                    },
+                );
             }
             Command::InviteFriend { network, steam_id } => {
                 let peer = steam_id.parse::<u64>()?;
@@ -299,12 +508,10 @@ impl Engine {
                         .get(&network)
                         .context("Unknown network")?
                         .network
-                        .owner
-                        == self.local,
-                    "Only owner can invite"
+                        .may_invite(&self.local),
+                    "You are not allowed to invite to this network"
                 );
-                if let Some((id, lobby)) = self.lobby.filter(|(id, _)| *id == network) {
-                    let _ = id;
+                if let Some(lobby) = self.admission_lobby(network) {
                     self.invite_friend(lobby, peer)?;
                 } else {
                     ensure!(!self.creating, "Lobby creation in progress; retry shortly");
@@ -349,16 +556,15 @@ impl Engine {
                 }
             }
             Command::Revoke { network, steam_id } => {
-                let mut next = self
-                    .networks
-                    .get(&network)
-                    .context("Unknown network")?
-                    .network
-                    .clone();
-                next.revoke(&self.local, &steam_id)?;
-                let signed = SignedNetwork::sign(next, &self.key)?;
-                self.store.save(&signed)?;
-                self.networks.insert(network, signed);
+                let current = self.networks.get(&network).context("Unknown network")?;
+                let signed = if current.network.owner == self.local {
+                    let mut next = current.network.clone();
+                    next.revoke(&self.local, &steam_id)?;
+                    SignedNetwork::sign(next, &self.key)?
+                } else {
+                    current.delegate(&self.local, Operation::Revoke { steam_id }, &self.key)?
+                };
+                self.save_network(signed)?;
             }
             Command::Readmit { network, steam_id } => {
                 let mut next = self
@@ -372,7 +578,46 @@ impl Engine {
                 self.store.save(&signed)?;
                 self.networks.insert(network, signed);
             }
+            Command::SetAccess { network, public } => {
+                let mut next = self
+                    .networks
+                    .get(&network)
+                    .context("Unknown network")?
+                    .network
+                    .clone();
+                next.set_access(
+                    &self.local,
+                    if public {
+                        Access::Public
+                    } else {
+                        Access::Private
+                    },
+                )?;
+                let signed = SignedNetwork::sign(next, &self.key)?;
+                self.store.save(&signed)?;
+                self.networks.insert(network, signed);
+            }
+            Command::SetMemberInvite {
+                network,
+                steam_id,
+                can_invite,
+            } => {
+                let mut next = self
+                    .networks
+                    .get(&network)
+                    .context("Unknown network")?
+                    .network
+                    .clone();
+                next.set_member_invite(&self.local, &steam_id, can_invite)?;
+                let signed = SignedNetwork::sign(next, &self.key)?;
+                self.store.save(&signed)?;
+                self.networks.insert(network, signed);
+            }
             Command::Delete { network } => {
+                if let Some(lobby) = self.published.remove(&network) {
+                    self.client.matchmaking().leave_lobby(lobby);
+                }
+                self.join_sent.remove(&network);
                 ensure!(self.networks.contains_key(&network), "Unknown network");
                 self.store.delete(network)?;
                 if let Some((id, lobby)) = self.lobby {
@@ -386,13 +631,108 @@ impl Engine {
                 }
                 self.adapters.remove(&network);
                 self.networks.remove(&network);
+                self.offers.remove(&network);
+                self.pins.remove(&network);
                 self.restore.retain(|id| *id != network);
                 self.sent_revisions.retain(|(_, id), _| *id != network);
+                self.requested.retain(|(id, _), _| *id != network);
                 if self.queued_invite.is_some_and(|(id, _)| id == network) {
                     self.queued_invite = None;
                 }
             }
             Command::Shutdown => {}
+            Command::SetPermissions {
+                network,
+                steam_id,
+                can_invite,
+                can_kick,
+            } => {
+                let mut next = self
+                    .networks
+                    .get(&network)
+                    .context("Unknown network")?
+                    .network
+                    .clone();
+                next.set_permissions(&self.local, &steam_id, can_invite, can_kick)?;
+                let signed = SignedNetwork::sign(next, &self.key)?;
+                self.store.save(&signed)?;
+                self.networks.insert(network, signed);
+            }
+            Command::SetPassword { network, password } => {
+                let mut next = self
+                    .networks
+                    .get(&network)
+                    .context("Unknown network")?
+                    .network
+                    .clone();
+                ensure!(next.owner == self.local, "Only owner can change password");
+                next.set_password(
+                    &self.local,
+                    if password.is_empty() {
+                        None
+                    } else {
+                        Some(Password::new(&password)?)
+                    },
+                )?;
+                let signed = SignedNetwork::sign(next, &self.key)?;
+                self.store.save(&signed)?;
+                self.networks.insert(network, signed);
+            }
+            Command::SubmitPassword { network, password } => {
+                self.request_join(network, &password)?
+            }
+            Command::Discover => {
+                let tx = self.events_tx.clone();
+                let mm = self.client.matchmaking();
+                mm.add_request_lobby_list_string_filter(steamworks::StringFilter(
+                    steamworks::LobbyKey::try_new("freectier_protocol")?,
+                    "2",
+                    steamworks::StringFilterKind::Equal,
+                ));
+                mm.add_request_lobby_list_string_filter(steamworks::StringFilter(
+                    steamworks::LobbyKey::try_new("freectier_public")?,
+                    "1",
+                    steamworks::StringFilterKind::Equal,
+                ));
+                mm.set_request_lobby_list_distance_filter(steamworks::DistanceFilter::Worldwide);
+                mm.request_lobby_list(move |result| {
+                    let _ = tx.send(Event::Found(result.map_err(|e| e.to_string())));
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn request_join(&mut self, network: Uuid, password: &str) -> Result<()> {
+        ensure!(
+            self.pending
+                .get(&network)
+                .is_some_and(|(_, _, time)| time.elapsed() >= Duration::from_secs(3)),
+            "Ожидаем ответ владельца; повторите через несколько секунд"
+        );
+        let (peer, signed) = self.offers.get(&network).context("No pending invitation")?;
+        let public_key = hex::encode(self.key.verifying_key().as_bytes());
+        let snapshot = admission::fingerprint(signed)?;
+        let proof = signed
+            .network
+            .password
+            .as_ref()
+            .map(|p| p.prove(password, &snapshot, &self.local, &public_key))
+            .transpose()?;
+        let request = JoinRequest {
+            public_key,
+            snapshot,
+            proof,
+        };
+        self.transport.send(
+            *peer,
+            &Frame::encode(Kind::Join, network, &serde_json::to_vec(&request)?)?,
+            true,
+        )?;
+        self.join_sent
+            .insert(network, (request.snapshot, Instant::now()));
+        if let Some((_, _, time)) = self.pending.get_mut(&network) {
+            *time = Instant::now();
         }
         Ok(())
     }
@@ -427,8 +767,24 @@ impl Engine {
                     mm.leave_lobby(lobby);
                     return Ok(());
                 };
-                if !(mm.set_lobby_data(lobby, "freectier_protocol", "1")
+                if config.owner != self.local && !config.may_invite(&self.local) {
+                    mm.leave_lobby(lobby);
+                    self.queued_invite = None;
+                    anyhow::bail!("Invitation permission was revoked");
+                }
+                if !(mm.set_lobby_data(lobby, "freectier_protocol", "2")
                     && mm.set_lobby_data(lobby, "freectier_network", &network.to_string())
+                    && mm.set_lobby_data(lobby, "freectier_owner", &config.owner)
+                    && mm.set_lobby_data(lobby, "freectier_key", &config.owner_key)
+                    && mm.set_lobby_data(
+                        lobby,
+                        "freectier_public",
+                        if config.access == Access::Public {
+                            "1"
+                        } else {
+                            "0"
+                        },
+                    )
                     && mm.set_lobby_data(lobby, "name", &config.name))
                 {
                     mm.leave_lobby(lobby);
@@ -448,24 +804,80 @@ impl Engine {
                 let mm = self.client.matchmaking();
                 let parsed = (|| -> Result<(Uuid, u64)> {
                     ensure!(
-                        mm.lobby_data(lobby, "freectier_protocol").as_deref() == Some("1"),
+                        mm.lobby_data(lobby, "freectier_protocol").as_deref() == Some("2"),
                         "Not a FreeC Tier lobby"
                     );
                     let id = mm
                         .lobby_data(lobby, "freectier_network")
                         .context("Missing Network ID")?
                         .parse()?;
-                    let owner = mm.lobby_owner(lobby).raw();
+                    let pin = mm
+                        .lobby_data(lobby, "freectier_key")
+                        .context("Missing owner key")?;
+                    admission::public_key(&pin)?;
+                    if let Some(known) = self.networks.get(&id) {
+                        ensure!(known.network.owner_key == pin, "Owner key changed");
+                    }
+                    self.pins.insert(id, pin);
+                    let owner = mm
+                        .lobby_data(lobby, "freectier_owner")
+                        .map(|value| value.parse::<u64>())
+                        .transpose()?
+                        .unwrap_or_else(|| mm.lobby_owner(lobby).raw());
+                    ensure!(owner > 0, "Invalid network owner");
+                    if let Some(known) = self.networks.get(&id) {
+                        ensure!(
+                            known.network.owner == owner.to_string(),
+                            "Network owner changed"
+                        );
+                    }
                     Ok((id, owner))
                 })();
                 match parsed {
                     Ok((id, owner)) => {
+                        if let Some((_, old, _)) = self.pending.remove(&id) {
+                            if old != lobby {
+                                mm.leave_lobby(old);
+                            }
+                        }
+                        self.offers.remove(&id);
+                        self.join_sent.remove(&id);
                         self.pending.insert(id, (owner, lobby, Instant::now()));
                     }
                     Err(error) => {
                         mm.leave_lobby(lobby);
                         return Err(error);
                     }
+                }
+            }
+            Event::Found(result) => {
+                let mm = self.client.matchmaking();
+                self.public_networks = result
+                    .map_err(anyhow::Error::msg)?
+                    .into_iter()
+                    .filter(|lobby| {
+                        mm.lobby_data(*lobby, "freectier_protocol").as_deref() == Some("2")
+                            && mm.lobby_data(*lobby, "freectier_public").as_deref() == Some("1")
+                    })
+                    .map(|lobby| PublicView {
+                        lobby: lobby.raw().to_string(),
+                        name: mm.lobby_data(lobby, "name").unwrap_or_default(),
+                    })
+                    .collect();
+            }
+            Event::Published(id, result) => {
+                self.publishing = None;
+                let lobby = result.map_err(anyhow::Error::msg)?;
+                if self.networks.get(&id).is_some_and(|n| {
+                    n.network.access == Access::Public && n.network.member(&self.local).is_some()
+                }) {
+                    if let Err(error) = self.publish_metadata(id, lobby) {
+                        self.client.matchmaking().leave_lobby(lobby);
+                        return Err(error);
+                    }
+                    self.published.insert(id, lobby);
+                } else {
+                    self.client.matchmaking().leave_lobby(lobby);
                 }
             }
         }
@@ -518,37 +930,84 @@ impl Engine {
             .map(|(id, _)| *id)
             .collect();
         for id in expired {
+            self.offers.remove(&id);
+            self.pins.remove(&id);
+            self.join_sent.remove(&id);
             if let Some((_, lobby, _)) = self.pending.remove(&id) {
                 self.client.matchmaking().leave_lobby(lobby);
             }
-            log(view, "Истекло время ожидания конфигурации от владельца");
+            log(view, "Истекло время ожидания подключения к сети");
         }
-        // Poll ephemeral admission lobby. Steam identifies each joining member.
+        let stale: Vec<_> = self
+            .published
+            .keys()
+            .copied()
+            .filter(|id| {
+                !self.networks.get(id).is_some_and(|n| {
+                    n.network.access == Access::Public && n.network.member(&self.local).is_some()
+                })
+            })
+            .collect();
+        for id in stale {
+            if let Some(lobby) = self.published.remove(&id) {
+                self.client.matchmaking().leave_lobby(lobby);
+            }
+        }
+        if self.publishing.is_none() && self.publish_retry.elapsed() >= Duration::from_secs(10) {
+            if let Some((&id, _)) = self.networks.iter().find(|(id, n)| {
+                n.network.access == Access::Public
+                    && n.network
+                        .member(&self.local)
+                        .is_some_and(|m| m.public_key.is_some())
+                    && !self.published.contains_key(id)
+                    && !self.lobby.is_some_and(|(existing, _)| existing == **id)
+            }) {
+                self.publishing = Some(id);
+                self.publish_retry = Instant::now();
+                let tx = self.events_tx.clone();
+                self.client
+                    .matchmaking()
+                    .create_lobby(LobbyType::Public, 32, move |result| {
+                        let _ = tx.send(Event::Published(id, result.map_err(|e| e.to_string())));
+                    });
+            }
+        }
+        // Lobby membership only opens the control channel, never the LAN.
+        self.requested.retain(|(id, _), time| {
+            self.lobby.is_some_and(|(network, _)| network == *id)
+                && time.elapsed() < Duration::from_secs(30)
+        });
         if let Some((id, lobby)) = self.lobby {
-            let mut next = self.networks[&id].network.clone();
-            if self
-                .client
-                .matchmaking()
-                .lobby_owner(lobby)
-                .raw()
-                .to_string()
-                == self.local
-            {
-                for member in self.client.matchmaking().lobby_members(lobby) {
-                    // Revoked reservations need an explicit re-admission action,
-                    // not merely the continued presence of the old lobby member.
-                    if !next
-                        .members
-                        .iter()
-                        .any(|m| m.steam_id == member.raw().to_string())
-                    {
-                        next.admit(&self.local, member.raw())?;
-                    }
+            if let Some(config) = self.networks.get(&id).map(|s| s.network.clone()) {
+                let may_invite = config.member(&self.local).is_some()
+                    && (config.access == Access::Public || config.may_invite(&self.local));
+                if !may_invite {
+                    self.client.matchmaking().leave_lobby(lobby);
+                    self.lobby = None;
                 }
-                if next.revision != self.networks[&id].network.revision {
-                    let signed = SignedNetwork::sign(next, &self.key)?;
-                    self.store.save(&signed)?;
-                    self.networks.insert(id, signed);
+                if may_invite {
+                    let mm = self.client.matchmaking();
+                    mm.set_lobby_data(
+                        lobby,
+                        "freectier_public",
+                        if config.access == Access::Public {
+                            "1"
+                        } else {
+                            "0"
+                        },
+                    );
+                    // Steam has no safe wrapper for SetLobbyType in this crate.
+                    unsafe {
+                        steamworks::sys::SteamAPI_ISteamMatchmaking_SetLobbyType(
+                            steamworks::sys::SteamAPI_SteamMatchmaking_v009(),
+                            lobby.raw(),
+                            if config.access == Access::Public {
+                                steamworks::sys::ELobbyType::k_ELobbyTypePublic
+                            } else {
+                                steamworks::sys::ELobbyType::k_ELobbyTypePrivate
+                            },
+                        );
+                    }
                 }
             }
         }
@@ -573,10 +1032,49 @@ impl Engine {
                 }
             }
         }
-        for (owner, _, _) in self.pending.values() {
+        for (owner, lobby, _) in self.pending.values() {
             allowed.insert(*owner);
             if local < *owner {
                 dial.insert(*owner);
+            }
+            for member in self.client.matchmaking().lobby_members(*lobby) {
+                if member.raw() != local {
+                    allowed.insert(member.raw());
+                    if local < member.raw() {
+                        dial.insert(member.raw());
+                    }
+                }
+            }
+        }
+        if let Some((_, lobby)) = self.lobby {
+            for member in self.client.matchmaking().lobby_members(lobby) {
+                if member.raw() != local {
+                    allowed.insert(member.raw());
+                    if local < member.raw() {
+                        dial.insert(member.raw());
+                    }
+                }
+            }
+        }
+        for lobby in self.published.values() {
+            for member in self.client.matchmaking().lobby_members(*lobby) {
+                if member.raw() != local {
+                    allowed.insert(member.raw());
+                    if local < member.raw() {
+                        dial.insert(member.raw());
+                    }
+                }
+            }
+        }
+        self.grace
+            .retain(|_, time| time.elapsed() < Duration::from_secs(5));
+        allowed.extend(self.grace.keys().copied());
+        self.guests
+            .retain(|_, time| time.elapsed() < Duration::from_secs(20));
+        for (_, peer) in self.guests.keys() {
+            allowed.insert(*peer);
+            if local < *peer {
+                dial.insert(*peer);
             }
         }
         let messages = self.transport.tick(&self.client, &allowed, &dial);
@@ -587,6 +1085,66 @@ impl Engine {
                 if view.dropped.is_power_of_two() {
                     log(view, &format!("Отклонён пакет: {error:#}"));
                 }
+            }
+        }
+        if self.last_hello.elapsed() >= Duration::from_secs(3) {
+            self.last_hello = Instant::now();
+            let key = hex::encode(self.key.verifying_key().as_bytes());
+            for (&id, (owner, lobby, _)) in &self.pending {
+                let mut peers: BTreeSet<_> = self
+                    .client
+                    .matchmaking()
+                    .lobby_members(*lobby)
+                    .into_iter()
+                    .map(|m| m.raw())
+                    .collect();
+                peers.insert(*owner);
+                for peer in peers {
+                    if peer != local && self.transport.connected(peer) {
+                        let _ = self.transport.send(
+                            peer,
+                            &Frame::encode(Kind::Hello, id, key.as_bytes())?,
+                            true,
+                        );
+                    }
+                }
+            }
+            for (&id, signed) in &self.networks {
+                if signed
+                    .network
+                    .member(&self.local)
+                    .is_some_and(|m| m.public_key.is_none())
+                {
+                    let owner = signed.network.owner.parse()?;
+                    if self.transport.connected(owner) {
+                        let _ = self.transport.send(
+                            owner,
+                            &Frame::encode(Kind::Hello, id, key.as_bytes())?,
+                            true,
+                        );
+                    }
+                }
+            }
+        }
+        let auto_join: Vec<_> = self
+            .offers
+            .iter()
+            .filter(|(id, (_, offer))| {
+                offer.network.password.is_none()
+                    && self
+                        .pending
+                        .get(id)
+                        .is_some_and(|(_, _, time)| time.elapsed() >= Duration::from_secs(3))
+                    && self
+                        .join_sent
+                        .get(id)
+                        .is_none_or(|(_, time)| time.elapsed() >= Duration::from_secs(5))
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in auto_join {
+            if let Err(error) = self.request_join(id, "") {
+                log(view, &format!("Подключение: {error:#}"));
             }
         }
         self.sent_revisions
@@ -673,25 +1231,58 @@ impl Engine {
                         return Ok(());
                     }
                 } else {
-                    let (owner, _, _) = self
+                    let (owner, lobby, _) = self
                         .pending
                         .get(&frame.network)
                         .context("Unsolicited network configuration")?;
                     ensure!(
-                        *owner == sender && signed.network.owner == sender_id,
+                        signed.network.owner == owner.to_string()
+                            && (sender == *owner
+                                || self
+                                    .client
+                                    .matchmaking()
+                                    .lobby_members(*lobby)
+                                    .iter()
+                                    .any(|m| m.raw() == sender)),
                         "Invitation owner mismatch"
                     );
                     signed.verify()?;
+                    ensure!(
+                        self.pins.get(&frame.network) == Some(&signed.network.owner_key),
+                        "Owner key mismatch"
+                    );
+                    let offer = &self
+                        .offers
+                        .get(&frame.network)
+                        .context("Admission without offer")?
+                        .1;
+                    ensure!(
+                        signed.check_update(offer)?,
+                        "Admission must extend offered policy"
+                    );
+                    ensure!(
+                        signed
+                            .network
+                            .member(&self.local)
+                            .and_then(|m| m.public_key.as_deref())
+                            == Some(hex::encode(self.key.verifying_key().as_bytes()).as_str()),
+                        "Applicant key changed"
+                    );
                     ensure!(
                         signed.network.member(&self.local).is_some(),
                         "Not admitted by owner"
                     );
                 }
-                self.store.save(&signed)?;
-                if signed.network.member(&self.local).is_none() {
-                    self.adapters.remove(&frame.network);
-                }
-                self.networks.insert(frame.network, signed);
+                let signed = if signed.network.owner == self.local && signed.delegation.is_some() {
+                    let mut next = signed.network;
+                    next.revision += 1;
+                    SignedNetwork::sign(next, &self.key)?
+                } else {
+                    signed
+                };
+                self.save_network(signed)?;
+                self.offers.remove(&frame.network);
+                self.join_sent.remove(&frame.network);
                 if let Some((_, lobby, _)) = self.pending.remove(&frame.network) {
                     self.client.matchmaking().leave_lobby(lobby);
                 }
@@ -710,6 +1301,169 @@ impl Engine {
                     .context("Virtual adapter is disabled")?
                     .inject(frame.payload)?;
                 view.received += 1;
+            }
+            Kind::Request => {
+                let peer = frame.invited_steam_id()?;
+                let config = &self
+                    .networks
+                    .get(&frame.network)
+                    .context("Unknown network")?
+                    .network;
+                ensure!(
+                    config.owner == self.local
+                        && config.member(&sender_id).is_some()
+                        && (config.access == Access::Public || config.may_invite(&sender_id)),
+                    "Unauthorized owner consultation"
+                );
+                ensure!(
+                    self.guests.contains_key(&(frame.network, peer)) || self.guests.len() < 64,
+                    "Too many pending admissions"
+                );
+                self.guests.insert((frame.network, peer), Instant::now());
+            }
+            Kind::Hello => {
+                let key = std::str::from_utf8(frame.payload)?.to_owned();
+                admission::public_key(&key)?;
+                if let Some(signed) = self.networks.get(&frame.network) {
+                    if signed
+                        .network
+                        .member(&sender_id)
+                        .is_some_and(|m| m.public_key.is_none())
+                        && signed.network.owner == self.local
+                    {
+                        let mut next = signed.network.clone();
+                        next.bind_key(&self.local, &sender_id, key)?;
+                        let signed = SignedNetwork::sign(next, &self.key)?;
+                        self.store.save(&signed)?;
+                        self.networks.insert(frame.network, signed);
+                    }
+                }
+                let signed = self
+                    .networks
+                    .get(&frame.network)
+                    .context("Unknown network")?;
+                ensure!(
+                    signed.network.member(&self.local).is_some(),
+                    "Local access revoked"
+                );
+                let in_lobby = self.applicant_in_lobby(frame.network, sender);
+                ensure!(
+                    in_lobby || signed.network.member(&sender_id).is_some(),
+                    "Unsolicited hello"
+                );
+                if in_lobby
+                    && signed.network.owner != self.local
+                    && signed.network.member(&sender_id).is_none()
+                {
+                    let owner = signed.network.owner.parse()?;
+                    if self.transport.connected(owner) {
+                        let _ = self.transport.send(
+                            owner,
+                            &Frame::encode(Kind::Request, frame.network, sender_id.as_bytes())?,
+                            true,
+                        );
+                    }
+                }
+                let kind = if signed.network.member(&sender_id).is_some() {
+                    Kind::Config
+                } else {
+                    Kind::Offer
+                };
+                self.transport.send(
+                    sender,
+                    &Frame::encode(kind, frame.network, &serde_json::to_vec(signed)?)?,
+                    true,
+                )?;
+            }
+            Kind::Join => {
+                let request: JoinRequest = serde_json::from_slice(frame.payload)?;
+                let signed = self
+                    .networks
+                    .get(&frame.network)
+                    .context("Unknown network")?;
+                ensure!(
+                    self.applicant_in_lobby(frame.network, sender),
+                    "Applicant not in admission lobby"
+                );
+                ensure!(
+                    admission::fingerprint(signed)? == request.snapshot,
+                    "Stale network snapshot"
+                );
+                let mut next = signed.delegate(
+                    &self.local,
+                    Operation::Admit {
+                        steam_id: sender_id.clone(),
+                        public_key: request.public_key,
+                        proof: request.proof,
+                    },
+                    &self.key,
+                )?;
+                if next.network.owner == self.local {
+                    next = SignedNetwork::sign(next.network, &self.key)?;
+                }
+                self.store.save(&next)?;
+                self.networks.insert(frame.network, next.clone());
+                self.transport.send(
+                    sender,
+                    &Frame::encode(Kind::Config, frame.network, &serde_json::to_vec(&next)?)?,
+                    true,
+                )?;
+                log(view, "Участник допущен автоматически");
+            }
+            Kind::Offer => {
+                let signed: SignedNetwork = serde_json::from_slice(frame.payload)?;
+                signed.verify()?;
+                let (owner, lobby, _) = self
+                    .pending
+                    .get(&frame.network)
+                    .context("Unsolicited offer")?;
+                ensure!(
+                    signed.network.id == frame.network && signed.network.owner == owner.to_string(),
+                    "Wrong network offer"
+                );
+                ensure!(
+                    self.pins.get(&frame.network) == Some(&signed.network.owner_key),
+                    "Owner key mismatch"
+                );
+                ensure!(
+                    sender == *owner
+                        || self
+                            .client
+                            .matchmaking()
+                            .lobby_members(*lobby)
+                            .iter()
+                            .any(|m| m.raw() == sender),
+                    "Offer from outside lobby"
+                );
+                ensure!(
+                    signed.network.member(&sender_id).is_some(),
+                    "Offer from nonmember"
+                );
+                ensure!(
+                    signed.network.access == Access::Public
+                        || signed.network.may_invite(&sender_id),
+                    "Inviter lacks permission"
+                );
+                if let Some((old_peer, old)) = self.offers.get(&frame.network) {
+                    ensure!(
+                        signed.network.revision >= old.network.revision,
+                        "Stale password policy"
+                    );
+                    if signed.network.revision == old.network.revision {
+                        ensure!(
+                            admission::fingerprint(&signed)? == admission::fingerprint(old)?,
+                            "Conflicting signed configurations"
+                        );
+                        if (*old_peer == *owner && sender != *owner)
+                            || (sender != *owner
+                                && *old_peer < sender
+                                && self.transport.connected(*old_peer))
+                        {
+                            return Ok(());
+                        }
+                    }
+                }
+                self.offers.insert(frame.network, (sender, signed));
             }
         }
         Ok(())
@@ -746,9 +1500,11 @@ impl Engine {
                     revision: n.revision,
                     adapter: self.adapters.contains_key(&n.id),
                     lobby: self
-                        .lobby
-                        .filter(|(id, _)| *id == n.id)
-                        .map(|(_, lobby)| lobby.raw().to_string()),
+                        .admission_lobby(n.id)
+                        .map(|lobby| lobby.raw().to_string()),
+                    public: n.access == Access::Public,
+                    can_invite: n.may_invite(&self.local),
+                    password: n.password.is_some(),
                     members: n
                         .members
                         .iter()
@@ -756,6 +1512,10 @@ impl Engine {
                             steam_id: m.steam_id.clone(),
                             ip: m.ip.to_string(),
                             active: m.active,
+                            can_invite: m.steam_id == n.owner || m.can_invite,
+                            may_invite: n.may_invite(&m.steam_id),
+                            can_kick: m.can_kick,
+                            may_kick: n.may_kick(&self.local, &m.steam_id),
                             name: self
                                 .client
                                 .friends()
@@ -777,6 +1537,16 @@ impl Engine {
                 }
             })
             .collect();
+        view.joins = self
+            .offers
+            .values()
+            .map(|(_, n)| JoinView {
+                id: n.network.id.to_string(),
+                name: n.network.name.clone(),
+                password: n.network.password.is_some(),
+            })
+            .collect();
+        view.public_networks = self.public_networks.clone();
     }
 }
 
@@ -786,6 +1556,9 @@ impl Drop for Engine {
             self.client.matchmaking().leave_lobby(lobby);
         }
         for (_, lobby, _) in self.pending.values() {
+            self.client.matchmaking().leave_lobby(*lobby);
+        }
+        for lobby in self.published.values() {
             self.client.matchmaking().leave_lobby(*lobby);
         }
     }

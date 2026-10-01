@@ -2,22 +2,23 @@ import { invoke, isTauri } from '@tauri-apps/api/core';
 import morphdom from 'morphdom';
 import './styles.css';
 
-type Peer = { steam_id: string; name: string; ip: string; active: boolean; state: string; ping_ms?: number };
-type Network = { id: string; name: string; subnet: string; owner: string; revision: number; adapter: boolean; lobby?: string; members: Peer[] };
-type Snapshot = { steam: string; steam_id?: string; nickname?: string; relay: string; networks: Network[]; friends: { steam_id: string; name: string }[]; events: string[]; received: number; sent: number; dropped: number };
+type Peer = { steam_id: string; name: string; ip: string; active: boolean; state: string; ping_ms?: number; can_invite: boolean; may_invite: boolean; can_kick: boolean; may_kick: boolean };
+type Network = { id: string; name: string; subnet: string; owner: string; revision: number; adapter: boolean; lobby?: string; public: boolean; can_invite: boolean; password: boolean; members: Peer[] };
+type Snapshot = { steam: string; steam_id?: string; nickname?: string; relay: string; networks: Network[]; friends: { steam_id: string; name: string }[]; events: string[]; received: number; sent: number; dropped: number; joins?: { id: string; name: string; password: boolean }[]; public_networks?: { lobby: string; name: string }[] };
 type Command = { type: string; [key: string]: unknown };
 type Settings = { minimize_to_tray: boolean; check_updates: boolean; theme: string };
 
 let state: Snapshot = { steam: 'waiting', relay: 'unknown', networks: [], friends: [], events: [], received: 0, sent: 0, dropped: 0 };
 let selected: string | undefined;
 let previous = '';
-let page: 'networks' | 'settings' | 'diagnostics' = 'networks';
+let page: 'networks' | 'settings' | 'diagnostics' | 'discover' = 'networks';
 let preferences: Settings = { minimize_to_tray: true, check_updates: true, theme: 'dark' };
 let updateMessage = 'Проверок ещё не было.';
 let updateVersion: string | null = null;
 let updating = false;
 let busy = false;
 let appVersion = '';
+let createPublic = false;
 const app = document.querySelector<HTMLDivElement>('#app')!;
 app.innerHTML = `
   <header class="topbar"><a class="brand" href="#" aria-label="FreeC Tier — мои сети"><span class="brand-mark">F</span><span class="brand-name">FreeC Tier</span><small class="brand-version" id="brand-version"></small></a><div id="session" role="status"></div></header>
@@ -26,7 +27,7 @@ app.innerHTML = `
   <div class="sidebar-bottom"><button class="nav-button" id="settings">Настройки <span aria-hidden="true">⚙</span></button></div></aside>
   <main id="content"></main></div>
   <div id="notice" role="status" hidden></div>
-  <dialog id="create-dialog"><form id="create-form"><div class="dialog-heading"><h2>Новая сеть</h2><button class="icon-button close" type="button" aria-label="Закрыть">×</button></div><label for="network-name">Название</label><input id="network-name" name="name" maxlength="64" required placeholder="Например, Minecraft" autocomplete="off" /><label>Подсеть</label><div class="readonly">Автоматически <span>10.77.x.0/24</span></div><div class="dialog-actions"><button type="button" class="button close">Отмена</button><button class="button primary" type="submit">Создать сеть</button></div></form></dialog>
+  <dialog id="create-dialog"><form id="create-form"><div class="dialog-heading"><h2>Новая сеть</h2><button class="icon-button close" type="button" aria-label="Закрыть">×</button></div><label for="network-name">Название</label><input id="network-name" name="name" maxlength="64" required placeholder="Например, Minecraft" autocomplete="off" /><span>Доступ</span><div class="segmented" role="group" aria-label="Доступ"><button type="button" id="create-private" class="seg active" aria-pressed="true">Приватная</button><button type="button" id="create-public" class="seg" aria-pressed="false">Публичная</button></div><p class="hint">В публичной сети участники с разрешением могут приглашать друзей.</p><label>Подсеть</label><div class="readonly">Автоматически <span>10.77.x.0/24</span></div><div class="dialog-actions"><button type="button" class="button close">Отмена</button><button class="button primary" type="submit">Создать сеть</button></div></form></dialog>
   <dialog id="join-dialog"><form id="join-form"><div class="dialog-heading"><h2>Подключиться по lobby</h2><button class="icon-button close" type="button" aria-label="Закрыть">×</button></div><label for="lobby-id">Steam Lobby ID</label><input id="lobby-id" name="lobby" required inputmode="numeric" pattern="[0-9]{1,20}" placeholder="64-битный идентификатор" /><div class="dialog-actions"><button type="button" class="button close">Отмена</button><button class="button primary" type="submit">Присоединиться</button></div></form></dialog>
   <dialog id="invite-dialog"><div class="dialog-heading"><h2>Пригласить друга</h2><button class="icon-button close" aria-label="Закрыть">×</button></div><div id="friend-list"></div><button id="overlay" class="button">Открыть список в Steam</button></dialog>
   <dialog id="delete-dialog"><form id="delete-form"><div class="dialog-heading"><h2>Удалить сеть?</h2><button class="icon-button close" type="button" aria-label="Закрыть">×</button></div><p id="delete-description"></p><p>У остальных участников сеть останется.</p><div class="dialog-actions"><button type="button" class="button close">Отмена</button><button class="button danger" type="submit">Удалить сеть</button></div></form></dialog>
@@ -37,6 +38,9 @@ app.innerHTML = `
   </div></dialog>`;
 
 const content = document.querySelector<HTMLElement>('#content')!;
+document.querySelector('#create')!.insertAdjacentHTML('afterend', '<button class="button" id="discover">Публичные сети</button>');
+document.querySelector('#create-public')!.closest('.segmented')!.insertAdjacentHTML('afterend', '<label id="create-password-label" hidden>Пароль (необязательно)<input id="create-password" type="password" maxlength="128" autocomplete="new-password" /></label>');
+document.querySelector('#app')!.insertAdjacentHTML('beforeend', `<dialog id="password-dialog"><form id="password-form"><div class="dialog-heading"><h2 id="password-title">Пароль сети</h2><button class="icon-button close" type="button" aria-label="Закрыть">×</button></div><label for="password-input">Пароль</label><input id="password-input" type="password" maxlength="128" autocomplete="current-password" /><p class="hint" id="password-hint"></p><div class="dialog-actions"><button class="button primary" type="submit">Продолжить</button></div></form></dialog>`);
 // Keyed DOM reconciliation keeps focus, open details and scroll containers alive.
 function patch(element: HTMLElement, html: string) {
   const next = element.cloneNode(false) as HTMLElement; next.innerHTML = html;
@@ -75,6 +79,8 @@ function render() {
   document.querySelectorAll<HTMLButtonElement>('[data-select]').forEach(button => button.onclick = () => { selected = button.dataset.select; page = 'networks'; render(); });
   if (page === 'diagnostics') { renderDiagnostics(); return; }
   if (page === 'settings') { renderSettings(); return; }
+  if (page === 'discover') { renderDiscovery(); return; }
+  if (state.joins?.length) { page = 'discover'; renderDiscovery(); return; }
   const active = network();
   if (!active) {
     contentHTML(`<section class="empty-state" id="empty"><svg class="empty-art" viewBox="0 0 180 110" role="img" aria-hidden="true"><path d="M42 48 L90 60 M138 48 L90 60" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" /><rect x="20" y="14" width="44" height="34" rx="9" fill="none" stroke="currentColor" stroke-width="2" /><rect x="116" y="14" width="44" height="34" rx="9" fill="none" stroke="currentColor" stroke-width="2" /><rect x="66" y="60" width="48" height="38" rx="10" fill="var(--accent)" /></svg><h1>Объедините компьютеры в одну сеть</h1><p>Как в одной локальной сети — для игр и любых LAN-приложений.</p><button class="button primary" id="create-first">Создать первую сеть</button></section>`);
@@ -83,13 +89,24 @@ function render() {
   }
   const owner = active.owner === state.steam_id;
   const local = active.members.find(m => m.steam_id === state.steam_id);
-  contentHTML(`<section class="page" id="detail-${active.id}"><div class="page-head"><div><h1>${escape(active.name)}</h1><p class="page-sub">Участников: ${active.members.filter(m => m.active).length}</p></div><div class="page-actions"><button id="invite" class="button" ${!owner || !online ? 'disabled' : ''}>Пригласить</button></div></div>
+  contentHTML(`<section class="page" id="detail-${active.id}"><div class="page-head"><div><h1>${escape(active.name)}</h1><p class="page-sub">Участников: ${active.members.filter(m => m.active).length} · ${active.public ? 'Публичная' : 'Приватная'}</p></div><div class="page-actions"><button id="invite" class="button" ${!active.can_invite || !online ? 'disabled' : ''}>Пригласить</button></div></div>
     <div class="status-card ${active.adapter ? 'on' : ''}"><span class="status-dot" aria-hidden="true"></span><div class="status-text"><strong>${active.adapter ? 'Сеть включена' : 'Сеть выключена'}</strong><span>${local?.active ? `Ваш адрес ${escape(local.ip)}` : 'Доступ отозван'}</span></div><button id="toggle-adapter" class="button ${active.adapter ? '' : 'primary'}" ${!online || !local?.active ? 'disabled' : ''}>${active.adapter ? 'Выключить' : 'Включить'}</button></div>
     ${!online ? '<p class="hint">Steam не запущен — включение сети и приглашения недоступны.</p>' : ''}
-    <div class="section-head"><h2>Участники</h2></div><div class="table-wrap"><table><thead><tr><th>Участник</th><th>IP-адрес</th><th>Соединение</th><th><span class="sr-only">Действия</span></th></tr></thead><tbody>${active.members.map(peer => `<tr id="peer-${active.id}-${peer.steam_id}" class="${peer.active ? '' : 'revoked'}"><td><div class="person"><span class="initials" aria-hidden="true">${escape((peer.name || '?').slice(0, 2).toUpperCase())}</span><span><strong>${escape(peer.name || peer.steam_id)}</strong><small>${peer.steam_id === active.owner ? 'Владелец' : 'Участник'}${peer.steam_id === state.steam_id ? ' · Вы' : ''}</small></span></div></td><td><code>${escape(peer.ip)}</code></td><td>${status(peer.state)}${peer.ping_ms != null ? `<small>${peer.ping_ms} мс</small>` : ''}</td><td>${owner && peer.steam_id !== active.owner ? `<button class="text-button danger" data-member="${peer.steam_id}" data-active="${peer.active}">${peer.active ? 'Удалить' : 'Вернуть'}</button>` : ''}</td></tr>`).join('')}</tbody></table></div>
+    <div class="section-head"><h2>Доступ</h2></div><div class="card"><div class="row"><span class="row-label">Тип сети<small>${active.public ? 'Доступна в списке публичных сетей' : 'Вход по приглашению'}</small></span>${owner ? `<div class="segmented" role="group" aria-label="Доступ"><button id="access-private" class="seg ${active.public ? '' : 'active'}" aria-pressed="${!active.public}" ${online ? '' : 'disabled'}>Приватная</button><button id="access-public" class="seg ${active.public ? 'active' : ''}" aria-pressed="${active.public}" ${online ? '' : 'disabled'}>Публичная</button></div>` : `<span class="muted">${active.public ? 'Публичная' : 'Приватная'}</span>`}</div>${active.public ? `<div class="row"><span class="row-label">Пароль<small>${active.password ? 'Установлен' : 'Без пароля'}</small></span>${owner ? `<button class="button" id="set-password" ${online ? '' : 'disabled'}>${active.password ? 'Изменить' : 'Установить'}</button>` : ''}</div>` : ''}</div>
+    <div class="section-head"><h2>Участники</h2></div><div class="table-wrap"><table><thead><tr><th>Участник</th><th>IP-адрес</th><th>Соединение</th><th><span class="sr-only">Права и действия</span></th></tr></thead><tbody>${active.members.map(peer => `<tr id="peer-${active.id}-${peer.steam_id}" class="${peer.active ? '' : 'revoked'}"><td><div class="person"><span class="initials" aria-hidden="true">${escape((peer.name || '?').slice(0, 2).toUpperCase())}</span><span><strong>${escape(peer.name || peer.steam_id)}</strong><small>${peer.steam_id === active.owner ? 'Владелец' : peer.may_invite ? 'Участник · может приглашать' : 'Участник'}${peer.steam_id === state.steam_id ? ' · Вы' : ''}</small></span></div></td><td><code>${escape(peer.ip)}</code></td><td>${status(peer.state)}${peer.ping_ms != null ? `<small>${peer.ping_ms} мс</small>` : ''}</td><td><div class="table-actions">${owner && peer.steam_id !== active.owner ? `<label class="permission"><input type="checkbox" data-permission="invite" data-peer="${peer.steam_id}" aria-label="Приглашать: ${escape(peer.name || peer.steam_id)}" ${peer.can_invite ? 'checked' : ''} ${online ? '' : 'disabled'} />Приглашать</label><label class="permission"><input type="checkbox" data-permission="kick" data-peer="${peer.steam_id}" aria-label="Исключать: ${escape(peer.name || peer.steam_id)}" ${peer.can_kick ? 'checked' : ''} ${online ? '' : 'disabled'} />Исключать</label>` : ''}${(owner && peer.steam_id !== active.owner) || peer.may_kick ? `<button class="text-button danger" data-member="${peer.steam_id}" data-active="${peer.active}" ${online ? '' : 'disabled'}>${peer.active ? 'Удалить' : 'Вернуть'}</button>` : ''}</div></td></tr>`).join('')}</tbody></table></div>
     <div class="danger-zone"><button class="text-button danger" id="delete-network">Удалить сеть с компьютера</button></div></section>`);
   document.querySelector<HTMLButtonElement>('#invite')!.onclick = openInvite;
   document.querySelector<HTMLButtonElement>('#toggle-adapter')!.onclick = () => { void send({ type: 'set_adapter', network: active.id, enabled: !active.adapter }); };
+  const privateAccess = document.querySelector<HTMLButtonElement>('#access-private');
+  const publicAccess = document.querySelector<HTMLButtonElement>('#access-public');
+  if (privateAccess) privateAccess.onclick = () => { void send({ type: 'set_access', network: active.id, public: false }); };
+  if (publicAccess) publicAccess.onclick = () => { void send({ type: 'set_access', network: active.id, public: true }); };
+  document.querySelectorAll<HTMLInputElement>('[data-permission]').forEach(input => input.onchange = () => {
+    const peer = active.members.find(p => p.steam_id === input.dataset.peer)!;
+    void send({ type: 'set_permissions', network: active.id, steam_id: peer.steam_id, can_invite: input.dataset.permission === 'invite' ? input.checked : peer.can_invite, can_kick: input.dataset.permission === 'kick' ? input.checked : peer.can_kick });
+  });
+  const passwordButton = document.querySelector<HTMLButtonElement>('#set-password');
+  if (passwordButton) passwordButton.onclick = () => openPassword(active.id, true);
   document.querySelector<HTMLButtonElement>('#delete-network')!.onclick = () => {
     const dialog = document.querySelector<HTMLDialogElement>('#delete-dialog')!;
     dialog.dataset.network = active.id;
@@ -99,6 +116,22 @@ function render() {
     dialog.showModal();
   };
   document.querySelectorAll<HTMLButtonElement>('[data-member]').forEach(button => button.onclick = () => send({ type: button.dataset.active === 'true' ? 'revoke' : 'readmit', network: active.id, steam_id: button.dataset.member }));
+}
+
+function openPassword(id: string, editing: boolean) {
+  const dialog = document.querySelector<HTMLDialogElement>('#password-dialog')!;
+  dialog.dataset.network = id; dialog.dataset.editing = String(editing);
+  document.querySelector('#password-title')!.textContent = editing ? 'Изменить пароль' : 'Вход в сеть';
+  document.querySelector('#password-hint')!.textContent = editing ? 'Пустое поле удалит пароль. Уже принятые участники сохранят доступ.' : 'Пароль проверяется автоматически. Владелец может быть офлайн.';
+  document.querySelector<HTMLInputElement>('#password-input')!.value = '';
+  dialog.showModal();
+}
+function renderDiscovery() {
+  const joins = state.joins || [];
+  contentHTML(`<section class="page" id="discovery-page"><div class="page-head"><h1>Публичные сети</h1><button class="button" id="refresh-public" ${state.steam === 'online' ? '' : 'disabled'}>Обновить</button></div>${joins.map(j => `<div class="card row" id="pending-${j.id}"><span>${escape(j.name)}<small>${j.password ? 'Требуется пароль' : 'Подключение…'}</small></span>${j.password ? `<button class="button primary" data-password="${j.id}">Ввести пароль</button>` : ''}</div>`).join('')}<div class="card">${(state.public_networks || []).map(n => `<div class="row"><span class="row-label">${escape(n.name)}</span><button class="button" data-lobby="${n.lobby}">Войти</button></div>`).join('') || '<p class="hint">Сети не найдены. Нажмите «Обновить», чтобы повторить поиск.</p>'}</div></section>`);
+  document.querySelector<HTMLButtonElement>('#refresh-public')!.onclick = () => { void send({ type: 'discover' }); };
+  document.querySelectorAll<HTMLButtonElement>('[data-lobby]').forEach(b => b.onclick = () => { void send({ type: 'join', lobby: b.dataset.lobby }); });
+  document.querySelectorAll<HTMLButtonElement>('[data-password]').forEach(b => b.onclick = () => openPassword(b.dataset.password!, false));
 }
 
 function renderDiagnostics() {
@@ -156,14 +189,32 @@ async function checkUpdate() {
   } catch (error) { updateMessage = `Не удалось проверить обновления: ${String(error)}`; }
   finally { updating = false; if (page === 'settings') renderSettings(); }
 }
-function openCreate() { (document.querySelector('#create-dialog') as HTMLDialogElement).showModal(); }
+function openCreate() { setCreateAccess(false); (document.querySelector('#create-dialog') as HTMLDialogElement).showModal(); }
+function setCreateAccess(publicAccess: boolean) {
+  createPublic = publicAccess;
+  document.querySelector('#create-private')!.classList.toggle('active', !publicAccess);
+  document.querySelector('#create-public')!.classList.toggle('active', publicAccess);
+  document.querySelector('#create-private')!.setAttribute('aria-pressed', String(!publicAccess));
+  document.querySelector('#create-public')!.setAttribute('aria-pressed', String(publicAccess));
+  document.querySelector<HTMLElement>('#create-password-label')!.hidden = !publicAccess;
+  if (!publicAccess) document.querySelector<HTMLInputElement>('#create-password')!.value = '';
+}
 function openInvite() {
   const active = network(); if (!active) return;
-  document.querySelector('#friend-list')!.innerHTML = state.friends.length ? state.friends.map(f => `<button class="friend-choice" data-friend="${f.steam_id}"><span>${escape(f.name)}</span><span>Пригласить</span></button>`).join('') : '<p class="muted">Список друзей пуст.</p>';
+  document.querySelector('#friend-list')!.innerHTML = `${state.friends.length ? state.friends.map(f => `<button class="friend-choice" data-friend="${f.steam_id}"><span>${escape(f.name)}</span><span>Пригласить</span></button>`).join('') : '<p class="muted">Список друзей пуст.</p>'}`;
   document.querySelectorAll<HTMLButtonElement>('[data-friend]').forEach(button => button.onclick = async () => { if (await send({ type: 'invite_friend', network: active.id, steam_id: button.dataset.friend })) (document.querySelector('#invite-dialog') as HTMLDialogElement).close(); });
   (document.querySelector('#invite-dialog') as HTMLDialogElement).showModal();
 }
 document.querySelector('#create')!.addEventListener('click', openCreate);
+document.querySelector('#discover')!.addEventListener('click', () => { page = 'discover'; render(); void send({ type: 'discover' }); });
+document.querySelector<HTMLFormElement>('#password-form')!.onsubmit = async e => {
+  e.preventDefault();
+  const dialog = document.querySelector<HTMLDialogElement>('#password-dialog')!;
+  const input = document.querySelector<HTMLInputElement>('#password-input')!;
+  if (await send({ type: dialog.dataset.editing === 'true' ? 'set_password' : 'submit_password', network: dialog.dataset.network, password: input.value })) { input.value = ''; dialog.close(); }
+};
+document.querySelector('#create-private')!.addEventListener('click', () => setCreateAccess(false));
+document.querySelector('#create-public')!.addEventListener('click', () => setCreateAccess(true));
 document.querySelector('#settings')!.addEventListener('click', () => { page = 'settings'; render(); });
 document.querySelector('.brand')!.addEventListener('click', e => { e.preventDefault(); page = 'networks'; render(); });
 document.querySelector('#overlay')!.addEventListener('click', () => { if (selected) send({ type: 'invite', network: selected }); });
@@ -172,7 +223,8 @@ document.querySelector('#open-privacy')!.addEventListener('click', () => { void 
 document.querySelectorAll<HTMLImageElement>('.step-shot').forEach(image => image.addEventListener('error', () => image.classList.add('missing')));
 document.querySelector<HTMLFormElement>('#create-form')!.onsubmit = async e => {
   e.preventDefault(); const input = document.querySelector<HTMLInputElement>('#network-name')!;
-  if (await send({ type: 'create', name: input.value.trim() })) { (document.querySelector('#create-dialog') as HTMLDialogElement).close(); input.value = ''; }
+  const password = document.querySelector<HTMLInputElement>('#create-password')!;
+  if (await send({ type: 'create', name: input.value.trim(), public: createPublic, password: createPublic ? password.value : '' })) { (document.querySelector('#create-dialog') as HTMLDialogElement).close(); input.value = ''; password.value = ''; }
 };
 document.querySelector<HTMLFormElement>('#join-form')!.onsubmit = async e => {
   e.preventDefault(); const input = document.querySelector<HTMLInputElement>('#lobby-id')!;
@@ -187,7 +239,7 @@ async function poll() {
   if (isTauri()) {
     try {
       const next = await invoke<Snapshot>('snapshot');
-      const serialized = JSON.stringify({ steam: next.steam, steam_id: next.steam_id, nickname: next.nickname, relay: next.relay, networks: next.networks });
+      const serialized = JSON.stringify({ steam: next.steam, steam_id: next.steam_id, nickname: next.nickname, relay: next.relay, networks: next.networks, joins: next.joins, public_networks: next.public_networks });
       if (next.events.length && next.events.at(-1) !== state.events.at(-1) && next.events.at(-1)!.startsWith('Ошибка:')) notice(next.events.at(-1)!);
       state = next;
       if (serialized !== previous) {

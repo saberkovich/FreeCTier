@@ -13,6 +13,7 @@ steamworks = { version = "0.13.1", features = ["raw-bindings"] }
 ed25519-dalek = "2"
 directories = "6"
 fs2 = "0.4"
+hex = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 wintun = "0.5.1"
