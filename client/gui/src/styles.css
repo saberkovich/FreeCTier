@@ -96,7 +96,8 @@ code { font-family: Consolas, monospace; font-size: .86em; }
 .status-text strong { font-size: 15px; font-weight: 600; }
 .status-text span { color: var(--muted); font-size: 12px; }
 .status-card .button { margin-left: auto; }
-.hint { margin: 10px 2px 0; color: var(--warning); font-size: 12px; }
+.hint { margin: 10px 2px 0; color: var(--muted); font-size: 12px; }
+.hint.warning { color: var(--warning); }
 
 .section-head { display: flex; align-items: baseline; justify-content: space-between; margin: 30px 0 12px; }
 .section-head h2 { font-size: 15px; }
@@ -146,6 +147,7 @@ td > small { display: block; color: var(--muted); font-size: 11px; margin-top: 3
 .row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 0; border-bottom: 1px solid var(--line-soft); }
 .row:last-child { border-bottom: 0; }
 .row-label { font-size: 13px; }
+.row-label small { display: block; margin-top: 2px; color: var(--muted); font-size: 11px; }
 .row-button { width: 100%; border: 0; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; border-bottom: 1px solid var(--line-soft); }
 .row-button:hover .row-label { color: var(--accent); }
 .row-button .chev { color: var(--faint); }

@@ -21,6 +21,8 @@ test('public discovery refreshes without network changes and password reaches IP
   await page.locator('#discover').click();
   await expect(page.getByText('<Public LAN>', { exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Войти', exact: true }).click();
+  await page.getByRole('button', { name: 'Ввести пароль' }).waitFor();
+  await page.screenshot({ path: '../../.cache/screenshots/discovery.png', fullPage: true });
   await page.getByRole('button', { name: 'Ввести пароль' }).click();
   await page.locator('#password-input').fill('wrong password');
   await page.waitForTimeout(1200);
@@ -94,6 +96,7 @@ test('first run, keyboard create flow, browser fallback and responsive layout', 
   await page.getByLabel('Название').fill('Minecraft');
   await page.getByRole('dialog').getByRole('button', { name: 'Публичная' }).click();
   await expect(page.getByRole('dialog').getByRole('button', { name: 'Публичная' })).toHaveClass(/active/);
+  await page.screenshot({ path: '../../.cache/screenshots/create-dialog.png' });
   await page.getByRole('dialog').getByRole('button', { name: 'Создать сеть' }).click();
   await expect(page.getByText('Это браузерный просмотр.', { exact: false })).toBeVisible();
   await page.keyboard.press('Escape');
@@ -156,6 +159,7 @@ test('real state rendering is escaped and adapter action reaches IPC', async ({ 
   await expect(page.locator('#access-public')).toHaveAttribute('aria-pressed', 'true');
   await expect(page.getByRole('checkbox', { name: 'Приглашать: Test friend' })).toBeChecked();
   await page.getByRole('checkbox', { name: 'Исключать: Test friend' }).check();
+  await page.screenshot({ path: '../../.cache/screenshots/detail.png', fullPage: true });
   expect(await page.evaluate(() => (window as unknown as {lastCommand: unknown}).lastCommand)).toEqual({ command: { type: 'set_permissions', network: '67ae3f2d-0734-47f8-bf1b-e5e2bc64a289', steam_id: '76561198000000002', can_invite: true, can_kick: true } });
   await expect(page.getByRole('checkbox', { name: 'Исключать: Test friend' })).toBeChecked();
   await expect(page.getByText('Участник · может приглашать')).toBeVisible();
