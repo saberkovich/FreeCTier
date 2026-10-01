@@ -480,10 +480,7 @@ impl SignedNetwork {
                 public_key,
                 proof,
             } => {
-                ensure!(
-                    next.may_invite(signer),
-                    "Invitation not permitted"
-                );
+                ensure!(next.may_invite(signer), "Invitation not permitted");
                 ensure!(
                     !next.members.iter().any(|m| &m.steam_id == steam_id),
                     "Member already known; only owner may restore access"

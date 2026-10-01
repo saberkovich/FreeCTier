@@ -159,15 +159,14 @@ fn open_steam_privacy() -> Result<(), String> {
             .encode_utf16()
             .collect();
         // ShellExecuteW returns a value greater than 32 on success.
-        let launched =
-            ShellExecuteW(
-                std::ptr::null_mut(),
-                operation.as_ptr(),
-                url.as_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-                1,
-            );
+        let launched = ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            url.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+        );
         if launched as usize <= 32 {
             return Err("Не удалось открыть настройки приватности Steam".into());
         }

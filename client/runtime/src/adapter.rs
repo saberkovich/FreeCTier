@@ -1,6 +1,10 @@
 use anyhow::{Context, Result};
 use freec_core::{config::Network, packet::MTU};
-use std::{process::Command, sync::Arc};
+use std::{os::windows::process::CommandExt, process::Command, sync::Arc};
+
+/// A windows-subsystem GUI process has no console for children to inherit, so
+/// every netsh invocation would otherwise flash its own visible CMD window.
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// First vertical slice runs elevated. A service/Named Pipe boundary is planned
 /// before distribution; no OS network configuration is changed on startup.
@@ -56,7 +60,10 @@ impl Adapter {
                 "store=active".into(),
             ],
         ] {
-            let output = Command::new(&netsh).args(args).output()?;
+            let output = Command::new(&netsh)
+                .args(args)
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()?;
             anyhow::ensure!(
                 output.status.success(),
                 "Cannot configure Wintun: {} {}",

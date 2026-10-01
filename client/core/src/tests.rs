@@ -224,13 +224,18 @@ mod policy {
         let owner_key = SigningKey::from_bytes(&[8; 32]);
         let inviter_key = SigningKey::from_bytes(&[9; 32]);
         let applicant_key = SigningKey::from_bytes(&[10; 32]);
-        let mut network = Network::new("Requests".into(), 76561198000000001, 0, &owner_key).unwrap();
+        let mut network =
+            Network::new("Requests".into(), 76561198000000001, 0, &owner_key).unwrap();
         let owner = network.owner.clone();
         let inviter = "76561198000000002";
         let applicant = "76561198000000003";
         network.admit(&owner, inviter.parse().unwrap()).unwrap();
         network
-            .bind_key(&owner, inviter, hex::encode(inviter_key.verifying_key().as_bytes()))
+            .bind_key(
+                &owner,
+                inviter,
+                hex::encode(inviter_key.verifying_key().as_bytes()),
+            )
             .unwrap();
         let applicant_public = hex::encode(applicant_key.verifying_key().as_bytes());
         let admit_applicant = || Operation::Admit {
