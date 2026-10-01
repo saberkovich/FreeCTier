@@ -27,7 +27,6 @@ const tag = process.env.GITHUB_REF_TYPE === 'tag' ? process.env.GITHUB_REF_NAME 
 const version = (process.env.FREECTIER_VERSION || tag || packageVersion).replace(/^v/, '');
 if (!/^\d+\.\d+\.\d+([-+][\w.-]+)?$/.test(version)) throw new Error(`Invalid release version "${version}". Use semver like 0.2.1 or 0.2.1-preview.`);
 if (tag && tag.replace(/^v/, '') !== version) console.warn(`Warning: git tag "${tag}" does not match release version "${version}".`);
-const releaseTag = tag ?? `v${version}`;
 
 const target = path.join(root, 'target/x86_64-pc-windows-msvc/release');
 const portable = path.join(root, 'dist/FreeC-Tier-release');
@@ -57,7 +56,9 @@ await writeFile(configPath, JSON.stringify(config, null, 2));
 execFileSync(process.execPath, [path.join(gui, 'node_modules/@tauri-apps/cli/tauri.js'), 'build', '--target', 'x86_64-pc-windows-msvc', '--config', configPath, '--', '--locked'], { cwd: gui, stdio: 'inherit' });
 const installers = (await readdir(path.join(target, 'bundle/nsis'))).filter(name => name.endsWith('.exe') && name.includes(`_${version}_`));
 if (installers.length !== 1) throw new Error(`Expected one ${version} installer, found ${installers.length}`);
-const installer = `FreeC-Tier_${version}_x64-setup.exe`;
+// Asset names stay version-free: the permanent link
+// .../releases/latest/download/<asset> always serves the newest build.
+const installer = 'FreeC-Tier_x64-setup.exe';
 const installerSource = path.join(target, 'bundle/nsis', installers[0]);
 await copyFile(installerSource, path.join(output, installer));
 if (signed) {
@@ -65,10 +66,10 @@ if (signed) {
   await writeFile(path.join(output, `${installer}.sig`), signature);
   await writeFile(path.join(output, 'latest.json'), JSON.stringify({
     version, notes: `FreeC Tier PREVIEW ${version}`, pub_date: new Date().toISOString(),
-    platforms: { 'windows-x86_64': { signature, url: `https://github.com/${repo}/releases/download/${releaseTag}/${installer}` } },
+    platforms: { 'windows-x86_64': { signature, url: `https://github.com/${repo}/releases/latest/download/${installer}` } },
   }, null, 2));
 }
-const zip = path.join(output, `FreeC-Tier_${version}_x64-portable.zip`);
+const zip = path.join(output, 'FreeC-Tier_x64-portable.zip');
 execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'Compress-Archive -LiteralPath $env:FCT_PORTABLE -DestinationPath $env:FCT_ARCHIVE -Force'], { stdio: 'inherit', env: { ...process.env, FCT_PORTABLE: portable, FCT_ARCHIVE: zip } });
 const artifacts = [installer, path.basename(zip), ...(signed ? [`${installer}.sig`, 'latest.json'] : [])];
 const sums = await Promise.all(artifacts.map(async name => `${createHash('sha256').update(await readFile(path.join(output, name))).digest('hex')}  ${name}`));
