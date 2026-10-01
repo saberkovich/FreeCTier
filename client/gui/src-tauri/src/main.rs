@@ -15,6 +15,7 @@ use tauri_plugin_updater::UpdaterExt;
 struct Settings {
     minimize_to_tray: bool,
     check_updates: bool,
+    autostart: bool,
     theme: String,
 }
 impl Default for Settings {
@@ -22,6 +23,7 @@ impl Default for Settings {
         Self {
             minimize_to_tray: true,
             check_updates: true,
+            autostart: false,
             theme: "dark".into(),
         }
     }
@@ -169,12 +171,47 @@ fn open_url(target: &str) -> Result<(), String> {
     }
     Ok(())
 }
-/// Steam has no API to hide the "in-game" status; the player changes it in
-/// their own account privacy settings. Open that page in the default browser.
+/// Autostart uses Task Scheduler instead of the Run registry key: the app
+/// manifest requires administrator, and a scheduled task with highest
+/// privileges starts at logon without a UAC prompt every time.
 #[tauri::command]
-fn open_steam_privacy() -> Result<(), String> {
+fn set_autostart(enabled: bool) -> Result<(), String> {
     #[cfg(windows)]
-    open_url("https://steamcommunity.com/my/edit/settings")?;
+    {
+        use std::os::windows::process::CommandExt;
+        let run = |args: &[&str]| -> Result<bool, String> {
+            std::process::Command::new("schtasks.exe")
+                .args(args)
+                .creation_flags(0x0800_0000)
+                .output()
+                .map(|output| output.status.success())
+                .map_err(|e| e.to_string())
+        };
+        if enabled {
+            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+            let task = format!("\"{}\"", exe.display());
+            if !run(&[
+                "/Create",
+                "/F",
+                "/TN",
+                "FreeC Tier",
+                "/TR",
+                &task,
+                "/SC",
+                "ONLOGON",
+                "/RL",
+                "HIGHEST",
+            ])? {
+                return Err("Не удалось создать задачу автозапуска".into());
+            }
+        } else if !run(&["/Delete", "/TN", "FreeC Tier", "/F"])?
+            && run(&["/Query", "/TN", "FreeC Tier"])?
+        {
+            // Delete failed and the task still exists — report it. A missing
+            // task is already the disabled state the user asked for.
+            return Err("Не удалось отключить автозапуск".into());
+        }
+    }
     Ok(())
 }
 fn shutdown(app: &tauri::AppHandle) {
@@ -420,11 +457,11 @@ fn main() {
             dispatch,
             settings,
             save_settings,
+            set_autostart,
             check_update,
             install_update,
             quit,
-            version,
-            open_steam_privacy
+            version
         ])
         .build(tauri::generate_context!())
         .expect("Cannot initialize FreeC Tier")

@@ -413,6 +413,22 @@ impl Engine {
         Ok(())
     }
 
+    /// Networks turn their adapter on by default: creation, first admission and
+    /// re-admission queue the request here. It is persisted so restarts keep the
+    /// network enabled, and executed by the tick's restore pass, which reports
+    /// subnet conflicts in the event log.
+    fn request_auto_enable(&mut self, network: Uuid) -> Result<()> {
+        let mut enabled: Vec<_> = self.store.load_enabled()?;
+        if !enabled.contains(&network) {
+            enabled.push(network);
+            self.store.save_enabled(&enabled)?;
+        }
+        if !self.restore.contains(&network) {
+            self.restore.push(network);
+        }
+        Ok(())
+    }
+
     fn save_network(&mut self, signed: SignedNetwork) -> Result<()> {
         self.store.save(&signed)?;
         let id = signed.network.id;
@@ -465,6 +481,7 @@ impl Engine {
                 self.store.save(&network)?;
                 let id = network.network.id;
                 self.networks.insert(id, network);
+                self.request_auto_enable(id)?;
                 self.command(Command::Invite { network: id })?;
             }
             Command::Invite { network } => {
@@ -585,6 +602,11 @@ impl Engine {
                 let signed = SignedNetwork::sign(next, &self.key)?;
                 self.store.save(&signed)?;
                 self.networks.insert(network, signed);
+                // Restore the adapter only if the user kept this network enabled.
+                if self.store.load_enabled()?.contains(&network) && !self.restore.contains(&network)
+                {
+                    self.restore.push(network);
+                }
             }
             Command::SetAccess { network, public } => {
                 let mut next = self
@@ -912,19 +934,27 @@ impl Engine {
         if !self.restore.is_empty() {
             let restore = std::mem::take(&mut self.restore);
             for id in restore {
+                if self.adapters.contains_key(&id) {
+                    // A manual enable won the race; keep its state.
+                    continue;
+                }
                 if let Some(config) = self.networks.get(&id) {
                     if config.network.member(&self.local).is_some() {
                         if self.adapters.keys().any(|active| {
                             self.networks[active].network.subnet == config.network.subnet
                         }) {
-                            log(view, "Адаптер не восстановлен: конфликт подсетей");
+                            log(view, "Сеть не включилась автоматически: конфликт подсетей");
                             continue;
                         }
                         match adapter::Adapter::open(&config.network, &self.local) {
                             Ok(adapter) => {
                                 self.adapters.insert(id, adapter);
+                                log(view, "Сеть включена автоматически");
                             }
-                            Err(error) => log(view, &format!("Адаптер не восстановлен: {error:#}")),
+                            Err(error) => log(
+                                view,
+                                &format!("Сеть не включилась автоматически: {error:#}"),
+                            ),
                         }
                     }
                 }
@@ -1295,6 +1325,8 @@ impl Engine {
                     signed
                 };
                 self.save_network(signed)?;
+                // First admission: the network joins enabled by default.
+                self.request_auto_enable(frame.network)?;
                 self.offers.remove(&frame.network);
                 self.join_sent.remove(&frame.network);
                 if let Some((_, lobby, _)) = self.pending.remove(&frame.network) {

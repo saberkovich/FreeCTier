@@ -129,9 +129,11 @@ test('real state rendering is escaped and adapter action reaches IPC', async ({ 
     Object.assign(window, { isTauri: true, __TAURI_INTERNALS__: { invoke: async (command: string, args: unknown) => {
       if (command === 'snapshot') { fixture.sent++; fixture.received += 2; fixture.dropped++; fixture.networks[0].revision++; return structuredClone(fixture); }
       if (command === 'version') return '0.2.1-preview';
-      if (command === 'settings') return { minimize_to_tray: true, check_updates: false, theme: 'dark' };
+      if (command === 'settings') return { minimize_to_tray: true, check_updates: true, autostart: false, theme: 'dark' };
       if (command === 'save_settings') Object.assign(window, { savedSettings: args });
-      if (command === 'check_update') return { configured: false, version: null };
+      if (command === 'set_autostart') Object.assign(window, { lastAutostart: args });
+      if (command === 'check_update') return { configured: true, version: '0.3.0' };
+      if (command === 'install_update') Object.assign(window, { installedUpdate: true });
       if (command === 'dispatch') {
         Object.assign(window, { lastCommand: args });
         const action = (args as { command: { type: string; public?: boolean; can_invite?: boolean; can_kick?: boolean } }).command;
@@ -144,6 +146,11 @@ test('real state rendering is escaped and adapter action reaches IPC', async ({ 
   });
   await page.goto('/');
   await expect(page.locator('#brand-version')).toHaveText('0.2.1-preview');
+  // The header offers the found update on every page and installs it in place.
+  await expect(page.locator('#header-update')).toHaveText('Обновить до 0.3.0');
+  await page.locator('#header-update').click();
+  expect(await page.evaluate(() => (window as unknown as {installedUpdate: unknown}).installedUpdate)).toBe(true);
+  await expect(page.locator('#header-update')).toBeHidden();
   await expect(page.getByRole('heading', { name: 'Minecraft' })).toBeVisible();
   // The desktop webview must not show its default right-click menu.
   expect(await page.evaluate(() => {
@@ -190,7 +197,7 @@ test('real state rendering is escaped and adapter action reaches IPC', async ({ 
   await page.locator('#back-settings').click();
   await page.getByRole('button', { name: 'Скрыть статус' }).click();
   await expect(page.getByRole('dialog')).toBeVisible();
-  await expect(page.getByText('Приватность профиля')).toBeVisible();
+  await expect(page.getByText('Невидимка')).toHaveCount(0);
   await expect(page.getByText('Скрыть игру в библиотеке')).toBeVisible();
   await page.screenshot({ path: '../../.cache/screenshots/steam-help.png' });
   await page.keyboard.press('Escape');
@@ -198,9 +205,13 @@ test('real state rendering is escaped and adapter action reaches IPC', async ({ 
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'light');
   await page.getByLabel('Сворачивать в трей').uncheck();
   await expect(page.getByLabel('Сворачивать в трей')).not.toBeChecked();
-  expect(await page.evaluate(() => (window as unknown as {savedSettings: unknown}).savedSettings)).toEqual({ settings: { minimize_to_tray: false, check_updates: false, theme: 'light' } });
+  await page.getByLabel('Автозапуск с включением ПК').check();
+  expect(await page.evaluate(() => (window as unknown as {lastAutostart: unknown}).lastAutostart)).toEqual({ enabled: true });
+  await expect(page.getByLabel('Автозапуск с включением ПК')).toBeChecked();
+  expect(await page.evaluate(() => (window as unknown as {savedSettings: unknown}).savedSettings)).toEqual({ settings: { minimize_to_tray: false, check_updates: true, autostart: true, theme: 'light' } });
   await page.getByRole('button', { name: 'Проверить', exact: true }).click();
-  await expect(page.locator('#update-message')).toContainText('Обновления не настроены');
+  await expect(page.locator('#update-message')).toContainText('Доступна версия 0.3.0');
+  await expect(page.getByRole('button', { name: 'Установить 0.3.0' })).toBeVisible();
   await page.screenshot({ path: '../../.cache/screenshots/settings.png', fullPage: true });
   await page.getByRole('link', { name: 'FreeC Tier — мои сети' }).click();
   await page.getByRole('button', { name: 'Удалить сеть с компьютера' }).click();

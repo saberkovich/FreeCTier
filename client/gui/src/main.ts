@@ -6,13 +6,13 @@ type Peer = { steam_id: string; name: string; ip: string; active: boolean; state
 type Network = { id: string; name: string; subnet: string; owner: string; revision: number; adapter: boolean; lobby?: string; public: boolean; can_invite: boolean; password: boolean; members: Peer[] };
 type Snapshot = { steam: string; steam_id?: string; nickname?: string; relay: string; networks: Network[]; friends: { steam_id: string; name: string }[]; events: string[]; received: number; sent: number; dropped: number; joins?: { id: string; name: string; password: boolean }[]; public_networks?: { lobby: string; name: string }[] };
 type Command = { type: string; [key: string]: unknown };
-type Settings = { minimize_to_tray: boolean; check_updates: boolean; theme: string };
+type Settings = { minimize_to_tray: boolean; check_updates: boolean; autostart?: boolean; theme: string };
 
 let state: Snapshot = { steam: 'waiting', relay: 'unknown', networks: [], friends: [], events: [], received: 0, sent: 0, dropped: 0 };
 let selected: string | undefined;
 let previous = '';
 let page: 'networks' | 'settings' | 'diagnostics' | 'discover' = 'networks';
-let preferences: Settings = { minimize_to_tray: true, check_updates: true, theme: 'dark' };
+let preferences: Settings = { minimize_to_tray: true, check_updates: true, autostart: false, theme: 'dark' };
 let updateMessage = 'Проверок ещё не было.';
 let updateVersion: string | null = null;
 let updating = false;
@@ -21,7 +21,7 @@ let appVersion = '';
 let createPublic = false;
 const app = document.querySelector<HTMLDivElement>('#app')!;
 app.innerHTML = `
-  <header class="topbar"><a class="brand" href="#" aria-label="FreeC Tier — мои сети"><span class="brand-mark">F</span><span class="brand-name">FreeC Tier</span><small class="brand-version" id="brand-version"></small></a><div id="session" role="status"></div></header>
+  <header class="topbar"><a class="brand" href="#" aria-label="FreeC Tier — мои сети"><span class="brand-mark">F</span><span class="brand-name">FreeC Tier</span><small class="brand-version" id="brand-version"></small></a><button id="header-update" class="header-update" hidden></button><div id="session" role="status"></div></header>
   <div class="workspace"><aside class="sidebar"><div class="rail-heading"><h2>Мои сети</h2><span id="network-count">0</span></div><nav id="network-list" aria-label="Сохранённые сети"></nav>
   <button class="button primary create" id="create">Создать сеть</button>
   <div class="sidebar-bottom"><button class="nav-button" id="settings">Настройки <span aria-hidden="true">⚙</span></button></div></aside>
@@ -32,10 +32,8 @@ app.innerHTML = `
   <dialog id="join-dialog"><form id="join-form"><div class="dialog-heading"><h2>Подключиться по lobby</h2><button class="icon-button close" type="button" aria-label="Закрыть">×</button></div><label for="lobby-id">Steam Lobby ID</label><input id="lobby-id" name="lobby" required inputmode="numeric" pattern="[0-9]{1,20}" placeholder="64-битный идентификатор" /><div class="dialog-actions"><button type="button" class="button close">Отмена</button><button class="button primary" type="submit">Присоединиться</button></div></form></dialog>
   <dialog id="invite-dialog"><div class="dialog-heading"><h2>Пригласить друга</h2><button class="icon-button close" aria-label="Закрыть">×</button></div><div id="friend-list"></div><button id="overlay" class="button">Открыть список в Steam</button></dialog>
   <dialog id="delete-dialog"><form id="delete-form"><div class="dialog-heading"><h2>Удалить сеть?</h2><button class="icon-button close" type="button" aria-label="Закрыть">×</button></div><p id="delete-description"></p><p>У остальных участников сеть останется.</p><div class="dialog-actions"><button type="button" class="button close">Отмена</button><button class="button danger" type="submit">Удалить сеть</button></div></form></dialog>
-  <dialog id="steam-help-dialog"><div class="dialog-heading"><h2>Скрыть статус в Steam</h2><button class="icon-button close" type="button" aria-label="Закрыть">×</button></div><p class="steam-help-note">Приложение работает через Steam, поэтому Steam показывает запущенную игру. Отключить это можно только в своём аккаунте — любым из способов.</p><div class="steam-help">
-    <section class="step"><span class="step-num">1</span><div class="step-body"><h3>Невидимка</h3><p>Кликните по своему имени в Steam и выберите «Невидимка».</p><img class="step-shot" src="/steam/invisible.png" alt="Меню статуса Steam с пунктом «Невидимка»" loading="lazy" /></div></section>
-    <section class="step"><span class="step-num">2</span><div class="step-body"><h3>Приватность профиля</h3><p>Профиль → Изменить профиль → «Доступ к игровой информации» → «Скрытый».</p><img class="step-shot" src="/steam/privacy.png" alt="Приватность профиля Steam" loading="lazy" /><button class="button" id="open-privacy">Открыть настройки приватности</button></div></section>
-    <section class="step"><span class="step-num">3</span><div class="step-body"><h3>Скрыть игру в библиотеке</h3><p>Библиотека → правый клик по игре → «Управление» → «Сделать приватной».</p><img class="step-shot" src="/steam/library.png" alt="Контекстное меню игры в библиотеке Steam" loading="lazy" /></div></section>
+  <dialog id="steam-help-dialog"><div class="dialog-heading"><h2>Скрыть статус в Steam</h2><button class="icon-button close" type="button" aria-label="Закрыть">×</button></div><p class="steam-help-note">Приложение работает через Steam, поэтому Steam показывает запущенную игру. Скройте её в своей библиотеке:</p><div class="steam-help">
+    <section class="step"><span class="step-num">1</span><div class="step-body"><h3>Скрыть игру в библиотеке</h3><p>Библиотека → правый клик по игре → «Управление» → «Сделать приватной».</p><img class="step-shot" src="/steam/library.png" alt="Контекстное меню игры в библиотеке Steam" loading="lazy" /></div></section>
   </div></dialog>`;
 
 const content = document.querySelector<HTMLElement>('#content')!;
@@ -74,6 +72,7 @@ async function send(command: Command): Promise<boolean> {
 
 function render() {
   renderJoinsBar();
+  renderHeaderUpdate();
   const online = state.steam === 'online';
   patch(document.querySelector<HTMLElement>('#session')!, `<span class="steam-pill ${online ? 'online' : 'offline'}"><i aria-hidden="true"></i>${online ? 'Steam подключён' : 'Steam не запущен'}</span>${state.nickname ? `<span class="account">${escape(state.nickname)}</span>` : ''}`);
   document.querySelector('#network-count')!.textContent = String(state.networks.length);
@@ -141,6 +140,22 @@ function renderJoinsBar() {
   document.querySelectorAll<HTMLButtonElement>('[data-password]').forEach(b => b.onclick = () => openPassword(b.dataset.password!, false));
   document.querySelectorAll<HTMLButtonElement>('[data-cancel-join]').forEach(b => b.onclick = () => { void send({ type: 'cancel_join', network: b.dataset.cancelJoin }); });
 }
+// An available update is always one click away in the header, on any page.
+function renderHeaderUpdate() {
+  const chip = document.querySelector<HTMLButtonElement>('#header-update')!;
+  if (!updateVersion) { chip.hidden = true; return; }
+  chip.hidden = false;
+  chip.disabled = updating;
+  chip.textContent = updating ? 'Обновляем…' : `Обновить до ${updateVersion}`;
+  chip.onclick = () => { void installUpdate(); };
+}
+async function installUpdate() {
+  updating = true; updateMessage = 'Загрузка и проверка подписи.';
+  renderHeaderUpdate();
+  if (page === 'settings') renderSettings();
+  try { await invoke('install_update'); } catch (error) { updateMessage = `Обновление не установлено: ${String(error)}`; notice(updateMessage); }
+  finally { updating = false; updateVersion = null; renderHeaderUpdate(); if (page === 'settings') renderSettings(); }
+}
 function renderDiscovery() {
   const joins = state.joins || [];
   contentHTML(`<section class="page" id="discovery-page"><div class="page-head"><h1>Публичные сети</h1><button class="button" id="refresh-public" ${state.steam === 'online' ? '' : 'disabled'}>Обновить</button></div>${joins.map(j => `<div class="card" id="pending-${j.id}"><div class="row"><span class="row-label">${escape(j.name)}<small>${j.password ? 'Требуется пароль' : 'Подключение…'}</small></span><div class="row-actions">${j.password ? `<button class="button primary" data-password="${j.id}">Ввести пароль</button>` : ''}<button class="text-button" data-cancel-join="${j.id}">Отмена</button></div></div></div>`).join('')}<div class="card">${(state.public_networks || []).map(n => `<div class="row"><span class="row-label">${escape(n.name)}</span><button class="button" data-lobby="${n.lobby}">Войти</button></div>`).join('') || '<p class="hint">Сети не найдены. Нажмите «Обновить», чтобы повторить поиск.</p>'}</div></section>`);
@@ -164,24 +179,27 @@ function updateDynamic() {
 }
 function renderSettings() {
   contentHTML(`<section class="page narrow" id="settings-page"><div class="page-head"><div><h1>Настройки</h1><p class="page-sub">${escape(appLabel())}</p></div></div>
-    <div class="card"><div class="row"><span class="row-label">Тема</span><div class="segmented" role="group" aria-label="Тема"><button id="theme-dark" class="seg ${preferences.theme !== 'light' ? 'active' : ''}" aria-pressed="${preferences.theme !== 'light'}">Тёмная</button><button id="theme-light" class="seg ${preferences.theme === 'light' ? 'active' : ''}" aria-pressed="${preferences.theme === 'light'}">Светлая</button></div></div><label class="row"><span class="row-label">Сворачивать в трей</span><input id="minimize-tray" type="checkbox" class="switch" ${preferences.minimize_to_tray ? 'checked' : ''} /></label></div>
+    <div class="card"><div class="row"><span class="row-label">Тема</span><div class="segmented" role="group" aria-label="Тема"><button id="theme-dark" class="seg ${preferences.theme !== 'light' ? 'active' : ''}" aria-pressed="${preferences.theme !== 'light'}">Тёмная</button><button id="theme-light" class="seg ${preferences.theme === 'light' ? 'active' : ''}" aria-pressed="${preferences.theme === 'light'}">Светлая</button></div></div><label class="row"><span class="row-label">Сворачивать в трей</span><input id="minimize-tray" type="checkbox" class="switch" ${preferences.minimize_to_tray ? 'checked' : ''} /></label><label class="row"><span class="row-label">Автозапуск с включением ПК<small>Запускать FreeC Tier при входе в Windows</small></span><input id="autostart" type="checkbox" class="switch" ${preferences.autostart ? 'checked' : ''} /></label></div>
     <h2 class="group-title">Обновления</h2><div class="card"><label class="row"><span class="row-label">Проверять при запуске</span><input id="auto-update" type="checkbox" class="switch" ${preferences.check_updates ? 'checked' : ''} /></label><div class="row"><span class="row-label muted" id="update-message" role="status">${escape(updateMessage)}</span><div class="row-actions"><button class="button" id="check-update" ${updating ? 'disabled' : ''}>${updating ? 'Проверяем…' : 'Проверить'}</button>${updateVersion ? `<button class="button primary" id="install-update" ${updating ? 'disabled' : ''}>Установить ${escape(updateVersion)}</button>` : ''}</div></div></div>
     <h2 class="group-title">Steam</h2><div class="card"><button class="row row-button" id="steam-help"><span class="row-label">Скрыть статус «играет»</span><span class="chev" aria-hidden="true">→</span></button></div>
     <h2 class="group-title">Дополнительно</h2><div class="card"><button class="row row-button" id="diagnostics"><span class="row-label">Диагностика</span><span class="chev" aria-hidden="true">→</span></button><div class="row"><span class="row-label">Завершение работы</span><button class="button" id="quit">Выйти</button></div></div></section>`);
   document.querySelector<HTMLButtonElement>('#theme-dark')!.onclick = () => setTheme('dark');
   document.querySelector<HTMLButtonElement>('#theme-light')!.onclick = () => setTheme('light');
   document.querySelector<HTMLInputElement>('#minimize-tray')!.onchange = e => { void savePreferences({ ...preferences, minimize_to_tray: (e.target as HTMLInputElement).checked }); };
+  document.querySelector<HTMLInputElement>('#autostart')!.onchange = async e => {
+    const input = e.target as HTMLInputElement;
+    // The scheduled task is the source of truth: persist the preference only
+    // after the task was created or removed, and revert on failure.
+    if (await desktop('set_autostart', { enabled: input.checked })) void savePreferences({ ...preferences, autostart: input.checked });
+    else input.checked = !input.checked;
+  };
   document.querySelector<HTMLInputElement>('#auto-update')!.onchange = e => { void savePreferences({ ...preferences, check_updates: (e.target as HTMLInputElement).checked }); };
   document.querySelector<HTMLButtonElement>('#diagnostics')!.onclick = () => { page = 'diagnostics'; render(); };
   document.querySelector<HTMLButtonElement>('#quit')!.onclick = () => { void desktop('quit'); };
   document.querySelector<HTMLButtonElement>('#steam-help')!.onclick = () => (document.querySelector('#steam-help-dialog') as HTMLDialogElement).showModal();
   document.querySelector<HTMLButtonElement>('#check-update')!.onclick = () => { void checkUpdate(); };
   const install = document.querySelector<HTMLButtonElement>('#install-update');
-  if (install) install.onclick = async () => {
-    updating = true; updateMessage = 'Загрузка и проверка подписи.'; renderSettings();
-    try { await invoke('install_update'); } catch (error) { updateMessage = `Обновление не установлено: ${String(error)}`; }
-    finally { updating = false; updateVersion = null; if (page === 'settings') renderSettings(); }
-  };
+  if (install) install.onclick = () => { void installUpdate(); };
 }
 function setTheme(theme: string) { applyTheme(theme); void savePreferences({ ...preferences, theme }); }
 async function desktop(command: string, args?: Record<string, unknown>) {
@@ -203,7 +221,7 @@ async function checkUpdate() {
     updateMessage = !result.configured ? 'Обновления не настроены в этой сборке.' : result.version ? `Доступна версия ${result.version}.` : 'Установлена актуальная версия.';
     if (result.version && page !== 'settings') notice(`Доступна версия ${result.version}.`);
   } catch (error) { updateMessage = `Не удалось проверить обновления: ${String(error)}`; }
-  finally { updating = false; if (page === 'settings') renderSettings(); }
+  finally { updating = false; if (page === 'settings') renderSettings(); renderHeaderUpdate(); }
 }
 function openCreate() { setCreateAccess(false); (document.querySelector('#create-dialog') as HTMLDialogElement).showModal(); }
 function setCreateAccess(publicAccess: boolean) {
@@ -235,7 +253,6 @@ document.querySelector('#settings')!.addEventListener('click', () => { page = 's
 document.querySelector('.brand')!.addEventListener('click', e => { e.preventDefault(); page = 'networks'; render(); });
 document.querySelector('#overlay')!.addEventListener('click', () => { if (selected) send({ type: 'invite', network: selected }); });
 document.querySelectorAll<HTMLButtonElement>('.close').forEach(button => button.onclick = () => button.closest('dialog')!.close());
-document.querySelector('#open-privacy')!.addEventListener('click', () => { void desktop('open_steam_privacy'); });
 document.querySelectorAll<HTMLImageElement>('.step-shot').forEach(image => image.addEventListener('error', () => image.classList.add('missing')));
 document.querySelector<HTMLFormElement>('#create-form')!.onsubmit = async e => {
   e.preventDefault(); const input = document.querySelector<HTMLInputElement>('#network-name')!;
