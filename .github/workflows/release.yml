@@ -47,10 +47,20 @@ jobs:
         with:
           name: FreeC-Tier-windows-x64
           path: dist/releases/*
-      - name: Create draft release
+      - name: Update tagged release
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $assets = (Get-ChildItem -LiteralPath dist/releases -File).FullName
-          gh release create "$env:GITHUB_REF_NAME" @assets --verify-tag --draft --title "FreeC Tier PREVIEW $env:GITHUB_REF_NAME" --generate-notes
+          $tag = $env:GITHUB_REF_NAME
+          $assets = @(Get-ChildItem -LiteralPath dist/releases -File | ForEach-Object { $_.FullName })
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            # Keep existing release title and notes; replace generated assets in place.
+            gh release upload $tag @assets --repo $env:GITHUB_REPOSITORY --clobber
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            gh release edit $tag --repo $env:GITHUB_REPOSITORY --draft=false
+          } else {
+            # Fallback for a tag that has no release page yet. Publish immediately.
+            gh release create $tag @assets --repo $env:GITHUB_REPOSITORY --verify-tag --title "FreeC Tier PREVIEW $tag" --generate-notes
+          }
