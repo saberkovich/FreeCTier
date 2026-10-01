@@ -155,6 +155,9 @@ pub enum Command {
         network: Uuid,
         password: String,
     },
+    CancelJoin {
+        network: Uuid,
+    },
     Discover,
     Delete {
         network: Uuid,
@@ -269,8 +272,10 @@ struct Engine {
     last_view: Instant,
     restore: Vec<Uuid>,
     refresh_configs: Instant,
-    /// Rate limit for forwarding admit requests to the owner, keyed by invitee.
-    requested: BTreeMap<(Uuid, u64), Instant>,
+    /// Cooldown for processing admission Join frames, keyed by applicant. Each
+    /// accepted frame costs a signature and a store write, so the sender-side
+    /// retry gates alone must not bound the owner's work.
+    join_cooldown: BTreeMap<(Uuid, u64), Instant>,
     offers: BTreeMap<Uuid, (u64, SignedNetwork)>,
     pins: BTreeMap<Uuid, String>,
     public_networks: Vec<PublicView>,
@@ -303,6 +308,9 @@ impl Engine {
                 }
                 next.upgrade(&local)?;
                 next.bind_key(&local, &local, hex::encode(key.verifying_key().as_bytes()))?;
+                if next.revision == signed.network.revision && signed.delegation.is_none() {
+                    continue;
+                }
                 *signed = SignedNetwork::sign(next, &key)?;
                 store.save(signed)?;
             }
@@ -334,7 +342,7 @@ impl Engine {
             last_view: Instant::now() - Duration::from_secs(1),
             restore,
             refresh_configs: Instant::now(),
-            requested: BTreeMap::new(),
+            join_cooldown: BTreeMap::new(),
             offers: BTreeMap::new(),
             pins: BTreeMap::new(),
             public_networks: Vec::new(),
@@ -635,7 +643,7 @@ impl Engine {
                 self.pins.remove(&network);
                 self.restore.retain(|id| *id != network);
                 self.sent_revisions.retain(|(_, id), _| *id != network);
-                self.requested.retain(|(id, _), _| *id != network);
+                self.join_cooldown.retain(|(id, _), _| *id != network);
                 if self.queued_invite.is_some_and(|(id, _)| id == network) {
                     self.queued_invite = None;
                 }
@@ -680,6 +688,14 @@ impl Engine {
             }
             Command::SubmitPassword { network, password } => {
                 self.request_join(network, &password)?
+            }
+            Command::CancelJoin { network } => {
+                self.offers.remove(&network);
+                self.join_sent.remove(&network);
+                self.pins.remove(&network);
+                if let Some((_, lobby, _)) = self.pending.remove(&network) {
+                    self.client.matchmaking().leave_lobby(lobby);
+                }
             }
             Command::Discover => {
                 let tx = self.events_tx.clone();
@@ -869,7 +885,7 @@ impl Engine {
                 self.publishing = None;
                 let lobby = result.map_err(anyhow::Error::msg)?;
                 if self.networks.get(&id).is_some_and(|n| {
-                    n.network.access == Access::Public && n.network.member(&self.local).is_some()
+                    n.network.access == Access::Public && n.network.may_invite(&self.local)
                 }) {
                     if let Err(error) = self.publish_metadata(id, lobby) {
                         self.client.matchmaking().leave_lobby(lobby);
@@ -944,7 +960,7 @@ impl Engine {
             .copied()
             .filter(|id| {
                 !self.networks.get(id).is_some_and(|n| {
-                    n.network.access == Access::Public && n.network.member(&self.local).is_some()
+                    n.network.access == Access::Public && n.network.may_invite(&self.local)
                 })
             })
             .collect();
@@ -956,6 +972,7 @@ impl Engine {
         if self.publishing.is_none() && self.publish_retry.elapsed() >= Duration::from_secs(10) {
             if let Some((&id, _)) = self.networks.iter().find(|(id, n)| {
                 n.network.access == Access::Public
+                    && n.network.may_invite(&self.local)
                     && n.network
                         .member(&self.local)
                         .is_some_and(|m| m.public_key.is_some())
@@ -973,14 +990,11 @@ impl Engine {
             }
         }
         // Lobby membership only opens the control channel, never the LAN.
-        self.requested.retain(|(id, _), time| {
-            self.lobby.is_some_and(|(network, _)| network == *id)
-                && time.elapsed() < Duration::from_secs(30)
-        });
+        self.join_cooldown
+            .retain(|_, time| time.elapsed() < Duration::from_secs(30));
         if let Some((id, lobby)) = self.lobby {
             if let Some(config) = self.networks.get(&id).map(|s| s.network.clone()) {
-                let may_invite = config.member(&self.local).is_some()
-                    && (config.access == Access::Public || config.may_invite(&self.local));
+                let may_invite = config.may_invite(&self.local);
                 if !may_invite {
                     self.client.matchmaking().leave_lobby(lobby);
                     self.lobby = None;
@@ -1312,7 +1326,7 @@ impl Engine {
                 ensure!(
                     config.owner == self.local
                         && config.member(&sender_id).is_some()
-                        && (config.access == Access::Public || config.may_invite(&sender_id)),
+                        && config.may_invite(&sender_id),
                     "Unauthorized owner consultation"
                 );
                 ensure!(
@@ -1354,6 +1368,7 @@ impl Engine {
                 if in_lobby
                     && signed.network.owner != self.local
                     && signed.network.member(&sender_id).is_none()
+                    && signed.network.may_invite(&self.local)
                 {
                     let owner = signed.network.owner.parse()?;
                     if self.transport.connected(owner) {
@@ -1364,18 +1379,31 @@ impl Engine {
                         );
                     }
                 }
-                let kind = if signed.network.member(&sender_id).is_some() {
-                    Kind::Config
-                } else {
-                    Kind::Offer
-                };
-                self.transport.send(
-                    sender,
-                    &Frame::encode(kind, frame.network, &serde_json::to_vec(signed)?)?,
-                    true,
-                )?;
+                if signed.network.member(&sender_id).is_some() {
+                    self.transport.send(
+                        sender,
+                        &Frame::encode(Kind::Config, frame.network, &serde_json::to_vec(signed)?)?,
+                        true,
+                    )?;
+                } else if signed.network.may_invite(&self.local) {
+                    // Only inviters hand out offers, so a lobby of a member whose
+                    // invite flag was revoked is never an admission channel.
+                    self.transport.send(
+                        sender,
+                        &Frame::encode(Kind::Offer, frame.network, &serde_json::to_vec(signed)?)?,
+                        true,
+                    )?;
+                }
             }
             Kind::Join => {
+                ensure!(
+                    self.join_cooldown
+                        .get(&(frame.network, sender))
+                        .is_none_or(|time| time.elapsed() >= Duration::from_secs(2)),
+                    "Admission request flood"
+                );
+                self.join_cooldown
+                    .insert((frame.network, sender), Instant::now());
                 let request: JoinRequest = serde_json::from_slice(frame.payload)?;
                 let signed = self
                     .networks
@@ -1440,8 +1468,7 @@ impl Engine {
                     "Offer from nonmember"
                 );
                 ensure!(
-                    signed.network.access == Access::Public
-                        || signed.network.may_invite(&sender_id),
+                    signed.network.may_invite(&sender_id),
                     "Inviter lacks permission"
                 );
                 if let Some((old_peer, old)) = self.offers.get(&frame.network) {

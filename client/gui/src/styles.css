@@ -169,6 +169,11 @@ details.net summary::marker { color: var(--faint); }
 .event-log p { margin: 10px 0; color: var(--muted); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
 
 #notice { position: fixed; right: 22px; bottom: 22px; max-width: min(420px, calc(100vw - 44px)); padding: 14px 18px; border-radius: 12px; background: var(--accent); color: #fff; font-size: 13px; line-height: 1.5; box-shadow: 0 12px 32px #0006; z-index: 20; }
+#joins-bar { position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%); display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; max-width: calc(100vw - 44px); z-index: 19; }
+#joins-bar[hidden] { display: none; }
+.join-chip { display: flex; align-items: center; gap: 12px; padding: 9px 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); color: var(--text); font-size: 12px; box-shadow: 0 12px 32px #0006; }
+.join-chip small { color: var(--muted); }
+.join-chip .text-button { color: var(--danger); white-space: nowrap; }
 
 dialog { width: min(440px, calc(100vw - 40px)); border: 1px solid var(--line); border-radius: 16px; padding: 24px; background: var(--surface); color: var(--text); box-shadow: 0 24px 64px #0007; }
 dialog::backdrop { background: #0d0407aa; }

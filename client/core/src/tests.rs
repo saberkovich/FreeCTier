@@ -220,43 +220,61 @@ mod policy {
 
     #[test]
     fn participant_requests_enforce_current_policy_and_preserve_revocations() {
-        let key = SigningKey::from_bytes(&[8; 32]);
-        let mut network = Network::new("Requests".into(), 76561198000000001, 0, &key).unwrap();
+        use crate::config::Operation;
+        let owner_key = SigningKey::from_bytes(&[8; 32]);
+        let inviter_key = SigningKey::from_bytes(&[9; 32]);
+        let applicant_key = SigningKey::from_bytes(&[10; 32]);
+        let mut network = Network::new("Requests".into(), 76561198000000001, 0, &owner_key).unwrap();
         let owner = network.owner.clone();
         let inviter = "76561198000000002";
+        let applicant = "76561198000000003";
         network.admit(&owner, inviter.parse().unwrap()).unwrap();
-        assert!(network
-            .admit_requested(&owner, inviter, 76561198000000003)
+        network
+            .bind_key(&owner, inviter, hex::encode(inviter_key.verifying_key().as_bytes()))
+            .unwrap();
+        let applicant_public = hex::encode(applicant_key.verifying_key().as_bytes());
+        let admit_applicant = || Operation::Admit {
+            steam_id: applicant.to_string(),
+            public_key: applicant_public.clone(),
+            proof: None,
+        };
+        let sign = |network: &Network| SignedNetwork::sign(network.clone(), &owner_key).unwrap();
+
+        // Private network: even the owner's blessing of the request flow does not
+        // widen invitations; the signer needs the flag on a public network.
+        assert!(sign(&network)
+            .delegate(inviter, admit_applicant(), &inviter_key)
             .is_err());
         network.set_access(&owner, Access::Public).unwrap();
-        assert!(network
-            .admit_requested(inviter, inviter, 76561198000000003)
-            .is_err());
-        assert!(network
-            .admit_requested(&owner, "76561198000000999", 76561198000000003)
-            .is_err());
         network.set_member_invite(&owner, inviter, false).unwrap();
-        assert!(network
-            .admit_requested(&owner, inviter, 76561198000000003)
+        assert!(sign(&network)
+            .delegate(inviter, admit_applicant(), &inviter_key)
             .is_err());
         network.set_member_invite(&owner, inviter, true).unwrap();
-        assert!(network
-            .admit_requested(&owner, inviter, 76561198000000003)
-            .unwrap());
-        let revision = network.revision;
-        assert!(!network
-            .admit_requested(&owner, inviter, 76561198000000003)
-            .unwrap());
-        assert_eq!(network.revision, revision);
-        let ip = network.member("76561198000000003").unwrap().ip;
-        network.revoke(&owner, "76561198000000003").unwrap();
-        assert!(network
-            .admit_requested(&owner, inviter, 76561198000000003)
+        let signed = sign(&network);
+        let admitted = signed
+            .delegate(inviter, admit_applicant(), &inviter_key)
+            .unwrap();
+        assert!(admitted.network.member(applicant).is_some());
+        // An already known reservation, active or revoked, is never admitted twice.
+        assert!(admitted
+            .delegate(inviter, admit_applicant(), &inviter_key)
             .is_err());
-        assert!(network.member("76561198000000003").is_none());
+        let ip = admitted.network.member(applicant).unwrap().ip;
+        // The owner applies the same admission directly; the reservation is stable.
+        network.admit(&owner, applicant.parse().unwrap()).unwrap();
+        assert_eq!(network.member(applicant).unwrap().ip, ip);
+        network.revoke(&owner, applicant).unwrap();
+        let signed = sign(&network);
+        assert!(signed
+            .delegate(inviter, admit_applicant(), &inviter_key)
+            .is_err());
+        assert!(network.member(applicant).is_none());
         network.revoke(&owner, inviter).unwrap();
-        assert!(network
-            .admit_requested(&owner, inviter, 76561198000000004)
+        let signed = sign(&network);
+        // A revoked signer cannot start admissions at all.
+        assert!(signed
+            .delegate(inviter, admit_applicant(), &inviter_key)
             .is_err());
         assert_eq!(network.admit(&owner, 76561198000000003).unwrap(), ip);
         assert!(network.set_member_invite(&owner, &owner, false).is_err());

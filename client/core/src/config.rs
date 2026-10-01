@@ -239,29 +239,6 @@ impl Network {
                 .any(|m| m.active && m.steam_id == steam_id && m.can_invite)
     }
 
-    /// Admission requested by an authenticated participant. Revoked reservations
-    /// may only be restored through the owner's explicit readmit action.
-    pub fn admit_requested(&mut self, actor: &str, inviter: &str, steam_id: u64) -> Result<bool> {
-        ensure!(actor == self.owner, "Only the owner admits members");
-        ensure!(
-            self.may_invite(inviter),
-            "Sender may not invite to this network"
-        );
-        if let Some(member) = self
-            .members
-            .iter()
-            .find(|m| m.steam_id == steam_id.to_string())
-        {
-            ensure!(
-                member.active,
-                "Revoked members require explicit re-admission"
-            );
-            return Ok(false);
-        }
-        self.admit(actor, steam_id)?;
-        Ok(true)
-    }
-
     pub fn set_access(&mut self, actor: &str, access: Access) -> Result<()> {
         ensure!(actor == self.owner, "Only the owner can change access");
         if self.access != access {
@@ -504,7 +481,7 @@ impl SignedNetwork {
                 proof,
             } => {
                 ensure!(
-                    next.access == Access::Public || next.may_invite(signer),
+                    next.may_invite(signer),
                     "Invitation not permitted"
                 );
                 ensure!(

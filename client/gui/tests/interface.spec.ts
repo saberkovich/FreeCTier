@@ -30,6 +30,17 @@ test('public discovery refreshes without network changes and password reaches IP
   await expect(page.locator('#notice')).toContainText('Неверный пароль сети');
   expect(await page.evaluate(() => (window as unknown as {lastCommand: unknown}).lastCommand)).toEqual({ command: { type: 'submit_password', network: '67ae3f2d-0734-47f8-bf1b-e5e2bc64a289', password: 'wrong password' } });
   await page.keyboard.press('Escape');
+  // The pending admission is cancellable and no longer hijacks navigation.
+  await page.getByRole('button', { name: 'Отмена', exact: true }).click();
+  expect(await page.evaluate(() => (window as unknown as {lastCommand: unknown}).lastCommand)).toEqual({ command: { type: 'cancel_join', network: '67ae3f2d-0734-47f8-bf1b-e5e2bc64a289' } });
+  await page.locator('#settings').click();
+  await expect(page.locator('#settings-page')).toBeVisible();
+  const bar = page.locator('#joins-bar');
+  await expect(bar).toBeVisible();
+  await expect(bar.locator('.join-chip')).toHaveCount(1);
+  await bar.getByRole('button', { name: 'Пароль', exact: true }).click();
+  await expect(page.locator('#password-dialog')).toBeVisible();
+  await page.keyboard.press('Escape');
   await page.setViewportSize({ width: 390, height: 844 });
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
 });

@@ -140,7 +140,7 @@ fn version(app: tauri::AppHandle) -> String {
 /// Steam has no API to hide the "in-game" status; the player changes it in
 /// their own account privacy settings. Open that page in the default browser.
 #[tauri::command]
-fn open_steam_privacy() {
+fn open_steam_privacy() -> Result<(), String> {
     #[cfg(windows)]
     unsafe {
         #[link(name = "shell32")]
@@ -158,15 +158,21 @@ fn open_steam_privacy() {
         let url: Vec<u16> = "https://steamcommunity.com/my/edit/settings\0"
             .encode_utf16()
             .collect();
-        ShellExecuteW(
-            std::ptr::null_mut(),
-            operation.as_ptr(),
-            url.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-            1,
-        );
+        // ShellExecuteW returns a value greater than 32 on success.
+        let launched =
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                operation.as_ptr(),
+                url.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+            );
+        if launched as usize <= 32 {
+            return Err("Не удалось открыть настройки приватности Steam".into());
+        }
     }
+    Ok(())
 }
 fn shutdown(app: &tauri::AppHandle) {
     let _ = app.state::<Handle>().send(Command::Shutdown);

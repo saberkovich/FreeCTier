@@ -61,6 +61,8 @@ impl Password {
         member_key: &str,
     ) -> Result<String> {
         let key = self.key(password)?;
+        // This message surfaces verbatim in the GUI event log, which is Russian;
+        // every other error here is internal and stays English.
         ensure!(
             hex::encode(key.verifying_key().as_bytes()) == self.verifier,
             "Неверный пароль сети"
