@@ -15,7 +15,6 @@ use tauri_plugin_updater::UpdaterExt;
 struct Settings {
     minimize_to_tray: bool,
     check_updates: bool,
-    skip_uac: bool,
     autostart: bool,
     theme: String,
 }
@@ -24,7 +23,6 @@ impl Default for Settings {
         Self {
             minimize_to_tray: true,
             check_updates: true,
-            skip_uac: false,
             autostart: false,
             theme: "dark".into(),
         }
@@ -67,6 +65,85 @@ fn save_settings(
     *current = settings;
     Ok(())
 }
+const SERVICE_NAME: &str = "FreeCTierService";
+
+/// SCM status of the companion service, queried without elevation.
+#[derive(Serialize)]
+struct ServiceStateInfo {
+    installed: bool,
+    running: bool,
+}
+
+fn query_service() -> Option<bool> {
+    use windows_service::service::{ServiceAccess, ServiceState};
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+    let manager =
+        ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).ok()?;
+    let service = manager
+        .open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS)
+        .ok()?;
+    Some(service.query_status().ok()?.current_state == ServiceState::Running)
+}
+
+#[tauri::command]
+fn service_status() -> ServiceStateInfo {
+    match query_service() {
+        Some(running) => ServiceStateInfo {
+            installed: true,
+            running,
+        },
+        None => ServiceStateInfo {
+            installed: false,
+            running: false,
+        },
+    }
+}
+
+#[tauri::command]
+fn install_service() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let service_exe = exe
+        .parent()
+        .ok_or_else(|| "Executable has no parent".to_string())?
+        .join("freec-service.exe");
+    open_with_verb(&service_exe.to_string_lossy(), "runas", "--install")
+}
+
+#[tauri::command]
+fn uninstall_service() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let service_exe = exe
+        .parent()
+        .ok_or_else(|| "Executable has no parent".to_string())?
+        .join("freec-service.exe");
+    open_with_verb(&service_exe.to_string_lossy(), "runas", "--uninstall")
+}
+
+/// Autostart uses the per-user Run key: the manifest is asInvoker, so no UAC
+/// appears at logon and no scheduled task is needed.
+#[tauri::command]
+fn set_autostart(enabled: bool) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use winreg::enums::{HKEY_CURRENT_USER, KEY_SET_VALUE};
+        let hkcu = winreg::RegKey::predef(HKEY_CURRENT_USER);
+        let key = hkcu
+            .open_subkey_with_flags(
+                "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+                KEY_SET_VALUE,
+            )
+            .map_err(|e| e.to_string())?;
+        if enabled {
+            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+            key.set_value("FreeC Tier", &format!("\"{}\"", exe.display()))
+                .map_err(|e| e.to_string())?;
+        } else {
+            let _ = key.delete_value("FreeC Tier");
+        }
+    }
+    Ok(())
+}
+
 fn update_config() -> Option<(&'static str, &'static str)> {
     let repo = option_env!("FREECTIER_GITHUB_REPOSITORY")?.trim();
     let key = option_env!("FREECTIER_UPDATER_PUBLIC_KEY")?.trim();
@@ -145,6 +222,10 @@ fn version(app: tauri::AppHandle) -> String {
 /// value greater than 32 on success.
 #[cfg(windows)]
 fn open_url(target: &str) -> Result<(), String> {
+    open_with_verb(target, "open", "")
+}
+#[cfg(windows)]
+fn open_with_verb(target: &str, verb: &str, arguments: &str) -> Result<(), String> {
     #[link(name = "shell32")]
     unsafe extern "system" {
         fn ShellExecuteW(
@@ -156,14 +237,15 @@ fn open_url(target: &str) -> Result<(), String> {
             show: i32,
         ) -> *mut std::ffi::c_void;
     }
-    let operation: Vec<u16> = "open\0".encode_utf16().collect();
+    let operation: Vec<u16> = format!("{verb}\0").encode_utf16().collect();
     let file: Vec<u16> = format!("{target}\0").encode_utf16().collect();
+    let parameters: Vec<u16> = format!("{arguments}\0").encode_utf16().collect();
     let launched = unsafe {
         ShellExecuteW(
             std::ptr::null_mut(),
             operation.as_ptr(),
             file.as_ptr(),
-            std::ptr::null(),
+            parameters.as_ptr(),
             std::ptr::null(),
             1,
         )
@@ -172,138 +254,6 @@ fn open_url(target: &str) -> Result<(), String> {
         return Err(format!("Не удалось открыть: {target}"));
     }
     Ok(())
-}
-/// The app manifest requires administrator, so every direct launch raises a
-/// UAC prompt. An elevated scheduled task starts without one: the skip-UAC
-/// setting registers the task for manual starts, and autostart adds a logon
-/// trigger to the same task. schtasks cannot create a trigger-less task
-/// without /SC, so the task is described in XML — spawning powershell.exe
-/// with an inline Register-ScheduledTask script would embed a classic
-/// malware IoC into the binary. Battery and time-limit defaults are
-/// overridden — otherwise the system would not start the task on battery and
-/// would kill the long-running process after 72 hours.
-#[cfg(windows)]
-fn apply_task(elevated_task: bool, start_at_logon: bool) -> Result<(), String> {
-    use std::ffi::OsStr;
-    use std::os::windows::process::CommandExt;
-    let schtasks = |args: &[&OsStr]| -> Result<bool, String> {
-        std::process::Command::new("schtasks.exe")
-            .args(args)
-            .creation_flags(0x0800_0000)
-            .output()
-            .map(|output| output.status.success())
-            .map_err(|e| e.to_string())
-    };
-    if !elevated_task {
-        // Delete failing on a missing task is the disabled state the caller
-        // asked for; only a delete failure with the task still present is an
-        // error.
-        let deleted = schtasks(&[
-            OsStr::new("/Delete"),
-            OsStr::new("/TN"),
-            OsStr::new("FreeC Tier"),
-            OsStr::new("/F"),
-        ])?;
-        if !deleted
-            && schtasks(&[
-                OsStr::new("/Query"),
-                OsStr::new("/TN"),
-                OsStr::new("FreeC Tier"),
-            ])?
-        {
-            return Err("Не удалось удалить задачу планировщика".into());
-        }
-        return Ok(());
-    }
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let command: String = exe
-        .to_string_lossy()
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;");
-    let trigger = if start_at_logon {
-        "<LogonTrigger><Enabled>true</Enabled></LogonTrigger>"
-    } else {
-        ""
-    };
-    let xml = format!(
-        r#"<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo>
-    <Description>FreeC Tier launcher</Description>
-  </RegistrationInfo>
-  <Triggers>{trigger}</Triggers>
-  <Principals>
-    <Principal id="Author">
-      <LogonType>InteractiveToken</LogonType>
-      <RunLevel>HighestAvailable</RunLevel>
-    </Principal>
-  </Principals>
-  <Settings>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
-    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
-    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <AllowHardTerminate>true</AllowHardTerminate>
-    <StartWhenAvailable>false</StartWhenAvailable>
-    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
-    <AllowStartOnDemand>true</AllowStartOnDemand>
-    <Enabled>true</Enabled>
-    <Hidden>false</Hidden>
-    <RunOnlyIfIdle>false</RunOnlyIfIdle>
-    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-    <Priority>7</Priority>
-  </Settings>
-  <Actions Context="Author">
-    <Exec>
-      <Command>{command}</Command>
-    </Exec>
-  </Actions>
-</Task>"#
-    );
-    // The declaration names UTF-16, so write the file as UTF-16LE with a BOM.
-    let mut bytes: Vec<u8> = vec![0xFF, 0xFE];
-    for unit in xml.encode_utf16() {
-        bytes.extend_from_slice(&unit.to_le_bytes());
-    }
-    let task_file = std::env::temp_dir().join("FreeC Tier.task.xml");
-    std::fs::write(&task_file, bytes).map_err(|e| e.to_string())?;
-    let registered = schtasks(&[
-        OsStr::new("/Create"),
-        OsStr::new("/F"),
-        OsStr::new("/TN"),
-        OsStr::new("FreeC Tier"),
-        OsStr::new("/XML"),
-        task_file.as_os_str(),
-    ]);
-    let _ = std::fs::remove_file(&task_file);
-    if !registered? {
-        return Err("Не удалось создать задачу планировщика".into());
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn apply_task(_elevated_task: bool, _start_at_logon: bool) -> Result<(), String> {
-    Ok(())
-}
-
-#[tauri::command]
-fn set_skip_uac(state: tauri::State<'_, Desktop>, enabled: bool) -> Result<(), String> {
-    let autostart = state.settings.lock().unwrap().autostart;
-    if !enabled && autostart {
-        return Err("Сначала отключите автозапуск".into());
-    }
-    apply_task(enabled || autostart, autostart)
-}
-
-#[tauri::command]
-fn set_autostart(state: tauri::State<'_, Desktop>, enabled: bool) -> Result<(), String> {
-    if enabled && !state.settings.lock().unwrap().skip_uac {
-        return Err("Сначала включите пропуск предупреждения User Account Control".into());
-    }
-    let skip_uac = enabled || state.settings.lock().unwrap().skip_uac;
-    apply_task(skip_uac, enabled)
 }
 fn shutdown(app: &tauri::AppHandle) {
     let _ = app.state::<Handle>().send(Command::Shutdown);
@@ -548,8 +498,10 @@ fn main() {
             dispatch,
             settings,
             save_settings,
-            set_skip_uac,
             set_autostart,
+            service_status,
+            install_service,
+            uninstall_service,
             check_update,
             install_update,
             quit,

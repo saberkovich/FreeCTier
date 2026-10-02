@@ -13,12 +13,15 @@
       />
     </dependentAssembly>
   </dependency>
-  <!-- The prototype manages Wintun in-process. Windows requests elevation
-       before Rust, Steamworks, or the saved-adapter restoration can run. -->
+  <!-- Wintun still needs elevation, but the process starts unelevated
+       (asInvoker): an instance without rights relaunches itself — through the
+       scheduled task when "Skip UAC" is enabled, or with a one-time UAC
+       prompt otherwise — before the engine initializes. This mirrors Mem
+       Reduct and keeps the running profile of a normal user process. -->
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>
-        <requestedExecutionLevel level="requireAdministrator" uiAccess="false" />
+        <requestedExecutionLevel level="asInvoker" uiAccess="false" />
       </requestedPrivileges>
     </security>
   </trustInfo>
