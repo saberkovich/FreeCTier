@@ -44,7 +44,15 @@ try { bytes = await readFile(zip); } catch (error) {
 const checksum = createHash('sha256').update(bytes).digest('hex');
 if (checksum !== '07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51') throw new Error('Wintun checksum mismatch');
 await writeFile(zip, bytes);
-execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'Expand-Archive -LiteralPath $env:FCT_ZIP -DestinationPath $env:FCT_EXTRACT -Force'], { env: { ...process.env, FCT_ZIP: zip, FCT_EXTRACT: cache }, stdio: 'inherit' });
+// Windows PowerShell 5.1 cannot autoload binary modules (Security) when the
+// parent shell polluted PSModulePath with PowerShell 7 paths, as the GitHub
+// Actions runner shell does. An unset variable restores the default paths.
+const powershellEnv = extra => {
+  const env = { ...process.env, ...extra };
+  delete env.PSModulePath;
+  return env;
+};
+execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'Expand-Archive -LiteralPath $env:FCT_ZIP -DestinationPath $env:FCT_EXTRACT -Force'], { env: powershellEnv({ FCT_ZIP: zip, FCT_EXTRACT: cache }), stdio: 'inherit' });
 await copyFile(path.join(cache, 'wintun', 'bin', 'amd64', 'wintun.dll'), path.join(output, 'wintun.dll'));
 await copyFile(path.join(cache, 'wintun', 'LICENSE.txt'), path.join(output, 'WINTUN-LICENSE.txt'));
 
@@ -80,7 +88,7 @@ const signature = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive
 $s = Get-AuthenticodeSignature -LiteralPath $env:FCT_BOOTSTRAP
 if ($s.Status -ne 'Valid' -or $s.SignerCertificate.Subject -notlike '*Microsoft Corporation*') {
   throw "Untrusted WebView2 bootstrapper: $($s.Status) / $($s.SignerCertificate.Subject)"
-}`], { env: { ...process.env, FCT_BOOTSTRAP: bootstrapperFile }, stdio: 'pipe' });
+}`], { env: powershellEnv({ FCT_BOOTSTRAP: bootstrapperFile }), stdio: 'pipe' });
 await copyFile(bootstrapperFile, path.join(output, 'MicrosoftEdgeWebview2Setup.exe'));
 console.log(`WebView2 bootstrapper staged in ${output} (signed by Microsoft)`);
 console.log(`Native libraries staged in ${output}`);

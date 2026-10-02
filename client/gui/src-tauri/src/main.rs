@@ -202,6 +202,9 @@ if ($env:FCT_LOGON -eq '1') {
     let status = std::process::Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .creation_flags(0x0800_0000)
+        // A polluted PSModulePath (e.g. launched from PowerShell 7) breaks
+        // module autoload in Windows PowerShell 5.1; unset restores defaults.
+        .env_remove("PSModulePath")
         .env("FCT_TASK", if elevated_task { "1" } else { "0" })
         .env("FCT_LOGON", if start_at_logon { "1" } else { "0" })
         .env("FCT_EXE", &exe)

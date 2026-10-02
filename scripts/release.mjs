@@ -79,7 +79,10 @@ if (signed) {
   }, null, 2));
 }
 const zip = path.join(output, 'FreeC-Tier_x64-portable.zip');
-execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'Compress-Archive -LiteralPath $env:FCT_PORTABLE -DestinationPath $env:FCT_ARCHIVE -Force'], { stdio: 'inherit', env: { ...process.env, FCT_PORTABLE: portable, FCT_ARCHIVE: zip } });
+const packagingEnv = { ...process.env, FCT_PORTABLE: portable, FCT_ARCHIVE: zip };
+// Same PowerShell 5.1 module-path cleanup as prepare-runtime.mjs.
+delete packagingEnv.PSModulePath;
+execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'Compress-Archive -LiteralPath $env:FCT_PORTABLE -DestinationPath $env:FCT_ARCHIVE -Force'], { stdio: 'inherit', env: packagingEnv });
 const artifacts = [installer, path.basename(zip), ...(signed ? [`${installer}.sig`, 'latest.json'] : [])];
 const sums = await Promise.all(artifacts.map(async name => `${createHash('sha256').update(await readFile(path.join(output, name))).digest('hex')}  ${name}`));
 await writeFile(path.join(output, 'SHA256SUMS.txt'), sums.join('\n') + '\n');
