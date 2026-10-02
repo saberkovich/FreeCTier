@@ -176,46 +176,109 @@ fn open_url(target: &str) -> Result<(), String> {
 /// The app manifest requires administrator, so every direct launch raises a
 /// UAC prompt. An elevated scheduled task starts without one: the skip-UAC
 /// setting registers the task for manual starts, and autostart adds a logon
-/// trigger to the same task. Battery and time-limit defaults are overridden —
-/// otherwise the system would not start the task on battery and would kill the
-/// long-running process after 72 hours.
+/// trigger to the same task. schtasks cannot create a trigger-less task
+/// without /SC, so the task is described in XML — spawning powershell.exe
+/// with an inline Register-ScheduledTask script would embed a classic
+/// malware IoC into the binary. Battery and time-limit defaults are
+/// overridden — otherwise the system would not start the task on battery and
+/// would kill the long-running process after 72 hours.
 #[cfg(windows)]
 fn apply_task(elevated_task: bool, start_at_logon: bool) -> Result<(), String> {
+    use std::ffi::OsStr;
     use std::os::windows::process::CommandExt;
+    let schtasks = |args: &[&OsStr]| -> Result<bool, String> {
+        std::process::Command::new("schtasks.exe")
+            .args(args)
+            .creation_flags(0x0800_0000)
+            .output()
+            .map(|output| output.status.success())
+            .map_err(|e| e.to_string())
+    };
+    if !elevated_task {
+        // Delete failing on a missing task is the disabled state the caller
+        // asked for; only a delete failure with the task still present is an
+        // error.
+        let deleted = schtasks(&[
+            OsStr::new("/Delete"),
+            OsStr::new("/TN"),
+            OsStr::new("FreeC Tier"),
+            OsStr::new("/F"),
+        ])?;
+        if !deleted
+            && schtasks(&[
+                OsStr::new("/Query"),
+                OsStr::new("/TN"),
+                OsStr::new("FreeC Tier"),
+            ])?
+        {
+            return Err("Не удалось удалить задачу планировщика".into());
+        }
+        return Ok(());
+    }
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let script = r#"
-$ErrorActionPreference = 'Stop'
-$name = 'FreeC Tier'
-$existing = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
-if ($env:FCT_TASK -eq '0') {
-  if ($existing) { Unregister-ScheduledTask -TaskName $name -Confirm:$false }
-  exit 0
-}
-$action = New-ScheduledTaskAction -Execute $env:FCT_EXE
-$principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Highest
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
-if ($env:FCT_LOGON -eq '1') {
-  Register-ScheduledTask -TaskName $name -Action $action -Principal $principal -Settings $settings -Trigger (New-ScheduledTaskTrigger -AtLogOn) -Force | Out-Null
-} else {
-  Register-ScheduledTask -TaskName $name -Action $action -Principal $principal -Settings $settings -Force | Out-Null
-}"#;
-    let status = std::process::Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .creation_flags(0x0800_0000)
-        // A polluted PSModulePath (e.g. launched from PowerShell 7) breaks
-        // module autoload in Windows PowerShell 5.1; unset restores defaults.
-        .env_remove("PSModulePath")
-        .env("FCT_TASK", if elevated_task { "1" } else { "0" })
-        .env("FCT_LOGON", if start_at_logon { "1" } else { "0" })
-        .env("FCT_EXE", &exe)
-        .output()
-        .map_err(|e| e.to_string())?;
-    if !status.status.success() {
-        let output = String::from_utf8_lossy(&status.stderr);
-        return Err(format!(
-            "Не удалось обновить задачу планировщика: {}",
-            output.trim()
-        ));
+    let command: String = exe
+        .to_string_lossy()
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;");
+    let trigger = if start_at_logon {
+        "<LogonTrigger><Enabled>true</Enabled></LogonTrigger>"
+    } else {
+        ""
+    };
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>FreeC Tier launcher</Description>
+  </RegistrationInfo>
+  <Triggers>{trigger}</Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>false</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{command}</Command>
+    </Exec>
+  </Actions>
+</Task>"#
+    );
+    // The declaration names UTF-16, so write the file as UTF-16LE with a BOM.
+    let mut bytes: Vec<u8> = vec![0xFF, 0xFE];
+    for unit in xml.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    let task_file = std::env::temp_dir().join("FreeC Tier.task.xml");
+    std::fs::write(&task_file, bytes).map_err(|e| e.to_string())?;
+    let registered = schtasks(&[
+        OsStr::new("/Create"),
+        OsStr::new("/F"),
+        OsStr::new("/TN"),
+        OsStr::new("FreeC Tier"),
+        OsStr::new("/XML"),
+        task_file.as_os_str(),
+    ]);
+    let _ = std::fs::remove_file(&task_file);
+    if !registered? {
+        return Err("Не удалось создать задачу планировщика".into());
     }
     Ok(())
 }
