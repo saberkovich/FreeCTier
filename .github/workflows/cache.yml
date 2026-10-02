@@ -1,10 +1,10 @@
 name: Rust cache
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
-  # Weekly refresh also covers the 7-day eviction of untouched caches during
-  # quiet weeks without commits.
+  # Cache warming runs on schedule only — not per commit. The key is
+  # content-based (Cargo.lock, rustc, Cargo.toml), so between refreshes tag
+  # runs keep restoring the last warmed state. Weekly cadence also covers the
+  # 7-day eviction of untouched caches during quiet weeks.
   schedule:
     - cron: '0 4 * * 0'
 
