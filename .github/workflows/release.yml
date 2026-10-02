@@ -21,12 +21,12 @@ jobs:
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Validate signing configuration
         shell: pwsh
         run: |
           if (-not $env:TAURI_SIGNING_PRIVATE_KEY -or -not $env:FREECTIER_UPDATER_PUBLIC_KEY) { throw 'Configure updater public key variable and private key secret first.' }
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm

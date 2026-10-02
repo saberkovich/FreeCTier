@@ -47,13 +47,14 @@ const config = {
     active: true, targets: ['nsis'], createUpdaterArtifacts: signed, icon: [iconPath],
     resources: Object.fromEntries(['steam_api64.dll', 'wintun.dll', 'WINTUN-LICENSE.txt'].map(name => [path.join(portable, name), name])),
     windows: {
+      // The installer carries the WebView2 bootstrapper and installs the
+      // runtime automatically when the machine lacks it. webviewInstallMode
+      // belongs to bundle.windows, not to the nsis section.
+      webviewInstallMode: { type: 'embedBootstrapper' },
       nsis: {
         installMode: 'perMachine',
         languages: ['Russian', 'English'],
         displayLanguageSelector: true,
-        // The installer carries the WebView2 bootstrapper and installs the
-        // runtime automatically when the machine lacks it.
-        webviewInstallMode: { type: 'embedBootstrapper' },
       },
     },
   },
