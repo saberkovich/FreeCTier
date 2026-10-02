@@ -129,9 +129,9 @@ test('real state rendering is escaped and adapter action reaches IPC', async ({ 
     Object.assign(window, { isTauri: true, __TAURI_INTERNALS__: { invoke: async (command: string, args: unknown) => {
       if (command === 'snapshot') { fixture.sent++; fixture.received += 2; fixture.dropped++; fixture.networks[0].revision++; return structuredClone(fixture); }
       if (command === 'version') return '0.2.1-preview';
-      if (command === 'settings') return { minimize_to_tray: true, check_updates: true, skip_uac: false, autostart: false, theme: 'dark' };
+      if (command === 'settings') return { minimize_to_tray: true, check_updates: true, autostart: false, theme: 'dark' };
       if (command === 'save_settings') Object.assign(window, { savedSettings: args });
-      if (command === 'set_skip_uac') Object.assign(window, { lastSkipUac: args });
+      if (command === 'service_status') return { installed: true, running: true };
       if (command === 'set_autostart') Object.assign(window, { lastAutostart: args });
       if (command === 'check_update') return { configured: true, version: '0.3.0' };
       if (command === 'install_update') Object.assign(window, { installedUpdate: true });
@@ -206,15 +206,13 @@ test('real state rendering is escaped and adapter action reaches IPC', async ({ 
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'light');
   await page.getByLabel('Сворачивать в трей').uncheck();
   await expect(page.getByLabel('Сворачивать в трей')).not.toBeChecked();
-  // Autostart is locked until the UAC-skip task setting is enabled.
-  await expect(page.getByLabel('Автозапуск с включением ПК')).toBeDisabled();
-  await page.getByLabel('Пропускать предупреждение User Account Control').check();
-  expect(await page.evaluate(() => (window as unknown as {lastSkipUac: unknown}).lastSkipUac)).toEqual({ enabled: true });
-  await expect(page.getByLabel('Автозапуск с включением ПК')).toBeEnabled();
-  await page.getByLabel('Автозапуск с включением ПК').check();
+  // The service card reports the companion service state; autostart toggles
+  // straight through the per-user Run key.
+  await expect(page.locator('#service-status')).toHaveText('Установлена и запущена');
+  await page.getByLabel('Запускать при входе в Windows').check();
   expect(await page.evaluate(() => (window as unknown as {lastAutostart: unknown}).lastAutostart)).toEqual({ enabled: true });
-  await expect(page.getByLabel('Автозапуск с включением ПК')).toBeChecked();
-  expect(await page.evaluate(() => (window as unknown as {savedSettings: unknown}).savedSettings)).toEqual({ settings: { minimize_to_tray: false, check_updates: true, skip_uac: true, autostart: true, theme: 'light' } });
+  await expect(page.getByLabel('Запускать при входе в Windows')).toBeChecked();
+  expect(await page.evaluate(() => (window as unknown as {savedSettings: unknown}).savedSettings)).toEqual({ settings: { minimize_to_tray: false, check_updates: true, autostart: true, theme: 'light' } });
   await page.getByRole('button', { name: 'Проверить', exact: true }).click();
   await expect(page.locator('#update-message')).toContainText('Доступна версия 0.3.0');
   await expect(page.getByRole('button', { name: 'Установить 0.3.0' })).toBeVisible();

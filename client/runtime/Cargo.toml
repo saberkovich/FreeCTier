@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 freec-core = { path = "../core" }
+freec-ipc = { path = "../ipc" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -16,4 +17,3 @@ fs2 = "0.4"
 hex = "0.4"
 
 [target.'cfg(windows)'.dependencies]
-wintun = "0.5.1"

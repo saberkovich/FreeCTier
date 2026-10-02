@@ -6,13 +6,13 @@ type Peer = { steam_id: string; name: string; ip: string; active: boolean; state
 type Network = { id: string; name: string; subnet: string; owner: string; revision: number; adapter: boolean; lobby?: string; public: boolean; can_invite: boolean; password: boolean; members: Peer[] };
 type Snapshot = { steam: string; steam_id?: string; nickname?: string; relay: string; networks: Network[]; friends: { steam_id: string; name: string }[]; events: string[]; received: number; sent: number; dropped: number; joins?: { id: string; name: string; password: boolean }[]; public_networks?: { lobby: string; name: string }[] };
 type Command = { type: string; [key: string]: unknown };
-type Settings = { minimize_to_tray: boolean; check_updates: boolean; skip_uac?: boolean; autostart?: boolean; theme: string };
+type Settings = { minimize_to_tray: boolean; check_updates: boolean; autostart?: boolean; theme: string };
 
 let state: Snapshot = { steam: 'waiting', relay: 'unknown', networks: [], friends: [], events: [], received: 0, sent: 0, dropped: 0 };
 let selected: string | undefined;
 let previous = '';
 let page: 'networks' | 'settings' | 'diagnostics' | 'discover' = 'networks';
-let preferences: Settings = { minimize_to_tray: true, check_updates: true, skip_uac: false, autostart: false, theme: 'dark' };
+let preferences: Settings = { minimize_to_tray: true, check_updates: true, autostart: false, theme: 'dark' };
 let updateMessage = 'Проверок ещё не было.';
 let updateVersion: string | null = null;
 let updating = false;
@@ -179,19 +179,29 @@ function updateDynamic() {
 }
 function renderSettings() {
   contentHTML(`<section class="page narrow" id="settings-page"><div class="page-head"><div><h1>Настройки</h1><p class="page-sub">${escape(appLabel())}</p></div></div>
-    <div class="card"><div class="row"><span class="row-label">Тема</span><div class="segmented" role="group" aria-label="Тема"><button id="theme-dark" class="seg ${preferences.theme !== 'light' ? 'active' : ''}" aria-pressed="${preferences.theme !== 'light'}">Тёмная</button><button id="theme-light" class="seg ${preferences.theme === 'light' ? 'active' : ''}" aria-pressed="${preferences.theme === 'light'}">Светлая</button></div></div><label class="row"><span class="row-label">Сворачивать в трей</span><input id="minimize-tray" type="checkbox" class="switch" ${preferences.minimize_to_tray ? 'checked' : ''} /></label><label class="row"><span class="row-label">Пропускать предупреждение User Account Control<small>Задача планировщика запускает FreeC Tier без окна UAC. Нужна для автозапуска.</small></span><input id="skip-uac" type="checkbox" class="switch" ${preferences.skip_uac ? 'checked' : ''} /></label><label class="row"><span class="row-label">Автозапуск с включением ПК<small>${preferences.skip_uac ? 'Запускать FreeC Tier при входе в Windows' : 'Сначала включите пропуск предупреждения UAC'}</small></span><input id="autostart" type="checkbox" class="switch" ${preferences.autostart ? 'checked' : ''} ${preferences.skip_uac ? '' : 'disabled'} /></label></div>
+    <div class="card"><div class="row"><span class="row-label">Тема</span><div class="segmented" role="group" aria-label="Тема"><button id="theme-dark" class="seg ${preferences.theme !== 'light' ? 'active' : ''}" aria-pressed="${preferences.theme !== 'light'}">Тёмная</button><button id="theme-light" class="seg ${preferences.theme === 'light' ? 'active' : ''}" aria-pressed="${preferences.theme === 'light'}">Светлая</button></div></div><label class="row"><span class="row-label">Сворачивать в трей</span><input id="minimize-tray" type="checkbox" class="switch" ${preferences.minimize_to_tray ? 'checked' : ''} /></label><label class="row"><span class="row-label">Запускать при входе в Windows<small>Манифест приложения не требует прав администратора, поэтому окно UAC не появится</small></span><input id="autostart" type="checkbox" class="switch" ${preferences.autostart ? "checked" : ""} /></label></div><h2 class="group-title">Служба</h2><div class="card"><div class="row"><span class="row-label">Служба FreeC Tier<small id="service-status">Проверяем…</small></span><div class="row-actions"><button class="button" id="service-install">Переустановить</button><button class="button" id="service-uninstall">Удалить</button></div></div></div>
     <h2 class="group-title">Обновления</h2><div class="card"><label class="row"><span class="row-label">Проверять при запуске</span><input id="auto-update" type="checkbox" class="switch" ${preferences.check_updates ? 'checked' : ''} /></label><div class="row"><span class="row-label muted" id="update-message" role="status">${escape(updateMessage)}</span><div class="row-actions"><button class="button" id="check-update" ${updating ? 'disabled' : ''}>${updating ? 'Проверяем…' : 'Проверить'}</button>${updateVersion ? `<button class="button primary" id="install-update" ${updating ? 'disabled' : ''}>Установить ${escape(updateVersion)}</button>` : ''}</div></div></div>
     <h2 class="group-title">Steam</h2><div class="card"><button class="row row-button" id="steam-help"><span class="row-label">Скрыть статус «играет»</span><span class="chev" aria-hidden="true">→</span></button></div>
     <h2 class="group-title">Дополнительно</h2><div class="card"><button class="row row-button" id="diagnostics"><span class="row-label">Диагностика</span><span class="chev" aria-hidden="true">→</span></button><div class="row"><span class="row-label">Завершение работы</span><button class="button" id="quit">Выйти</button></div></div></section>`);
   document.querySelector<HTMLButtonElement>('#theme-dark')!.onclick = () => setTheme('dark');
   document.querySelector<HTMLButtonElement>('#theme-light')!.onclick = () => setTheme('light');
   document.querySelector<HTMLInputElement>('#minimize-tray')!.onchange = e => { void savePreferences({ ...preferences, minimize_to_tray: (e.target as HTMLInputElement).checked }); };
-  document.querySelector<HTMLInputElement>('#skip-uac')!.onchange = async e => {
-    const input = e.target as HTMLInputElement;
-    // The backend refuses to drop the task while autostart still needs it.
-    if (await desktop('set_skip_uac', { enabled: input.checked })) void savePreferences({ ...preferences, skip_uac: input.checked });
-    else input.checked = !input.checked;
+    async function refreshServiceStatus() {
+    if (!isTauri()) return;
+    try {
+      const status = await invoke<{ installed: boolean; running: boolean }>('service_status');
+      const label = document.querySelector('#service-status');
+      if (label) label.textContent = status.running ? 'Установлена и запущена' : status.installed ? 'Установлена, но не запущена' : 'Не установлена';
+    } catch { /* service missing from this build */ }
+  }
+  void refreshServiceStatus();
+  document.querySelector<HTMLButtonElement>('#service-install')!.onclick = async () => {
+    if (await desktop('install_service')) setTimeout(() => void refreshServiceStatus(), 2500);
   };
+  document.querySelector<HTMLButtonElement>('#service-uninstall')!.onclick = async () => {
+    if (await desktop('uninstall_service')) setTimeout(() => void refreshServiceStatus(), 2500);
+  };
+
   document.querySelector<HTMLInputElement>('#autostart')!.onchange = async e => {
     const input = e.target as HTMLInputElement;
     // The scheduled task is the source of truth: persist the preference only

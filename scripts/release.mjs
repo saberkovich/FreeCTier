@@ -45,7 +45,7 @@ const config = {
   version,
   bundle: {
     active: true, targets: ['nsis'], createUpdaterArtifacts: signed, icon: [iconPath],
-    resources: Object.fromEntries(['steam_api64.dll', 'wintun.dll', 'WINTUN-LICENSE.txt'].map(name => [path.join(portable, name), name])),
+    resources: Object.fromEntries(['steam_api64.dll', 'wintun.dll', 'WINTUN-LICENSE.txt', 'freec-service.exe'].map(name => [path.join(portable, name), name])),
     windows: {
       // The installer carries the WebView2 bootstrapper and installs the
       // runtime automatically when the machine lacks it. webviewInstallMode
@@ -55,6 +55,7 @@ const config = {
         installMode: 'perMachine',
         languages: ['Russian', 'English'],
         displayLanguageSelector: true,
+        installerHooks: path.join(gui, 'src-tauri', 'installer-hooks.nsh'),
       },
     },
   },
@@ -85,6 +86,15 @@ const packagingEnv = { ...process.env, FCT_PORTABLE: portable, FCT_ARCHIVE: zip 
 delete packagingEnv.PSModulePath;
 execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'Compress-Archive -LiteralPath $env:FCT_PORTABLE -DestinationPath $env:FCT_ARCHIVE -Force'], { stdio: 'inherit', env: packagingEnv });
 const artifacts = [installer, path.basename(zip), ...(signed ? [`${installer}.sig`, 'latest.json'] : [])];
-const sums = await Promise.all(artifacts.map(async name => `${createHash('sha256').update(await readFile(path.join(output, name))).digest('hex')}  ${name}`));
+// Inner binaries get their own entries: antivirus false-positive submissions
+// must reference the hash of the exact file Defender flags, not just the
+// archive containing it.
+const inner = ['freec-tier.exe', 'freec-runtime.exe'].map(name => `FreeC-Tier-release/${name}`);
+const sums = await Promise.all(
+  [...artifacts, ...inner].map(async name => {
+    const file = name.startsWith('FreeC-Tier-release/') ? path.join(portable, path.basename(name)) : path.join(output, name);
+    return `${createHash('sha256').update(await readFile(file)).digest('hex')}  ${name}`;
+  }),
+);
 await writeFile(path.join(output, 'SHA256SUMS.txt'), sums.join('\n') + '\n');
 console.log(`Release artifacts: ${output}`);

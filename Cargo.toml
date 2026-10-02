@@ -1,5 +1,5 @@
 [workspace]
-members = ["client/core", "client/runtime", "client/gui/src-tauri"]
+members = ["client/core", "client/ipc", "client/runtime", "client/service", "client/gui/src-tauri"]
 default-members = ["client/core", "client/runtime"]
 resolver = "2"
 
