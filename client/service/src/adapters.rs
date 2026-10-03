@@ -29,25 +29,6 @@ pub struct Adapters {
     map: BTreeMap<Uuid, Entry>,
 }
 
-fn netsh(args: &[&str]) -> Result<()> {
-    use std::os::windows::process::CommandExt;
-    let netsh =
-        std::path::PathBuf::from(std::env::var_os("SystemRoot").context("SystemRoot is missing")?)
-            .join("System32/netsh.exe");
-    let output = std::process::Command::new(&netsh)
-        .args(args)
-        .creation_flags(0x0800_0000)
-        .output()
-        .context("Cannot run netsh")?;
-    anyhow::ensure!(
-        output.status.success(),
-        "Cannot configure Wintun: {} {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    Ok(())
-}
-
 impl Adapters {
     fn ensure_api(&mut self) -> Result<&wintun::Wintun> {
         if self.api.is_none() {
@@ -84,28 +65,15 @@ impl Adapters {
         })?;
         // Address assignment creates the connected /24 route. Never configure
         // a default gateway or DNS. Passing argv avoids shell interpolation.
-        let ip = local_ip.to_string();
-        netsh(&[
-            "interface",
-            "ipv4",
-            "set",
-            "address",
-            &format!("name={name}"),
-            "source=static",
-            &format!("address={ip}"),
-            "mask=255.255.255.0",
-            "gateway=none",
-            "store=active",
-        ])?;
-        netsh(&[
-            "interface",
-            "ipv4",
-            "set",
-            "subinterface",
-            &name,
-            &format!("mtu={MTU}"),
-            "store=active",
-        ])?;
+        // Configure the interface through the IP Helper API instead of
+        // netsh: netsh resolves the adapter by name and loses the race with
+        // a freshly created adapter in session 0; the LUID-based path has no
+        // such lookup. The address entry also creates the connected /24
+        // route, exactly like the previous netsh call did.
+        let index = interface_index(unsafe {
+            std::mem::transmute::<wintun::NET_LUID_LH, [u8; 8]>(adapter.get_luid())
+        })?;
+        configure_interface(index, local_ip)?;
         let session = Arc::new(adapter.start_session(wintun::MAX_RING_CAPACITY)?);
         let reader_session = Arc::clone(&session);
         let reader_network = network;
@@ -170,4 +138,72 @@ impl Adapters {
     pub fn clear(&mut self) {
         self.map.clear();
     }
+}
+
+/// Interface index for an adapter LUID, as the IP Helper API expects.
+fn interface_index(luid: [u8; 8]) -> Result<u32> {
+    use windows::Win32::NetworkManagement::IpHelper::ConvertInterfaceLuidToIndex;
+    use windows::Win32::NetworkManagement::Ndis::NET_LUID_LH;
+    // wintun_raw and windows define the same 8-byte union layout.
+    let mut converted = NET_LUID_LH::default();
+    converted.Value = u64::from_ne_bytes(luid);
+    let mut index = 0u32;
+    let result = unsafe { ConvertInterfaceLuidToIndex(&converted, &mut index) };
+    anyhow::ensure!(result.is_ok(), "ConvertInterfaceLuidToIndex: {:?}", result);
+    Ok(index)
+}
+
+/// Address + MTU via IP Helper: no child process, no name lookup, and the
+/// /24 on-link route is created with the address entry.
+fn configure_interface(index: u32, local_ip: Ipv4Addr) -> Result<()> {
+    use windows::Win32::Foundation::{ERROR_OBJECT_ALREADY_EXISTS, WIN32_ERROR};
+    use windows::Win32::NetworkManagement::IpHelper::{
+        CreateUnicastIpAddressEntry, GetIpInterfaceEntry, InitializeUnicastIpAddressEntry,
+        SetIpInterfaceEntry, MIB_IPINTERFACE_ROW, MIB_UNICASTIPADDRESS_ROW,
+    };
+    use windows::Win32::Networking::WinSock::{
+        IpPrefixOriginManual, IpSuffixOriginManual, AF_INET, IN_ADDR, IN_ADDR_0, SOCKADDR_INET,
+    };
+    unsafe {
+        // MTU. The stack reports SitePrefixLength 255 for IPv4 interfaces,
+        // which SetIpInterfaceEntry rejects unless normalized to zero.
+        let mut interface = MIB_IPINTERFACE_ROW {
+            Family: AF_INET,
+            InterfaceIndex: index,
+            ..Default::default()
+        };
+        GetIpInterfaceEntry(&mut interface)
+            .ok()
+            .context("GetIpInterfaceEntry")?;
+        interface.NlMtu = MTU;
+        interface.SitePrefixLength = 0;
+        SetIpInterfaceEntry(&mut interface)
+            .ok()
+            .context("SetIpInterfaceEntry (MTU)")?;
+
+        // Unicast address; re-registering a live adapter is a no-op.
+        let mut unicast = MIB_UNICASTIPADDRESS_ROW::default();
+        InitializeUnicastIpAddressEntry(&mut unicast);
+        unicast.InterfaceIndex = index;
+        unicast.Address = SOCKADDR_INET {
+            Ipv4: windows::Win32::Networking::WinSock::SOCKADDR_IN {
+                sin_family: AF_INET,
+                sin_port: 0,
+                sin_addr: IN_ADDR {
+                    S_un: IN_ADDR_0 {
+                        S_addr: u32::from_be_bytes(local_ip.octets()),
+                    },
+                },
+                sin_zero: [0; 8],
+            },
+        };
+        unicast.OnLinkPrefixLength = 24;
+        unicast.PrefixOrigin = IpPrefixOriginManual;
+        unicast.SuffixOrigin = IpSuffixOriginManual;
+        let result = CreateUnicastIpAddressEntry(&unicast);
+        if result != WIN32_ERROR(0) && result != ERROR_OBJECT_ALREADY_EXISTS {
+            anyhow::bail!("CreateUnicastIpAddressEntry: {:?}", result);
+        }
+    }
+    Ok(())
 }
