@@ -18,8 +18,9 @@ use uuid::Uuid;
 /// Per-network inbound queue depth. Overflow drops packets, mirroring Wintun
 /// ring backpressure on the service side.
 const QUEUE_DEPTH: usize = 1024;
-/// How long `open` waits for the service connection and the open ack.
-const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long `open` waits for the service connection and the open ack. Wintun
+/// adapter creation can take seconds on a cold system, so this is generous.
+const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 
 enum WriterMessage {
     Pipe(std::fs::File),
@@ -219,9 +220,20 @@ fn open_service_adapter(network: Uuid, local_ip: Ipv4Addr) -> Result<Receiver<Ve
         client.live.lock().unwrap().remove(&network);
         anyhow::bail!("Служба FreeC Tier не запущена — переустановите её в настройках приложения");
     }
-    let result = waiter
-        .recv_timeout(OPEN_TIMEOUT)
-        .map_err(|_| anyhow::anyhow!("Служба FreeC Tier не отвечает"))?;
+    // A timeout still cleans up: the live map drives adapter re-registration
+    // after reconnects, and a stale entry would reopen an adapter the engine
+    // considers closed. The service may complete the open later — its late
+    // ack finds no waiter and is dropped harmlessly, and a retry hits the
+    // service's already-open fast path.
+    let result = match waiter.recv_timeout(OPEN_TIMEOUT) {
+        Ok(result) => result,
+        Err(_) => {
+            client.pending_opens.lock().unwrap().remove(&network);
+            client.drop_queue(&network);
+            client.live.lock().unwrap().remove(&network);
+            anyhow::bail!("Служба FreeC Tier не отвечает");
+        }
+    };
     match result {
         Ok(()) => Ok(inbound),
         Err(message) => {
@@ -281,5 +293,70 @@ impl Drop for Adapter {
         }) {
             let _ = client.send(frame);
         }
+    }
+}
+
+#[cfg(test)]
+mod service_live {
+    use super::*;
+
+    struct ServiceGuard(std::process::Child);
+    impl ServiceGuard {
+        fn kill(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    impl Drop for ServiceGuard {
+        fn drop(&mut self) {
+            self.kill();
+        }
+    }
+
+    /// End-to-end plumbing check against a real console-mode service: the
+    /// OpenAdapter reply must arrive well within the open window (a regression
+    /// test for replies lost to concurrent pipe writes). The adapter itself
+    /// fails without elevation, but the reply path under test is identical.
+    /// Skipped when the service binary has not been built yet, or when
+    /// another (e.g. the installed) service instance already owns the pipe.
+    #[test]
+    fn open_reply_arrives_from_service() {
+        let exe = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/debug/freec-service.exe");
+        if !exe.is_file() {
+            eprintln!("skipping: {} is not built", exe.display());
+            return;
+        }
+        let stderr = std::process::Stdio::piped();
+        let mut child = std::process::Command::new(&exe)
+            .arg("--console")
+            .stdout(std::process::Stdio::null())
+            .stderr(stderr)
+            .spawn()
+            .expect("spawn console service");
+        // A stale foreign service (e.g. the installed one) owns the pipe; the
+        // spawned instance then cannot bind and the probe cannot judge the
+        // reply path. Its stderr tells the two cases apart.
+        let mut child_stderr = child.stderr.take().expect("stderr");
+        let stderr_thread = std::thread::spawn(move || {
+            let mut captured = String::new();
+            use std::io::Read;
+            let _ = child_stderr.read_to_string(&mut captured);
+            captured
+        });
+        let mut guard = ServiceGuard(child);
+        std::thread::sleep(Duration::from_millis(1500));
+        let started = std::time::Instant::now();
+        let result = open_service_adapter(Uuid::new_v4(), Ipv4Addr::new(10, 77, 9, 9));
+        if started.elapsed() >= OPEN_TIMEOUT {
+            guard.kill();
+            let captured = stderr_thread.join().unwrap_or_default();
+            if captured.contains("pipe create failed") {
+                eprintln!("skipping: another service instance owns the pipe");
+                return;
+            }
+            panic!("service did not reply within the open window: {result:?}");
+        }
+        eprintln!("open result: {result:?}");
     }
 }

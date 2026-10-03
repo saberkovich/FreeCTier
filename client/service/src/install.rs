@@ -30,6 +30,36 @@ pub fn install() -> Result<()> {
         ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
     )
     .context("Cannot open service database")?;
+    // Upgrades replace the registered binary: stop and delete an existing
+    // installation first, otherwise create_service fails with
+    // ERROR_SERVICE_EXISTS and the running old build keeps serving.
+    if let Ok(existing) = manager.open_service(
+        SERVICE_NAME,
+        ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE,
+    ) {
+        if existing
+            .query_status()
+            .map(|s| s.current_state == ServiceState::Running)
+            .unwrap_or(false)
+        {
+            let _ = existing.stop();
+            for _ in 0..30 {
+                if existing
+                    .query_status()
+                    .map(|s| s.current_state != ServiceState::Running)
+                    .unwrap_or(true)
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+        existing
+            .delete()
+            .context("Cannot replace the old service")?;
+        // SCM marks the entry for deletion; it frees once all handles close.
+        std::thread::sleep(Duration::from_millis(500));
+    }
     let info = ServiceInfo {
         name: SERVICE_NAME.into(),
         display_name: SERVICE_DISPLAY.into(),

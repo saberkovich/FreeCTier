@@ -353,7 +353,16 @@ fn run_session(handle: HANDLE, ctl: &Arc<Ctl>, adapters: &Arc<Mutex<Adapters>>) 
                         message: format!("{error:#}"),
                     },
                 };
-                io.write_frame(&freec_ipc::encode_service_frame(&reply)?)?;
+                // Replies must go through the single writer thread: the
+                // adapter packet pumps start producing frames immediately,
+                // and two concurrent WriteFile calls on one pipe handle (one
+                // shared event) corrupt completion and lose frames.
+                if outbound
+                    .send(freec_ipc::encode_service_frame(&reply)?)
+                    .is_err()
+                {
+                    break;
+                }
                 log(&format!("adapter {network} open handled"));
             }
             freec_ipc::ClientMessage::CloseAdapter { network } => {
