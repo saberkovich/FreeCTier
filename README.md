@@ -2,6 +2,18 @@
 
 ---
 
+**Windows x64:**
+
+<a href="https://github.com/saberkovich/FreeCTier/releases/latest/download/FreeC-Tier_x64-setup.exe">
+  <img src="https://github.com/user-attachments/assets/118ad69b-4d43-4290-aa97-11d504aa3a42" width="300">
+</a>
+
+<a href="https://github.com/saberkovich/FreeCTier/releases/latest/download/FreeC-Tier_x64-portable.zip">
+  <img src="https://github.com/user-attachments/assets/40da1f29-d03b-4290-852f-7c0b3f55622f" width="300">
+</a>
+
+---
+
 **FreeC Tier** - приложение для создания виртуальной локальной сети между компьютерами через инфраструктуру Steam.
 
 Подключайте друзей и устройства так, будто они находятся в одной локальной сети — без собственного VPN-сервера, ручной настройки портов и проброса NAT.
