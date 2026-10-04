@@ -1694,14 +1694,22 @@ fn describe_steam_error(error: &anyhow::Error) -> String {
 
 /// Actionable follow-up for Steam init failures we recognize. Steam's own
 /// detail ("ConnectToGlobalUser failed.") alone doesn't tell the user what
-/// to do; the two known causes are an elevated app process (Steam refuses
-/// API connections across different integrity levels) and a stuck client.
-fn wait_hint(detail: &str, elevated: bool) -> &'static str {
+/// to do. Field evidence (2026-10-04): re-logging the Steam account fixed
+/// this even from an elevated app process — the client's broken login state
+/// is the primary suspect in every case, so lead with it; elevation is the
+/// secondary suspect and the advice depends on both token states.
+fn wait_hint(detail: &str, elevated: bool, steam_elevated: Option<bool>) -> &'static str {
     if detail.contains("ConnectToGlobalUser") {
-        if elevated {
-            " Приложение запущено от имени администратора — Steam не подключается к таким процессам. Перезапустите FreeC Tier обычным способом."
-        } else {
-            " Steam открыт, но не принимает подключение приложения. Перезапустите Steam и дождитесь входа в аккаунт."
+        match (elevated, steam_elevated) {
+            (true, Some(false)) => {
+                " Перезапустите Steam: выйдите из аккаунта и войдите заново. Если не поможет — перезапустите FreeC Tier без прав администратора."
+            }
+            (true, _) => {
+                " Перезапустите Steam: выйдите из аккаунта и войдите заново. Если не поможет — включите контроль учётных записей (UAC) и перезапустите оба приложения."
+            }
+            (false, _) => {
+                " Перезапустите Steam: выйдите из аккаунта и войдите заново, затем дождитесь входа в аккаунт."
+            }
         }
     } else {
         ""
@@ -1740,6 +1748,150 @@ pub fn process_elevated() -> bool {
     false
 }
 
+/// Token elevation of the Steam client process, if it is running. Used to
+/// demote this app only on a PROVEN integrity mismatch: with UAC disabled
+/// every process runs elevated, and demoting based on our own token alone
+/// looped the process forever on such machines.
+#[cfg(windows)]
+pub fn steam_token_elevated() -> Option<bool> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Security::{
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows::Win32::System::Threading::{
+        OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut pid = None;
+        if Process32FirstW(snapshot, &mut entry).is_ok() {
+            loop {
+                let name = String::from_utf16_lossy(&entry.szExeFile);
+                if name
+                    .trim_end_matches('\0')
+                    .eq_ignore_ascii_case("steam.exe")
+                {
+                    pid = Some(entry.th32ProcessID);
+                    break;
+                }
+                if Process32NextW(snapshot, &mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snapshot);
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid?).ok()?;
+        let mut token = Default::default();
+        let opened = OpenProcessToken(process, TOKEN_QUERY, &mut token);
+        let _ = CloseHandle(process);
+        opened.ok()?;
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut returned = 0u32;
+        let result = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(&mut elevation as *mut _ as *mut _),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        );
+        let _ = CloseHandle(token);
+        Some(result.is_ok() && elevation.TokenIsElevated != 0)
+    }
+}
+
+#[cfg(not(windows))]
+pub fn steam_token_elevated() -> Option<bool> {
+    None
+}
+
+/// Launch `exe` with the Windows shell's (normally unelevated) token via
+/// `CreateProcessWithTokenW`. Unlike the `explorer.exe` handoff hack this is
+/// deterministic: the child token IS the shell token, whatever the system's
+/// UAC quirks are.
+#[cfg(windows)]
+pub fn demote_via_shell(exe: &std::path::Path) -> bool {
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Security::{
+        DuplicateTokenEx, SecurityImpersonation, TokenPrimary, TOKEN_ACCESS_MASK,
+        TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Threading::{
+        CreateProcessWithTokenW, OpenProcess, OpenProcessToken, CREATE_NO_WINDOW,
+        LOGON_WITH_PROFILE, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
+    unsafe {
+        let shell = GetShellWindow();
+        if shell.is_invalid() {
+            return false;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(shell, Some(&mut pid));
+        if pid == 0 {
+            return false;
+        }
+        let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return false;
+        };
+        let mut token = Default::default();
+        let opened = OpenProcessToken(
+            process,
+            TOKEN_ACCESS_MASK(TOKEN_DUPLICATE.0 | TOKEN_QUERY.0),
+            &mut token,
+        );
+        let _ = CloseHandle(process);
+        if opened.is_err() {
+            return false;
+        }
+        let mut new_token = Default::default();
+        let duplicated = DuplicateTokenEx(
+            token,
+            TOKEN_ACCESS_MASK(TOKEN_ASSIGN_PRIMARY.0 | TOKEN_DUPLICATE.0 | TOKEN_QUERY.0),
+            None,
+            SecurityImpersonation,
+            TokenPrimary,
+            &mut new_token,
+        );
+        let _ = CloseHandle(token);
+        if duplicated.is_err() {
+            return false;
+        }
+        let path = HSTRING::from(exe.as_os_str());
+        let startup = STARTUPINFOW {
+            cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+            ..Default::default()
+        };
+        let mut info = PROCESS_INFORMATION::default();
+        let result = CreateProcessWithTokenW(
+            new_token,
+            LOGON_WITH_PROFILE,
+            PCWSTR(path.as_ptr()),
+            None,
+            CREATE_NO_WINDOW,
+            None,
+            PCWSTR::null(),
+            &startup,
+            &mut info,
+        );
+        let _ = CloseHandle(new_token);
+        result.is_ok()
+    }
+}
+
+#[cfg(not(windows))]
+pub fn demote_via_shell(_exe: &std::path::Path) -> bool {
+    false
+}
+
 fn run(root: PathBuf, app_id: u32, rx: mpsc::Receiver<Command>, shared: Arc<Mutex<Snapshot>>) {
     let mut engine: Option<Engine> = None;
     let mut view = Snapshot {
@@ -1770,13 +1922,30 @@ fn run(root: PathBuf, app_id: u32, rx: mpsc::Receiver<Command>, shared: Arc<Mute
                     // time floods the 50-line event log with "Ожидание Steam".
                     let detail = describe_steam_error(&error);
                     if wait_error.as_deref() != Some(detail.as_str()) {
-                        log(
-                            &mut view,
-                            &format!(
-                                "Ожидание Steam: {detail}{}",
-                                wait_hint(&detail, process_elevated())
-                            ),
+                        let elevated = process_elevated();
+                        let steam_state = steam_token_elevated();
+                        let mut line = format!(
+                            "Ожидание Steam: {detail}{}",
+                            wait_hint(&detail, elevated, steam_state)
                         );
+                        if detail.contains("ConnectToGlobalUser") {
+                            // Token states are the diagnosis the user cannot
+                            // see otherwise; keep them in the log verbatim.
+                            line.push_str(&format!(
+                                " [приложение: {} · Steam: {}]",
+                                if elevated {
+                                    "админ"
+                                } else {
+                                    "обычный"
+                                },
+                                match steam_state {
+                                    Some(true) => "админ",
+                                    Some(false) => "обычный",
+                                    None => "не найден",
+                                },
+                            ));
+                        }
+                        log(&mut view, &line);
                         wait_error = Some(detail);
                     }
                     retry = Instant::now() + Duration::from_secs(5);
@@ -1852,13 +2021,23 @@ mod wait_hint_tests {
 
     #[test]
     fn connect_to_global_user_gets_actionable_hints() {
-        assert!(wait_hint("ConnectToGlobalUser failed.", true).contains("администратора"));
-        assert!(wait_hint("ConnectToGlobalUser failed.", false).contains("Перезапустите Steam"));
+        // The Steam re-login advice leads in every branch (field evidence:
+        // it fixed the error even from an elevated app process).
+        let hint = wait_hint("ConnectToGlobalUser failed.", true, Some(false));
+        assert!(hint.contains("выйдите из аккаунта"));
+        assert!(hint.contains("без прав администратора"));
+        // Both elevated (UAC disabled): the fallback advice is UAC, since
+        // restarting "normally" is impossible there.
+        assert!(wait_hint("ConnectToGlobalUser failed.", true, Some(true)).contains("UAC"));
+        assert!(wait_hint("ConnectToGlobalUser failed.", true, None).contains("UAC"));
+        // Unelevated app: same lead, plain wording.
+        assert!(wait_hint("ConnectToGlobalUser failed.", false, Some(false))
+            .contains("выйдите из аккаунта"));
         // Unrecognized details and non-init errors get no hint.
         assert_eq!(
-            wait_hint("Steam client appears to be out of date", true),
+            wait_hint("Steam client appears to be out of date", true, Some(true)),
             ""
         );
-        assert_eq!(wait_hint("", false), "");
+        assert_eq!(wait_hint("", false, None), "");
     }
 }
