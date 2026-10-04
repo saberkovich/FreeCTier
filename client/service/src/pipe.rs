@@ -302,7 +302,8 @@ pub fn serve(ctl: &Arc<Ctl>, user_sid: &str) {
             user_sid
         }
     ));
-    let adapters = Arc::new(Mutex::new(Adapters::default()));
+    let adapters = Arc::new(Mutex::new(Adapters::new(ctl.stop_flag.clone())));
+    adapters.lock().unwrap().prepare();
     loop {
         if ctl.is_stopping() {
             break;
@@ -387,6 +388,7 @@ fn run_session(handle: HANDLE, ctl: &Arc<Ctl>, adapters: &Arc<Mutex<Adapters>>) 
             }
         })
         .context("Cannot spawn pipe writer")?;
+    adapters.lock().unwrap().attach(outbound.clone());
 
     loop {
         if ctl.is_stopping() {
@@ -402,12 +404,7 @@ fn run_session(handle: HANDLE, ctl: &Arc<Ctl>, adapters: &Arc<Mutex<Adapters>>) 
         match freec_ipc::decode_client_frame(&frame)? {
             freec_ipc::ClientMessage::Hello => anyhow::bail!("Duplicate hello"),
             freec_ipc::ClientMessage::OpenAdapter { network, local_ip } => {
-                let result = adapters.lock().unwrap().open(
-                    network,
-                    local_ip,
-                    ctl.stop_flag.clone(),
-                    outbound.clone(),
-                );
+                let result = adapters.lock().unwrap().open(network, local_ip);
                 let reply = match result {
                     Ok(()) => freec_ipc::ServiceMessage::AdapterOpened { network },
                     Err(error) => freec_ipc::ServiceMessage::AdapterError {
