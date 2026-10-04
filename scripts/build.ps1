@@ -15,6 +15,7 @@ try {
     foreach ($argument in $args) {
         switch ($argument) {
             '--debug' { $profile = 'debug' }
+            '--installer' { $installer = $true }
             '--no-pause' { }
             default { throw "Unknown option: $argument. Usage: build.bat [--debug] [--no-pause]" }
         }
@@ -78,6 +79,12 @@ try {
     Copy-Item -LiteralPath (Join-Path $root 'README.md') -Destination $destination -Force
     Write-Host "`nBuild complete: $destination"
     Write-Host "Start: $(Join-Path $destination 'freec-tier.exe')"
+    if ($installer) {
+        if ($profile -ne 'release') { throw '--installer requires the release profile (drop --debug).' }
+        Write-Host '[6/5] Building the NSIS installer package...'
+        Invoke-Checked 'node.exe' @('scripts/release.mjs')
+        Write-Host "Installer package: $(Join-Path $root 'dist\releases')"
+    }
     Write-Host 'Steam and WebView2 Runtime must be installed. The desktop EXE requests administrator rights through Windows UAC on launch.'
 } catch {
     [Console]::Error.WriteLine("Build error: $_")

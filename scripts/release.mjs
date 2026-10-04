@@ -89,7 +89,7 @@ const artifacts = [installer, path.basename(zip), ...(signed ? [`${installer}.si
 // Inner binaries get their own entries: antivirus false-positive submissions
 // must reference the hash of the exact file Defender flags, not just the
 // archive containing it.
-const inner = ['freec-tier.exe', 'freec-runtime.exe'].map(name => `FreeC-Tier-release/${name}`);
+const inner = ['freec-tier.exe', 'freec-runtime.exe', 'freec-service.exe'].map(name => `FreeC-Tier-release/${name}`);
 const sums = await Promise.all(
   [...artifacts, ...inner].map(async name => {
     const file = name.startsWith('FreeC-Tier-release/') ? path.join(portable, path.basename(name)) : path.join(output, name);
