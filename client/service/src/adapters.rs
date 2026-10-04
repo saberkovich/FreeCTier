@@ -17,8 +17,25 @@ use uuid::Uuid;
 const MTU: u32 = 1280;
 
 struct Entry {
+    /// Per-adapter stop signal. The global service stop flag can't close one
+    /// adapter, and a reader left running holds its own session Arc — a bare
+    /// `join()` in `close` would never return while the pipe stays connected
+    /// and the whole session thread would wedge (disable → enable died with
+    /// «Служба не отвечает» exactly this way).
+    running: Arc<AtomicBool>,
     _session: Arc<wintun::Session>,
     reader: Option<JoinHandle<()>>,
+}
+
+impl Entry {
+    /// Signal the reader to exit, then wait for it. The reader polls every
+    /// ~1ms, so the join is bounded by that.
+    fn stop_and_join(mut self) {
+        self.running.store(false, Ordering::SeqCst);
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
 }
 
 /// `api` loads lazily: a missing wintun.dll must not prevent the service from
@@ -106,10 +123,12 @@ impl Adapters {
         crate::log("open: session started");
         let reader_session = Arc::clone(&session);
         let reader_network = network;
+        let running = Arc::new(AtomicBool::new(true));
+        let reader_running = Arc::clone(&running);
         let reader = std::thread::Builder::new()
             .name(format!("freec-svc-{}", network.simple()))
             .spawn(move || {
-                while !stop_flag.load(Ordering::SeqCst) {
+                while !stop_flag.load(Ordering::SeqCst) && reader_running.load(Ordering::SeqCst) {
                     match reader_session.try_receive() {
                         Ok(Some(packet)) => {
                             let frame = freec_ipc::encode_service_frame(
@@ -136,6 +155,7 @@ impl Adapters {
         self.map.insert(
             network,
             Entry {
+                running,
                 _session: session,
                 reader: Some(reader),
             },
@@ -145,9 +165,7 @@ impl Adapters {
 
     pub fn close(&mut self, network: Uuid) {
         if let Some(entry) = self.map.remove(&network) {
-            if let Some(reader) = entry.reader {
-                let _ = reader.join();
-            }
+            entry.stop_and_join();
         }
     }
 
@@ -165,7 +183,9 @@ impl Adapters {
     }
 
     pub fn clear(&mut self) {
-        self.map.clear();
+        for (_, entry) in std::mem::take(&mut self.map) {
+            entry.stop_and_join();
+        }
     }
 }
 
