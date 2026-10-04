@@ -6,7 +6,7 @@ type Peer = { steam_id: string; name: string; ip: string; active: boolean; state
 type Network = { id: string; name: string; subnet: string; owner: string; revision: number; adapter: boolean; lobby?: string; public: boolean; can_invite: boolean; password: boolean; members: Peer[] };
 type Snapshot = { steam: string; steam_id?: string; nickname?: string; relay: string; networks: Network[]; friends: { steam_id: string; name: string }[]; events: string[]; received: number; sent: number; dropped: number; joins?: { id: string; name: string; password: boolean }[]; public_networks?: { lobby: string; name: string }[] };
 type Command = { type: string; [key: string]: unknown };
-type Settings = { minimize_to_tray: boolean; check_updates: boolean; autostart?: boolean; theme: string };
+type Settings = { minimize_to_tray: boolean; check_updates: boolean; autostart?: boolean; theme: string; custom_colors?: Record<string, string> };
 
 let state: Snapshot = { steam: 'waiting', relay: 'unknown', networks: [], friends: [], events: [], received: 0, sent: 0, dropped: 0 };
 let selected: string | undefined;
@@ -55,7 +55,33 @@ const labels: Record<string, string> = { connected: 'Подключён', connec
 function status(value: string) { return `<span class="peer-status ${escape(value)}"><i aria-hidden="true"></i>${escape(labels[value] || value)}</span>`; }
 function network() { return state.networks.find(n => n.id === selected); }
 function appLabel() { return appVersion ? `FreeC Tier ${appVersion}` : 'FreeC Tier'; }
-function applyTheme(theme: string) { document.documentElement.dataset.theme = theme === 'light' ? 'light' : 'dark'; }
+function applyTheme(theme: string) {
+  const root = document.documentElement;
+  for (const token of THEME_TOKENS) root.style.removeProperty(`--${token}`);
+  if (theme === 'custom') {
+    // No `custom` block in CSS: the :root defaults act as the base and the
+    // user's palette is layered on top as inline variables.
+    root.dataset.theme = 'custom';
+    for (const [token, value] of Object.entries(preferences.custom_colors ?? {})) {
+      if (value) root.style.setProperty(`--${token}`, value);
+    }
+  } else {
+    root.dataset.theme = theme === 'light' ? 'light' : 'dark';
+  }
+}
+const THEME_TOKENS = ['accent', 'accent-hover', 'accent-soft', 'focus', 'text', 'muted', 'faint', 'bg', 'surface', 'surface-2', 'surface-3', 'line', 'line-soft', 'success', 'warning', 'danger'] as const;
+const THEME_LABELS: Record<string, string> = {
+  accent: 'Акцент', 'accent-hover': 'Акцент (наведение)', 'accent-soft': 'Акцент (подложка)', focus: 'Обводка фокуса',
+  text: 'Текст', muted: 'Приглушённый текст', faint: 'Слабый текст', bg: 'Фон',
+  surface: 'Поверхность', 'surface-2': 'Поверхность 2', 'surface-3': 'Поверхность 3',
+  line: 'Линии', 'line-soft': 'Тонкие линии',
+  success: 'Успех', warning: 'Предупреждение', danger: 'Опасность',
+};
+const THEME_GROUPS: Array<[string, string[]]> = [
+  ['Основные цвета', ['bg', 'surface', 'surface-2', 'surface-3', 'text', 'muted', 'faint', 'line', 'line-soft']],
+  ['Акцент', ['accent', 'accent-hover', 'accent-soft', 'focus']],
+  ['Статусы', ['success', 'warning', 'danger']],
+];
 function setVersion(value: string) {
   appVersion = value;
   const brand = document.querySelector('#brand-version'); if (brand) brand.textContent = value;
@@ -179,12 +205,29 @@ function updateDynamic() {
 }
 function renderSettings() {
   contentHTML(`<section class="page narrow" id="settings-page"><div class="page-head"><div><h1>Настройки</h1><p class="page-sub">${escape(appLabel())}</p></div></div>
-    <div class="card"><div class="row"><span class="row-label">Тема</span><div class="segmented" role="group" aria-label="Тема"><button id="theme-dark" class="seg ${preferences.theme !== 'light' ? 'active' : ''}" aria-pressed="${preferences.theme !== 'light'}">Тёмная</button><button id="theme-light" class="seg ${preferences.theme === 'light' ? 'active' : ''}" aria-pressed="${preferences.theme === 'light'}">Светлая</button></div></div><label class="row"><span class="row-label">Сворачивать в трей</span><input id="minimize-tray" type="checkbox" class="switch" ${preferences.minimize_to_tray ? 'checked' : ''} /></label><label class="row"><span class="row-label">Запускать при входе в Windows</span><input id="autostart" type="checkbox" class="switch" ${preferences.autostart ? "checked" : ""} /></label></div><h2 class="group-title">Служба</h2><div class="card"><div class="row"><span class="row-label">Служба FreeC Tier<small id="service-status">Проверяем…</small></span><div class="row-actions"><button class="button" id="service-install">Переустановить</button><button class="button" id="service-uninstall">Удалить</button></div></div></div>
+    <div class="card"><div class="row"><span class="row-label">Тема</span><div class="segmented" role="group" aria-label="Тема"><button id="theme-dark" class="seg ${preferences.theme === 'dark' ? 'active' : ''}" aria-pressed="${preferences.theme === 'dark'}">Тёмная</button><button id="theme-light" class="seg ${preferences.theme === 'light' ? 'active' : ''}" aria-pressed="${preferences.theme === 'light'}">Светлая</button><button id="theme-custom" class="seg ${preferences.theme === 'custom' ? 'active' : ''}" aria-pressed="${preferences.theme === 'custom'}">Своя</button></div></div><label class="row"><span class="row-label">Сворачивать в трей</span><input id="minimize-tray" type="checkbox" class="switch" ${preferences.minimize_to_tray ? 'checked' : ''} /></label><label class="row"><span class="row-label">Запускать при входе в Windows</span><input id="autostart" type="checkbox" class="switch" ${preferences.autostart ? "checked" : ""} /></label></div>
+    ${preferences.theme === 'custom' ? `<div class="card" id="theme-editor">${THEME_GROUPS.map(([title, tokens]) => `<h3 class="editor-title">${escape(title)}</h3>${tokens.map(token => `<label class="row color-row"><span class="row-label">${escape(THEME_LABELS[token] ?? token)}</span><input type="color" class="color-input" data-token="${token}" value="${escape(preferences.custom_colors?.[token] ?? '#000000')}" aria-label="${escape(THEME_LABELS[token] ?? token)}" /></label>`).join('')}`).join('')}<div class="row"><span class="row-label muted">Изменения применяются сразу.</span><button class="button" id="theme-reset">Сбросить</button></div></div>` : ''}
+    <h2 class="group-title">Служба</h2><div class="card"><div class="row"><span class="row-label">Служба FreeC Tier<small id="service-status">Проверяем…</small></span><div class="row-actions"><button class="button" id="service-install">Переустановить</button><button class="button" id="service-uninstall">Удалить</button></div></div></div>
     <h2 class="group-title">Обновления</h2><div class="card"><label class="row"><span class="row-label">Проверять при запуске</span><input id="auto-update" type="checkbox" class="switch" ${preferences.check_updates ? 'checked' : ''} /></label><div class="row"><span class="row-label muted" id="update-message" role="status">${escape(updateMessage)}</span><div class="row-actions"><button class="button" id="check-update" ${updating ? 'disabled' : ''}>${updating ? 'Проверяем…' : 'Проверить'}</button>${updateVersion ? `<button class="button primary" id="install-update" ${updating ? 'disabled' : ''}>Установить ${escape(updateVersion)}</button>` : ''}</div></div></div>
     <h2 class="group-title">Steam</h2><div class="card"><button class="row row-button" id="steam-help"><span class="row-label">Скрыть статус «играет»</span><span class="chev" aria-hidden="true">→</span></button></div>
     <h2 class="group-title">Дополнительно</h2><div class="card"><button class="row row-button" id="diagnostics"><span class="row-label">Диагностика</span><span class="chev" aria-hidden="true">→</span></button><div class="row"><span class="row-label">Завершение работы</span><button class="button" id="quit">Выйти</button></div></div></section>`);
   document.querySelector<HTMLButtonElement>('#theme-dark')!.onclick = () => setTheme('dark');
   document.querySelector<HTMLButtonElement>('#theme-light')!.onclick = () => setTheme('light');
+  document.querySelector<HTMLButtonElement>('#theme-custom')!.onclick = () => setTheme('custom');
+  document.querySelectorAll<HTMLInputElement>('.color-input').forEach(input => {
+    const token = input.dataset.token!;
+    input.oninput = () => {
+      // Live preview only: persisting on every drag step would spam the
+      // settings file, so the value lands on disk when the picker closes.
+      preferences.custom_colors = { ...(preferences.custom_colors ?? {}), [token]: input.value };
+      applyTheme('custom');
+    };
+    input.onchange = () => { void savePreferences({ ...preferences, theme: 'custom' }); };
+  });
+  document.querySelector<HTMLButtonElement>('#theme-reset')?.addEventListener('click', () => {
+    applyTheme('dark');
+    void savePreferences({ ...preferences, theme: 'dark', custom_colors: undefined });
+  });
   document.querySelector<HTMLInputElement>('#minimize-tray')!.onchange = e => { void savePreferences({ ...preferences, minimize_to_tray: (e.target as HTMLInputElement).checked }); };
     async function refreshServiceStatus() {
     if (!isTauri()) return;
@@ -217,7 +260,23 @@ function renderSettings() {
   const install = document.querySelector<HTMLButtonElement>('#install-update');
   if (install) install.onclick = () => { void installUpdate(); };
 }
-function setTheme(theme: string) { applyTheme(theme); void savePreferences({ ...preferences, theme }); }
+function setTheme(theme: string) {
+  if (theme === 'custom' && !preferences.custom_colors) {
+    // Seed the custom palette from whatever the user sees right now, so the
+    // editor starts from their current theme instead of a blank slate.
+    const style = getComputedStyle(document.documentElement);
+    const seeded: Record<string, string> = {};
+    for (const token of THEME_TOKENS) {
+      const value = style.getPropertyValue(`--${token}`).trim();
+      if (value) seeded[token] = value;
+    }
+    preferences = { ...preferences, theme: 'custom', custom_colors: seeded };
+  } else {
+    preferences = { ...preferences, theme };
+  }
+  applyTheme(preferences.theme);
+  void savePreferences(preferences);
+}
 async function desktop(command: string, args?: Record<string, unknown>) {
   if (!isTauri()) { notice('Это браузерный просмотр. Настройки и выход доступны в desktop-клиенте.'); return false; }
   try { await invoke(command, args); return true; } catch (error) { notice(String(error)); return false; }
