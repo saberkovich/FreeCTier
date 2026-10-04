@@ -1692,6 +1692,54 @@ fn describe_steam_error(error: &anyhow::Error) -> String {
     format!("{error:#}")
 }
 
+/// Actionable follow-up for Steam init failures we recognize. Steam's own
+/// detail ("ConnectToGlobalUser failed.") alone doesn't tell the user what
+/// to do; the two known causes are an elevated app process (Steam refuses
+/// API connections across different integrity levels) and a stuck client.
+fn wait_hint(detail: &str, elevated: bool) -> &'static str {
+    if detail.contains("ConnectToGlobalUser") {
+        if elevated {
+            " Приложение запущено от имени администратора — Steam не подключается к таким процессам. Перезапустите FreeC Tier обычным способом."
+        } else {
+            " Steam открыт, но не принимает подключение приложения. Перезапустите Steam и дождитесь входа в аккаунт."
+        }
+    } else {
+        ""
+    }
+}
+
+/// Whether this process runs with an elevated token.
+#[cfg(windows)]
+pub fn process_elevated() -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Security::{
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut token = Default::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return false;
+        }
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut returned = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(&mut elevation as *mut _ as *mut _),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        );
+        let _ = CloseHandle(token);
+        ok.is_ok() && elevation.TokenIsElevated != 0
+    }
+}
+
+#[cfg(not(windows))]
+pub fn process_elevated() -> bool {
+    false
+}
+
 fn run(root: PathBuf, app_id: u32, rx: mpsc::Receiver<Command>, shared: Arc<Mutex<Snapshot>>) {
     let mut engine: Option<Engine> = None;
     let mut view = Snapshot {
@@ -1722,7 +1770,13 @@ fn run(root: PathBuf, app_id: u32, rx: mpsc::Receiver<Command>, shared: Arc<Mute
                     // time floods the 50-line event log with "Ожидание Steam".
                     let detail = describe_steam_error(&error);
                     if wait_error.as_deref() != Some(detail.as_str()) {
-                        log(&mut view, &format!("Ожидание Steam: {detail}"));
+                        log(
+                            &mut view,
+                            &format!(
+                                "Ожидание Steam: {detail}{}",
+                                wait_hint(&detail, process_elevated())
+                            ),
+                        );
                         wait_error = Some(detail);
                     }
                     retry = Instant::now() + Duration::from_secs(5);
@@ -1789,5 +1843,22 @@ mod steam_error {
             describe_steam_error(&error),
             "Steam не авторизован — войдите в аккаунт"
         );
+    }
+}
+
+#[cfg(test)]
+mod wait_hint_tests {
+    use super::*;
+
+    #[test]
+    fn connect_to_global_user_gets_actionable_hints() {
+        assert!(wait_hint("ConnectToGlobalUser failed.", true).contains("администратора"));
+        assert!(wait_hint("ConnectToGlobalUser failed.", false).contains("Перезапустите Steam"));
+        // Unrecognized details and non-init errors get no hint.
+        assert_eq!(
+            wait_hint("Steam client appears to be out of date", true),
+            ""
+        );
+        assert_eq!(wait_hint("", false), "");
     }
 }

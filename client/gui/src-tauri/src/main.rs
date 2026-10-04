@@ -380,6 +380,27 @@ fn ensure_webview2() {
 
 fn main() {
     #[cfg(windows)]
+    {
+        // Steam refuses API connections from differently-elevated processes,
+        // and the installer's «Запустить приложение» checkbox inherits the
+        // installer's elevation — restart through Explorer, which launches
+        // the app with the normal user token. Nothing here needs admin (the
+        // service owns the privileged work), so elevated is always wrong.
+        if freec_runtime::process_elevated() {
+            let relaunched = std::env::current_exe().ok().and_then(|exe| {
+                use std::os::windows::process::CommandExt;
+                std::process::Command::new("explorer.exe")
+                    .arg(exe)
+                    .creation_flags(0x0800_0000)
+                    .spawn()
+                    .ok()
+            });
+            if relaunched.is_some() {
+                std::process::exit(0);
+            }
+        }
+    }
+    #[cfg(windows)]
     ensure_webview2();
     // Release builds have no console: retain startup panics for diagnosis.
     let log_path = std::env::var_os("APPDATA")
