@@ -21,7 +21,8 @@ use std::{
     time::{Duration, Instant},
 };
 use steamworks::{
-    CallbackHandle, Client, FriendFlags, GameLobbyJoinRequested, LobbyId, LobbyType, SteamId,
+    CallbackHandle, Client, FriendFlags, GameLobbyJoinRequested, LobbyId, LobbyType,
+    SteamAPIInitError, SteamId,
 };
 use uuid::Uuid;
 
@@ -295,7 +296,10 @@ struct Engine {
 impl Engine {
     fn new(root: &std::path::Path, app_id: u32) -> Result<Self> {
         let client = Client::init_app(app_id)?;
-        ensure!(client.user().logged_on(), "Steam is not signed in");
+        ensure!(
+            client.user().logged_on(),
+            "Steam не авторизован — войдите в аккаунт"
+        );
         let local = client.user().steam_id().raw().to_string();
         let store = Store::new(root.join("accounts").join(&local))?;
         let key = store.owner_key()?;
@@ -1669,6 +1673,25 @@ fn log(view: &mut Snapshot, message: &str) {
     }
 }
 
+/// Steam's init path fills a detailed `SteamErrMsg`, but the crate's
+/// `Display` shows only static text ("Some other failure") and drops it —
+/// pull the payload back out so the event log shows the real reason.
+fn describe_steam_error(error: &anyhow::Error) -> String {
+    for cause in error.chain() {
+        if let Some(init) = cause.downcast_ref::<SteamAPIInitError>() {
+            let detail = match init {
+                SteamAPIInitError::FailedGeneric(message)
+                | SteamAPIInitError::NoSteamClient(message)
+                | SteamAPIInitError::VersionMismatch(message) => message.clone(),
+            };
+            if !detail.trim().is_empty() {
+                return detail;
+            }
+        }
+    }
+    format!("{error:#}")
+}
+
 fn run(root: PathBuf, app_id: u32, rx: mpsc::Receiver<Command>, shared: Arc<Mutex<Snapshot>>) {
     let mut engine: Option<Engine> = None;
     let mut view = Snapshot {
@@ -1677,6 +1700,7 @@ fn run(root: PathBuf, app_id: u32, rx: mpsc::Receiver<Command>, shared: Arc<Mute
         ..Default::default()
     };
     let mut retry = Instant::now();
+    let mut wait_error: Option<String> = None;
     let args: Vec<_> = std::env::args().collect();
     let mut startup_lobby = args
         .windows(2)
@@ -1686,6 +1710,7 @@ fn run(root: PathBuf, app_id: u32, rx: mpsc::Receiver<Command>, shared: Arc<Mute
         if engine.is_none() && Instant::now() >= retry {
             match Engine::new(&root, app_id) {
                 Ok(next) => {
+                    wait_error = None;
                     log(&mut view, "Steam подключён. Конфигурации загружены.");
                     if let Some(lobby) = startup_lobby.take() {
                         next.join(LobbyId::from_raw(lobby));
@@ -1693,7 +1718,13 @@ fn run(root: PathBuf, app_id: u32, rx: mpsc::Receiver<Command>, shared: Arc<Mute
                     engine = Some(next);
                 }
                 Err(error) => {
-                    log(&mut view, &format!("Ожидание Steam: {error:#}"));
+                    // The same reason repeats on every retry; logging it each
+                    // time floods the 50-line event log with "Ожидание Steam".
+                    let detail = describe_steam_error(&error);
+                    if wait_error.as_deref() != Some(detail.as_str()) {
+                        log(&mut view, &format!("Ожидание Steam: {detail}"));
+                        wait_error = Some(detail);
+                    }
                     retry = Instant::now() + Duration::from_secs(5);
                 }
             }
@@ -1731,5 +1762,32 @@ fn run(root: PathBuf, app_id: u32, rx: mpsc::Receiver<Command>, shared: Arc<Mute
         }
         *shared.lock().unwrap_or_else(|p| p.into_inner()) = view.clone();
         thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(test)]
+mod steam_error {
+    use super::*;
+
+    #[test]
+    fn init_message_payload_is_surfaced() {
+        // The crate's Display prints "Some other failure"; the useful text
+        // is in the payload and must reach the event log.
+        let error = anyhow::Error::from(SteamAPIInitError::FailedGeneric(
+            "Steam must be running and signed in".into(),
+        ));
+        assert_eq!(
+            describe_steam_error(&error),
+            "Steam must be running and signed in"
+        );
+    }
+
+    #[test]
+    fn non_init_errors_pass_through() {
+        let error = anyhow::anyhow!("Steam не авторизован — войдите в аккаунт");
+        assert_eq!(
+            describe_steam_error(&error),
+            "Steam не авторизован — войдите в аккаунт"
+        );
     }
 }
