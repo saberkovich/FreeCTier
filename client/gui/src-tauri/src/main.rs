@@ -17,6 +17,9 @@ struct Settings {
     check_updates: bool,
     autostart: bool,
     theme: String,
+    /// User-tuned CSS variable overrides for the «Своя» theme, keyed by
+    /// token name (`accent`, `bg`, …) with `#rrggbb` values.
+    custom_colors: std::collections::BTreeMap<String, String>,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -25,6 +28,7 @@ impl Default for Settings {
             check_updates: true,
             autostart: false,
             theme: "dark".into(),
+            custom_colors: Default::default(),
         }
     }
 }

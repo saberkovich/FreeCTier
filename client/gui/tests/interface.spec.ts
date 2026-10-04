@@ -225,3 +225,38 @@ test('real state rendering is escaped and adapter action reaches IPC', async ({ 
   await page.getByRole('button', { name: 'Удалить сеть', exact: true }).click();
   expect(await page.evaluate(() => (window as unknown as {lastCommand: unknown}).lastCommand)).toEqual({ command: { type: 'delete', network: '67ae3f2d-0734-47f8-bf1b-e5e2bc64a289' } });
 });
+
+test('custom theme seeds from the current theme, previews live and persists', async ({ page }) => {
+  await page.addInitScript(() => {
+    const fixture = { steam: 'online', steam_id: '2', nickname: 'Guest', relay: 'Ok', networks: [], friends: [], events: [], sent: 0, received: 0, dropped: 0 };
+    Object.assign(window, { isTauri: true, __TAURI_INTERNALS__: { invoke: async (command: string, args: unknown) => {
+      if (command === 'snapshot') return structuredClone(fixture);
+      if (command === 'settings') return { minimize_to_tray: true, check_updates: false, autostart: false, theme: 'dark' };
+      if (command === 'version') return '0.2.0';
+      if (command === 'save_settings') Object.assign(window, { savedSettings: args });
+      if (command === 'service_status') return { installed: false, running: false };
+    } } });
+  });
+  await page.goto('/');
+  await page.locator('#settings').click();
+  await page.getByRole('button', { name: 'Своя' }).click();
+  // Seeded palette covers every token, so the editor starts from the dark theme.
+  await expect(page.locator('#theme-editor .color-input')).toHaveCount(16);
+  expect(await page.evaluate(() => (window as unknown as {savedSettings: unknown}).savedSettings)).toEqual({
+    settings: { minimize_to_tray: true, check_updates: false, autostart: false, theme: 'custom', custom_colors: expect.objectContaining({ accent: '#a12834', bg: '#160b0e' }) },
+  });
+  // Picking previews immediately as an inline variable on <html>.
+  await page.locator('.color-input[data-token="accent"]').fill('#00ff00');
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'custom');
+  expect(await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--accent').trim())).toBe('#00ff00');
+  // The value persists when the picker closes.
+  await expect.poll(async () => await page.evaluate(() => {
+    const saved = (window as unknown as {savedSettings?: {settings?: {custom_colors?: Record<string, string>}}}).savedSettings;
+    return saved?.settings?.custom_colors?.accent;
+  })).toBe('#00ff00');
+  // Reset returns to the plain dark theme without overrides.
+  await page.getByRole('button', { name: 'Сбросить' }).click();
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
+  await expect(page.locator('#theme-editor')).toHaveCount(0);
+  expect(await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--accent').trim())).toBe('#a12834');
+});
