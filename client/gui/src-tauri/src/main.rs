@@ -378,26 +378,49 @@ fn ensure_webview2() {
     force_exit();
 }
 
+#[cfg(windows)]
+fn demote_marker() -> Option<std::path::PathBuf> {
+    std::env::var_os("APPDATA").map(|appdata| {
+        std::path::PathBuf::from(appdata)
+            .join("FreeC Tier")
+            .join("demote.marker")
+    })
+}
+
 fn main() {
     #[cfg(windows)]
     {
         // Steam refuses API connections from differently-elevated processes,
         // and the installer's «Запустить приложение» checkbox inherits the
         // installer's elevation — restart through Explorer, which launches
-        // the app with the normal user token. Nothing here needs admin (the
-        // service owns the privileged work), so elevated is always wrong.
+        // the app with the normal user token. Demote ONLY on a proven
+        // mismatch with Steam's own token: with UAC disabled every process
+        // runs elevated, and Steam connects fine there. The marker file
+        // allows one demotion attempt per session — if a relaunched copy is
+        // still elevated (handoff quirks), it must not loop; a healthy
+        // unelevated launch clears the marker again.
         if freec_runtime::process_elevated() {
-            let relaunched = std::env::current_exe().ok().and_then(|exe| {
-                use std::os::windows::process::CommandExt;
-                std::process::Command::new("explorer.exe")
-                    .arg(exe)
-                    .creation_flags(0x0800_0000)
-                    .spawn()
-                    .ok()
-            });
-            if relaunched.is_some() {
-                std::process::exit(0);
+            let marker = demote_marker();
+            let already_tried = marker.as_deref().is_some_and(std::path::Path::exists);
+            if already_tried {
+                // Keep running elevated; the engine's event log explains why
+                // Steam will not connect.
+            } else if freec_runtime::steam_token_elevated() == Some(false) {
+                if let Some(marker) = &marker {
+                    let _ = std::fs::create_dir_all(marker.parent().expect("marker parent"));
+                    let _ = std::fs::write(marker, b"");
+                }
+                // CreateProcessWithTokenW with the shell's token: the child is
+                // unelevated by construction (no Explorer handoff quirks).
+                let relaunched = std::env::current_exe()
+                    .map(|exe| freec_runtime::demote_via_shell(&exe))
+                    .unwrap_or(false);
+                if relaunched {
+                    std::process::exit(0);
+                }
             }
+        } else if let Some(marker) = demote_marker() {
+            let _ = std::fs::remove_file(marker);
         }
     }
     #[cfg(windows)]
