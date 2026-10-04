@@ -53,6 +53,19 @@ pub fn install() -> Result<()> {
                 }
                 std::thread::sleep(Duration::from_millis(500));
             }
+            // A wedged service (e.g. stuck in a driver call) ignores Stop; the
+            // SCM would leave it running and block the replacement. Kill the
+            // process so the delete below can proceed.
+            if let Ok(status) = existing.query_status() {
+                if let Some(pid) = status.process_id {
+                    use std::os::windows::process::CommandExt;
+                    let _ = std::process::Command::new("taskkill.exe")
+                        .args(["/PID", &pid.to_string(), "/F"])
+                        .creation_flags(0x0800_0000)
+                        .output();
+                }
+            }
+            std::thread::sleep(Duration::from_millis(500));
         }
         existing
             .delete()

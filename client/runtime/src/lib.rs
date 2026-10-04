@@ -271,6 +271,10 @@ struct Engine {
     last_sync: Instant,
     last_view: Instant,
     restore: Vec<Uuid>,
+    /// Last surfaced service-connect issue, to avoid event-log spam.
+    last_service_issue: Option<String>,
+    /// Last surfaced outgoing-packet error, to avoid event-log spam.
+    last_outgoing_error: Option<String>,
     refresh_configs: Instant,
     /// Cooldown for processing admission Join frames, keyed by applicant. Each
     /// accepted frame costs a signature and a store write, so the sender-side
@@ -341,6 +345,8 @@ impl Engine {
             last_sync: Instant::now(),
             last_view: Instant::now() - Duration::from_secs(1),
             restore,
+            last_service_issue: None,
+            last_outgoing_error: None,
             refresh_configs: Instant::now(),
             join_cooldown: BTreeMap::new(),
             offers: BTreeMap::new(),
@@ -1121,6 +1127,14 @@ impl Engine {
                 dial.insert(*peer);
             }
         }
+        if let Some(issue) = adapter::current_issue() {
+            if self.last_service_issue.as_deref() != Some(issue.as_str()) {
+                log(view, &format!("Служба: {issue}"));
+                self.last_service_issue = Some(issue);
+            }
+        } else if self.last_service_issue.take().is_some() {
+            log(view, "Служба: подключение восстановлено");
+        }
         let messages = self.transport.tick(&self.client, &allowed, &dial);
         for (sender, bytes) in messages {
             if let Err(error) = self.receive(sender, &bytes, view) {
@@ -1225,7 +1239,26 @@ impl Engine {
                     break;
                 };
                 let result = (|| -> Result<()> {
-                    let packet = Packet::parse(&bytes)?;
+                    // The stack's own chatter (IGMP reports, IPv6, etc.) is
+                    // not an error — skip it quietly.
+                    let packet = match Packet::parse(&bytes) {
+                        Ok(packet) => packet,
+                        Err(_) => return Ok(()),
+                    };
+                    // Self-destined packets (e.g. a ping to the VPN IP) come
+                    // back through the ring: loop them straight into the
+                    // adapter so the local stack sees them, instead of
+                    // tunneling a packet to ourselves (the incoming path
+                    // rejects sender == local by design).
+                    let local_ip = self.networks[&id]
+                        .network
+                        .member(&self.local)
+                        .context("Local identity is not a member")?
+                        .ip;
+                    if packet.destination == local_ip {
+                        adapter.inject(&bytes)?;
+                        return Ok(());
+                    }
                     let recipients = packet.outgoing(&self.networks[&id].network, &self.local)?;
                     let frame = Frame::encode(Kind::Ipv4, id, &bytes)?;
                     for peer in recipients {
@@ -1241,8 +1274,13 @@ impl Engine {
                     }
                     Ok(())
                 })();
-                if result.is_err() {
+                if let Err(error) = result {
                     view.dropped += 1;
+                    let message = format!("{error:#}");
+                    if self.last_outgoing_error.as_deref() != Some(message.as_str()) {
+                        log(view, &format!("Адаптер: {message}"));
+                        self.last_outgoing_error = Some(message);
+                    }
                 }
             }
         }

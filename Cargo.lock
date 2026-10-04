@@ -1260,6 +1260,7 @@ dependencies = [
  "serde_json",
  "steamworks",
  "uuid",
+ "windows",
 ]
 
 [[package]]

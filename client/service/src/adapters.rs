@@ -58,11 +58,33 @@ impl Adapters {
         if self.map.contains_key(&network) {
             return Ok(());
         }
+        crate::log("open: api ready");
         let api = self.ensure_api()?;
+        crate::log("open: wintun create/open starting");
         let name = format!("FreeC-{}", network.simple());
-        let adapter = wintun::Adapter::open(api, &name).or_else(|_| {
-            wintun::Adapter::create(api, &name, "FreeC Tier", Some(network.as_u128()))
-        })?;
+        let adapter = match wintun::Adapter::open(api, &name) {
+            Ok(adapter) => {
+                crate::log("open: existing adapter opened");
+                adapter
+            }
+            Err(open_error) => {
+                crate::log(&format!(
+                    "open: adapter open failed ({open_error}), creating"
+                ));
+                let created =
+                    wintun::Adapter::create(api, &name, "FreeC Tier", Some(network.as_u128()));
+                match created {
+                    Ok(adapter) => {
+                        crate::log("open: adapter created");
+                        adapter
+                    }
+                    Err(create_error) => {
+                        crate::log(&format!("open: adapter create failed: {create_error}"));
+                        return Err(create_error).context("Cannot open Wintun adapter");
+                    }
+                }
+            }
+        };
         // Address assignment creates the connected /24 route. Never configure
         // a default gateway or DNS. Passing argv avoids shell interpolation.
         // Configure the interface through the IP Helper API instead of
@@ -73,8 +95,15 @@ impl Adapters {
         let index = interface_index(unsafe {
             std::mem::transmute::<wintun::NET_LUID_LH, [u8; 8]>(adapter.get_luid())
         })?;
+        crate::log(&format!(
+            "open: configuring interface index {index} with {local_ip}"
+        ));
         configure_interface(index, local_ip)?;
+        cleanup_addresses(index, local_ip);
+        crate::log("open: interface configured (IP Helper)");
+        crate::log("open: adapter created, starting session");
         let session = Arc::new(adapter.start_session(wintun::MAX_RING_CAPACITY)?);
+        crate::log("open: session started");
         let reader_session = Arc::clone(&session);
         let reader_network = network;
         let reader = std::thread::Builder::new()
@@ -153,6 +182,23 @@ fn interface_index(luid: [u8; 8]) -> Result<u32> {
     Ok(index)
 }
 
+use windows::Win32::Networking::WinSock::{IN_ADDR, IN_ADDR_0};
+
+/// `S_un.S_addr` stores the address octets as its memory image; a
+/// native-endian load/store of the u32 keeps that image byte-exact, while
+/// the `_be_` variants mirror it (10.77.0.1 became 1.0.77.10 once).
+fn in_addr_of(ip: Ipv4Addr) -> IN_ADDR {
+    IN_ADDR {
+        S_un: IN_ADDR_0 {
+            S_addr: u32::from_ne_bytes(ip.octets()),
+        },
+    }
+}
+
+fn ipv4_of_in_addr(addr: IN_ADDR) -> Ipv4Addr {
+    Ipv4Addr::from(unsafe { addr.S_un.S_addr }.to_ne_bytes())
+}
+
 /// Address + MTU via IP Helper: no child process, no name lookup, and the
 /// /24 on-link route is created with the address entry.
 fn configure_interface(index: u32, local_ip: Ipv4Addr) -> Result<()> {
@@ -162,7 +208,7 @@ fn configure_interface(index: u32, local_ip: Ipv4Addr) -> Result<()> {
         SetIpInterfaceEntry, MIB_IPINTERFACE_ROW, MIB_UNICASTIPADDRESS_ROW,
     };
     use windows::Win32::Networking::WinSock::{
-        IpPrefixOriginManual, IpSuffixOriginManual, AF_INET, IN_ADDR, IN_ADDR_0, SOCKADDR_INET,
+        IpPrefixOriginManual, IpSuffixOriginManual, AF_INET, SOCKADDR_INET,
     };
     unsafe {
         // MTU. The stack reports SitePrefixLength 255 for IPv4 interfaces,
@@ -189,11 +235,7 @@ fn configure_interface(index: u32, local_ip: Ipv4Addr) -> Result<()> {
             Ipv4: windows::Win32::Networking::WinSock::SOCKADDR_IN {
                 sin_family: AF_INET,
                 sin_port: 0,
-                sin_addr: IN_ADDR {
-                    S_un: IN_ADDR_0 {
-                        S_addr: u32::from_be_bytes(local_ip.octets()),
-                    },
-                },
+                sin_addr: in_addr_of(local_ip),
                 sin_zero: [0; 8],
             },
         };
@@ -206,4 +248,51 @@ fn configure_interface(index: u32, local_ip: Ipv4Addr) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Remove every IPv4 address on the adapter's interface except the expected
+/// one; leftovers from earlier sessions make the stack emit packets with
+/// sources the engine rejects.
+fn cleanup_addresses(index: u32, keep: Ipv4Addr) {
+    use windows::Win32::NetworkManagement::IpHelper::{
+        DeleteUnicastIpAddressEntry, FreeMibTable, GetUnicastIpAddressTable,
+        MIB_UNICASTIPADDRESS_TABLE,
+    };
+    use windows::Win32::Networking::WinSock::AF_INET;
+    unsafe {
+        let mut table: *mut MIB_UNICASTIPADDRESS_TABLE = std::ptr::null_mut();
+        if GetUnicastIpAddressTable(AF_INET, &mut table).is_err() {
+            return;
+        }
+        if !table.is_null() {
+            let count = (*table).NumEntries as usize;
+            let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), count);
+            for row in rows {
+                if row.InterfaceIndex != index {
+                    continue;
+                }
+                let ip = ipv4_of_in_addr(row.Address.Ipv4.sin_addr);
+                if ip != keep {
+                    let _ = DeleteUnicastIpAddressEntry(row);
+                }
+            }
+            FreeMibTable(table as _);
+        }
+    }
+}
+
+#[cfg(test)]
+mod addr_order {
+    use super::*;
+
+    /// The wire image of the address must be the octets in order; the
+    /// mirrored image (1.0.77.10 for 10.77.0.1) once shipped and silently
+    /// broke every ping while the service log looked perfect.
+    #[test]
+    fn in_addr_memory_image_is_wire_order() {
+        let addr = in_addr_of(Ipv4Addr::new(10, 77, 0, 1));
+        let image = unsafe { addr.S_un.S_addr.to_ne_bytes() };
+        assert_eq!(image, [10, 77, 0, 1]);
+        assert_eq!(ipv4_of_in_addr(addr), Ipv4Addr::new(10, 77, 0, 1));
+    }
 }

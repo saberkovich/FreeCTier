@@ -76,6 +76,49 @@ fn create_server(user_sid: &str) -> Result<HANDLE> {
     }
 }
 
+/// The Windows Firewall treats a freshly created Wintun adapter as an
+/// unidentified public network and blocks all inbound traffic from the
+/// tunnel (games listening for LAN peers, pings). Allow anything within
+/// the FreeC Tier subnets; idempotent across service restarts.
+fn open_firewall() {
+    use std::os::windows::process::CommandExt;
+    for arguments in [
+        vec![
+            "advfirewall",
+            "firewall",
+            "delete",
+            "rule",
+            "name=FreeC Tier",
+        ],
+        vec![
+            "advfirewall",
+            "firewall",
+            "add",
+            "rule",
+            "name=FreeC Tier",
+            "dir=in",
+            "action=allow",
+            "protocol=any",
+            "remoteip=10.77.0.0/16",
+            "profile=any",
+        ],
+    ] {
+        let result = std::process::Command::new("netsh.exe")
+            .args(&arguments)
+            .creation_flags(0x0800_0000)
+            .output();
+        match result {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => log(&format!(
+                "firewall rule update failed: {} {}",
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+            Err(error) => log(&format!("firewall rule update failed: {error}")),
+        }
+    }
+}
+
 /// Overlapped `ConnectNamedPipe` that stays responsive to service stop.
 fn wait_client(handle: HANDLE, stop: HANDLE) -> io::Result<()> {
     let event = unsafe { CreateEventW(None, true, false, None)? };
@@ -199,6 +242,7 @@ impl PipeIo {
     }
 
     fn read_exact(&self, buffer: &mut [u8]) -> io::Result<()> {
+        log(&format!("svc io: reading {} bytes", buffer.len()));
         let mut done = 0;
         while done < buffer.len() {
             let count = self.read_one(&mut buffer[done..])?;
@@ -249,6 +293,15 @@ fn is_stop_set(stop: HANDLE) -> bool {
 /// Accept loop: create the pipe, wait for a client, run the session, repeat
 /// until the service is asked to stop.
 pub fn serve(ctl: &Arc<Ctl>, user_sid: &str) {
+    open_firewall();
+    log(&format!(
+        "listening on {PIPE_PATH}; pipe DACL user SID: {}",
+        if user_sid.is_empty() {
+            "(none recorded)"
+        } else {
+            user_sid
+        }
+    ));
     let adapters = Arc::new(Mutex::new(Adapters::default()));
     loop {
         if ctl.is_stopping() {
@@ -265,7 +318,14 @@ pub fn serve(ctl: &Arc<Ctl>, user_sid: &str) {
         *ctl.client.lock().unwrap() = Some(server.0 as isize);
         match wait_client(server, ctl.stop_event) {
             Ok(()) => {
-                log("client connected");
+                let mut pid = 0u32;
+                unsafe {
+                    let _ = windows::Win32::System::Pipes::GetNamedPipeClientProcessId(
+                        server, &mut pid,
+                    );
+                }
+                log(&format!("client connected (pid {pid})"));
+                log("session: waiting for hello");
                 if let Err(error) = run_session(server, ctl, &adapters) {
                     if !is_stopped_error(&error) {
                         log(&format!("client session failed: {error:#}"));
@@ -332,11 +392,13 @@ fn run_session(handle: HANDLE, ctl: &Arc<Ctl>, adapters: &Arc<Mutex<Adapters>>) 
         if ctl.is_stopping() {
             break;
         }
+        log("session: waiting for frame");
         let frame = match io.read_frame() {
             Ok(frame) => frame,
             Err(error) if is_stopped_error(&error) => break,
             Err(error) => return Err(error.into()),
         };
+
         match freec_ipc::decode_client_frame(&frame)? {
             freec_ipc::ClientMessage::Hello => anyhow::bail!("Duplicate hello"),
             freec_ipc::ClientMessage::OpenAdapter { network, local_ip } => {
