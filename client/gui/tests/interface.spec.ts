@@ -78,13 +78,13 @@ test('public member invitations follow effective permission without owner contro
     fixture.networks[0].members[1].may_invite = false;
   });
   await expect(page.locator('#invite')).toBeDisabled();
-  await expect(page.getByText('Участник · может приглашать · Вы')).toHaveCount(0);
+  await expect(page.getByText('МОЖЕТ ПРИГЛАШАТЬ · ВЫ')).toHaveCount(0);
   await page.evaluate(() => {
     const { fixture } = window as unknown as { fixture: { networks: { public: boolean; members: { can_invite: boolean }[] }[] } };
     fixture.networks[0].public = false;
     fixture.networks[0].members[1].can_invite = true;
   });
-  await expect(page.getByText('Вход по приглашению')).toBeVisible();
+  await expect(page.getByText('Вход только по приглашению')).toBeVisible();
   await expect(page.locator('#invite')).toBeDisabled();
 });
 
@@ -170,15 +170,15 @@ test('real state rendering is escaped and adapter action reaches IPC', async ({ 
   await page.screenshot({ path: '../../.cache/screenshots/detail.png', fullPage: true });
   expect(await page.evaluate(() => (window as unknown as {lastCommand: unknown}).lastCommand)).toEqual({ command: { type: 'set_permissions', network: '67ae3f2d-0734-47f8-bf1b-e5e2bc64a289', steam_id: '76561198000000002', can_invite: true, can_kick: true } });
   await expect(page.getByRole('checkbox', { name: 'Исключать: Test friend' })).toBeChecked();
-  await expect(page.getByText('Участник · может приглашать')).toBeVisible();
+  await expect(page.getByText('МОЖЕТ ПРИГЛАШАТЬ')).toBeVisible();
   await page.locator('#access-private').click();
   await expect(page.locator('#access-private')).toHaveAttribute('aria-pressed', 'true');
   await expect(page.getByRole('checkbox', { name: 'Приглашать: Test friend' })).not.toBeChecked();
-  await expect(page.getByText('Участник · может приглашать')).toHaveCount(0);
+  await expect(page.getByText('МОЖЕТ ПРИГЛАШАТЬ')).toHaveCount(0);
   await page.getByRole('checkbox', { name: 'Приглашать: Test friend' }).check();
   await expect(page.getByRole('checkbox', { name: 'Приглашать: Test friend' })).toBeChecked();
   await expect(page.getByRole('checkbox', { name: 'Исключать: Test friend' })).toBeChecked();
-  await expect(page.getByText('Участник · может приглашать')).toBeVisible();
+  await expect(page.getByText('МОЖЕТ ПРИГЛАШАТЬ')).toBeVisible();
   await page.screenshot({ path: '../../.cache/screenshots/network-fixture.png', fullPage: true });
   await page.locator('#settings').click();
   await page.getByRole('button', { name: 'Диагностика' }).click();
@@ -226,6 +226,45 @@ test('real state rendering is escaped and adapter action reaches IPC', async ({ 
   expect(await page.evaluate(() => (window as unknown as {lastCommand: unknown}).lastCommand)).toEqual({ command: { type: 'delete', network: '67ae3f2d-0734-47f8-bf1b-e5e2bc64a289' } });
 });
 
+test('accent swatches recolor the app, persist and hand over to the custom editor', async ({ page }) => {
+  await page.addInitScript(() => {
+    const fixture = { steam: 'online', steam_id: '2', nickname: 'Guest', relay: 'Ok', networks: [], friends: [], events: [], sent: 0, received: 0, dropped: 0 };
+    Object.assign(window, { isTauri: true, __TAURI_INTERNALS__: { invoke: async (command: string, args: unknown) => {
+      if (command === 'snapshot') return structuredClone(fixture);
+      if (command === 'settings') return { minimize_to_tray: true, check_updates: false, autostart: false, theme: 'dark' };
+      if (command === 'version') return '0.2.0';
+      if (command === 'save_settings') Object.assign(window, { savedSettings: args });
+      if (command === 'service_status') return { installed: false, running: false };
+    } } });
+  });
+  await page.goto('/');
+  await page.locator('#settings').click();
+  // With no override the ring sits on the preset accent of the active theme.
+  await expect(page.getByRole('button', { name: 'Акцент: По умолчанию' })).toHaveAttribute('aria-pressed', 'true');
+  await page.getByRole('button', { name: 'Акцент: Фиолетовый' }).click();
+  expect(await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--accent').trim())).toBe('#8b5cf6');
+  await expect(page.getByRole('button', { name: 'Акцент: Фиолетовый' })).toHaveAttribute('aria-pressed', 'true');
+  expect(await page.evaluate(() => (window as unknown as {savedSettings: unknown}).savedSettings)).toEqual({
+    settings: { minimize_to_tray: true, check_updates: false, autostart: false, theme: 'dark', accent: '#8b5cf6' },
+  });
+  // The light preset keeps the chosen accent, the rest of the palette flips.
+  await page.getByRole('button', { name: 'Светлая' }).click();
+  expect(await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--accent').trim())).toBe('#8b5cf6');
+  // «Своя» owns every token, so the swatch row steps aside and seeds from it.
+  await page.getByRole('button', { name: 'Своя' }).click();
+  await expect(page.getByRole('button', { name: 'Акцент: Фиолетовый' })).toHaveCount(0);
+  expect(await page.evaluate(() => {
+    const saved = (window as unknown as {savedSettings?: {settings?: {custom_colors?: Record<string, string>}}}).savedSettings;
+    return saved?.settings?.custom_colors?.accent;
+  })).toBe('#8b5cf6');
+  // Back on a preset, «По умолчанию» drops the override for good.
+  await page.getByRole('button', { name: 'Тёмная' }).click();
+  await page.getByRole('button', { name: 'Акцент: По умолчанию' }).click();
+  expect(await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--accent').trim())).toBe('#e03650');
+  await page.waitForTimeout(400); // let the switch finish its color transition
+  await page.screenshot({ path: '../../.cache/screenshots/accent.png', fullPage: true });
+});
+
 test('custom theme seeds from the current theme, previews live and persists', async ({ page }) => {
   await page.addInitScript(() => {
     const fixture = { steam: 'online', steam_id: '2', nickname: 'Guest', relay: 'Ok', networks: [], friends: [], events: [], sent: 0, received: 0, dropped: 0 };
@@ -243,7 +282,7 @@ test('custom theme seeds from the current theme, previews live and persists', as
   // Seeded palette covers every token, so the editor starts from the dark theme.
   await expect(page.locator('#theme-editor .color-input')).toHaveCount(16);
   expect(await page.evaluate(() => (window as unknown as {savedSettings: unknown}).savedSettings)).toEqual({
-    settings: { minimize_to_tray: true, check_updates: false, autostart: false, theme: 'custom', custom_colors: expect.objectContaining({ accent: '#a12834', bg: '#160b0e' }) },
+    settings: { minimize_to_tray: true, check_updates: false, autostart: false, theme: 'custom', custom_colors: expect.objectContaining({ accent: '#e03650', bg: '#0d0608' }) },
   });
   // Picking previews immediately as an inline variable on <html>.
   await page.locator('.color-input[data-token="accent"]').fill('#00ff00');
@@ -258,5 +297,5 @@ test('custom theme seeds from the current theme, previews live and persists', as
   await page.getByRole('button', { name: 'Сбросить' }).click();
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
   await expect(page.locator('#theme-editor')).toHaveCount(0);
-  expect(await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--accent').trim())).toBe('#a12834');
+  expect(await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--accent').trim())).toBe('#e03650');
 });
