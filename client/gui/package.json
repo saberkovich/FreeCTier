@@ -19,6 +19,9 @@
     "vite": "^7.1.7"
   },
   "dependencies": {
+    "@fontsource/jetbrains-mono": "^5.3.0",
+    "@fontsource/onest": "^5.3.1",
+    "@fontsource/unbounded": "^5.3.0",
     "morphdom": "^2.7.8"
   }
 }
