@@ -6,7 +6,7 @@ test('public discovery refreshes without network changes and password reaches IP
       public_networks: [] as { lobby: string; name: string }[], joins: [] as { id: string; name: string; password: boolean }[] };
     Object.assign(window, { isTauri: true, __TAURI_INTERNALS__: { invoke: async (command: string, args: unknown) => {
       if (command === 'snapshot') return structuredClone(fixture);
-      if (command === 'settings') return { theme: 'dark', check_updates: false, minimize_to_tray: true };
+      if (command === 'settings') return { theme: 'dark', check_updates: false, minimize_to_tray: true, onboarded: true };
       if (command === 'version') return '0.2.0';
       if (command === 'dispatch') {
         Object.assign(window, { lastCommand: args });
@@ -58,7 +58,7 @@ test('public member invitations follow effective permission without owner contro
     Object.assign(window, { fixture, isTauri: true, __TAURI_INTERNALS__: { invoke: async (command: string, args: unknown) => {
       if (command === 'snapshot') return structuredClone(fixture);
       if (command === 'version') return '0.2.1-preview';
-      if (command === 'settings') return { minimize_to_tray: true, check_updates: false, theme: 'dark' };
+      if (command === 'settings') return { minimize_to_tray: true, check_updates: false, theme: 'dark', onboarded: true };
       if (command === 'dispatch') Object.assign(window, { lastCommand: args });
     } } });
   });
@@ -129,7 +129,7 @@ test('real state rendering is escaped and adapter action reaches IPC', async ({ 
     Object.assign(window, { isTauri: true, __TAURI_INTERNALS__: { invoke: async (command: string, args: unknown) => {
       if (command === 'snapshot') { fixture.sent++; fixture.received += 2; fixture.dropped++; fixture.networks[0].revision++; return structuredClone(fixture); }
       if (command === 'version') return '0.2.1-preview';
-      if (command === 'settings') return { minimize_to_tray: true, check_updates: true, autostart: false, theme: 'dark' };
+      if (command === 'settings') return { minimize_to_tray: true, check_updates: true, autostart: false, theme: 'dark', onboarded: true };
       if (command === 'save_settings') Object.assign(window, { savedSettings: args });
       if (command === 'service_status') return { installed: true, running: true };
       if (command === 'avatars') return { '76561198000000002': 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==' };
@@ -219,7 +219,7 @@ test('real state rendering is escaped and adapter action reaches IPC', async ({ 
   await page.getByLabel('Запускать при входе в Windows').check();
   expect(await page.evaluate(() => (window as unknown as {lastAutostart: unknown}).lastAutostart)).toEqual({ enabled: true });
   await expect(page.getByLabel('Запускать при входе в Windows')).toBeChecked();
-  expect(await page.evaluate(() => (window as unknown as {savedSettings: unknown}).savedSettings)).toEqual({ settings: { minimize_to_tray: false, check_updates: true, autostart: true, theme: 'light' } });
+  expect(await page.evaluate(() => (window as unknown as {savedSettings: unknown}).savedSettings)).toEqual({ settings: { minimize_to_tray: false, check_updates: true, autostart: true, theme: 'light', onboarded: true } });
   await page.getByRole('button', { name: 'Проверить', exact: true }).click();
   await expect(page.locator('#update-message')).toContainText('Доступна версия 0.3.0');
   await expect(page.getByRole('button', { name: 'Установить 0.3.0' })).toBeVisible();
@@ -233,12 +233,51 @@ test('real state rendering is escaped and adapter action reaches IPC', async ({ 
   expect(await page.evaluate(() => (window as unknown as {lastCommand: unknown}).lastCommand)).toEqual({ command: { type: 'delete', network: '67ae3f2d-0734-47f8-bf1b-e5e2bc64a289' } });
 });
 
+test('first run opens on the Steam library step and follows the license live', async ({ page }) => {
+  await page.addInitScript(() => {
+    const snapshot = { steam: 'waiting', steam_id: '1', relay: 'unknown', networks: [], friends: [], events: [], sent: 0, received: 0, dropped: 0 };
+    const app = { app_id: 324810, in_library: false };
+    Object.assign(window, { app, isTauri: true, __TAURI_INTERNALS__: { invoke: async (command: string, args: unknown) => {
+      if (command === 'snapshot') return structuredClone(snapshot);
+      if (command === 'settings') return { minimize_to_tray: true, check_updates: false, autostart: false, theme: 'dark' };
+      if (command === 'version') return '0.2.0';
+      if (command === 'steam_app') return structuredClone(app);
+      if (command === 'open_steam_app') Object.assign(window, { opened: args });
+      if (command === 'save_settings') Object.assign(window, { savedSettings: args });
+      if (command === 'service_status') return { installed: true, running: true };
+    } } });
+  });
+  await page.goto('/');
+  const dialog = page.locator('#welcome-dialog');
+  await expect(dialog).toBeVisible();
+  // Step one names the AppID and says plainly that the license is missing.
+  await expect(dialog.getByText('324810')).toBeVisible();
+  await expect(dialog.getByText('В библиотеке пока не видно')).toBeVisible();
+  // Step two is the same guide Settings offers on its own.
+  await expect(dialog.getByText('Скрыть игру в библиотеке')).toBeVisible();
+  await dialog.getByRole('button', { name: 'Добавить в Steam' }).click();
+  expect(await page.evaluate(() => (window as unknown as {opened: unknown}).opened)).toEqual({ store: false });
+  await dialog.getByRole('button', { name: 'Открыть страницу в магазине' }).click();
+  expect(await page.evaluate(() => (window as unknown as {opened: unknown}).opened)).toEqual({ store: true });
+  // The user acts in Steam; the window notices on its own.
+  await page.evaluate(() => { (window as unknown as { app: { in_library: boolean } }).app.in_library = true; });
+  await expect(dialog.getByText('уже в библиотеке')).toBeVisible();
+  await page.screenshot({ path: '../../.cache/screenshots/welcome.png' });
+  await dialog.getByRole('button', { name: 'Готово' }).click();
+  await expect(dialog).not.toBeVisible();
+  expect(await page.evaluate(() => (window as unknown as {savedSettings: {settings: {onboarded: boolean}}}).savedSettings.settings.onboarded)).toBe(true);
+  // Reopening it from Settings must not need a restart.
+  await page.locator('#settings').click();
+  await page.getByRole('button', { name: 'Настройка Steam' }).click();
+  await expect(dialog).toBeVisible();
+});
+
 test('accent swatches recolor the app, persist and hand over to the custom editor', async ({ page }) => {
   await page.addInitScript(() => {
     const fixture = { steam: 'online', steam_id: '2', nickname: 'Guest', relay: 'Ok', networks: [], friends: [], events: [], sent: 0, received: 0, dropped: 0 };
     Object.assign(window, { isTauri: true, __TAURI_INTERNALS__: { invoke: async (command: string, args: unknown) => {
       if (command === 'snapshot') return structuredClone(fixture);
-      if (command === 'settings') return { minimize_to_tray: true, check_updates: false, autostart: false, theme: 'dark' };
+      if (command === 'settings') return { minimize_to_tray: true, check_updates: false, autostart: false, theme: 'dark', onboarded: true };
       if (command === 'version') return '0.2.0';
       if (command === 'save_settings') Object.assign(window, { savedSettings: args });
       if (command === 'service_status') return { installed: false, running: false };
@@ -252,7 +291,7 @@ test('accent swatches recolor the app, persist and hand over to the custom edito
   expect(await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--accent').trim())).toBe('#8b5cf6');
   await expect(page.getByRole('button', { name: 'Акцент: Фиолетовый' })).toHaveAttribute('aria-pressed', 'true');
   expect(await page.evaluate(() => (window as unknown as {savedSettings: unknown}).savedSettings)).toEqual({
-    settings: { minimize_to_tray: true, check_updates: false, autostart: false, theme: 'dark', accent: '#8b5cf6' },
+    settings: { minimize_to_tray: true, check_updates: false, autostart: false, theme: 'dark', onboarded: true, accent: '#8b5cf6' },
   });
   // The light preset keeps the chosen accent, the rest of the palette flips.
   await page.getByRole('button', { name: 'Светлая' }).click();
@@ -277,7 +316,7 @@ test('custom theme seeds from the current theme, previews live and persists', as
     const fixture = { steam: 'online', steam_id: '2', nickname: 'Guest', relay: 'Ok', networks: [], friends: [], events: [], sent: 0, received: 0, dropped: 0 };
     Object.assign(window, { isTauri: true, __TAURI_INTERNALS__: { invoke: async (command: string, args: unknown) => {
       if (command === 'snapshot') return structuredClone(fixture);
-      if (command === 'settings') return { minimize_to_tray: true, check_updates: false, autostart: false, theme: 'dark' };
+      if (command === 'settings') return { minimize_to_tray: true, check_updates: false, autostart: false, theme: 'dark', onboarded: true };
       if (command === 'version') return '0.2.0';
       if (command === 'save_settings') Object.assign(window, { savedSettings: args });
       if (command === 'service_status') return { installed: false, running: false };
@@ -289,7 +328,7 @@ test('custom theme seeds from the current theme, previews live and persists', as
   // Seeded palette covers every token, so the editor starts from the dark theme.
   await expect(page.locator('#theme-editor .color-input')).toHaveCount(16);
   expect(await page.evaluate(() => (window as unknown as {savedSettings: unknown}).savedSettings)).toEqual({
-    settings: { minimize_to_tray: true, check_updates: false, autostart: false, theme: 'custom', custom_colors: expect.objectContaining({ accent: '#e03650', bg: '#0d0608' }) },
+    settings: { minimize_to_tray: true, check_updates: false, autostart: false, theme: 'custom', onboarded: true, custom_colors: expect.objectContaining({ accent: '#e03650', bg: '#0d0608' }) },
   });
   // Picking previews immediately as an inline variable on <html>.
   await page.locator('.color-input[data-token="accent"]').fill('#00ff00');

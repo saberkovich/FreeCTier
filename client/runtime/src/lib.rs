@@ -1788,28 +1788,84 @@ fn describe_steam_error(error: &anyhow::Error) -> String {
 /// IPC pipe» while both tokens were clean — that shape is either a
 /// steam.exe left over from another Windows account (owns the IPC pipe,
 /// refuses everyone else) or antivirus blocking the IPC.
-fn wait_hint(detail: &str, elevated: bool, steam: &SteamState) -> &'static str {
+fn wait_hint(
+    detail: &str,
+    elevated: bool,
+    steam: &SteamState,
+    app_id: u32,
+    in_library: Option<bool>,
+) -> String {
     let connection_failure = detail.contains("ConnectToGlobalUser") || detail.contains("IPC pipe");
     if !connection_failure {
-        return "";
+        return String::new();
     }
     if steam.same_user == Some(false) {
-        return " Steam запущен от другой учётной записи Windows — перезагрузите компьютер, чтобы сбросить зависший процесс.";
+        return " Steam запущен от другой учётной записи Windows — перезагрузите компьютер, чтобы сбросить зависший процесс.".into();
     }
     if steam.processes > 1 {
-        return " Запущено несколько процессов Steam, один из них завис — перезагрузите компьютер, чтобы сбросить его.";
+        return " Запущено несколько процессов Steam, один из них завис — перезагрузите компьютер, чтобы сбросить его.".into();
+    }
+    // The app connects to Steam under a published AppID, and Steam refuses the
+    // connection outright when the signed-in account holds no license for it.
+    // Nothing in the token or process state shows that, so an account that
+    // never added the (free) app looks exactly like a blocked one.
+    if in_library == Some(false) {
+        return format!(
+            " Похоже, приложения {app_id}, через которое работает FreeC Tier, нет в вашей библиотеке Steam. Откройте store.steampowered.com/app/{app_id} и нажмите «Играть» — оно бесплатное, скачивать его не нужно. Если оно уже в библиотеке, причина внешняя: чаще всего антивирус, добавьте FreeC Tier и Steam в его исключения."
+        );
     }
     match (elevated, steam.elevated) {
         (true, Some(false)) => {
-            " Перезапустите Steam: выйдите из аккаунта и войдите заново. Если не поможет — перезапустите FreeC Tier без прав администратора."
+            " Перезапустите Steam: выйдите из аккаунта и войдите заново. Если не поможет — перезапустите FreeC Tier без прав администратора.".into()
         }
         (true, _) => {
-            " Перезапустите Steam: выйдите из аккаунта и войдите заново. Если не поможет — включите контроль учётных записей (UAC) и перезапустите оба приложения."
+            " Перезапустите Steam: выйдите из аккаунта и войдите заново. Если не поможет — включите контроль учётных записей (UAC) и перезапустите оба приложения.".into()
         }
         // Tokens look correct on both sides — the connection is blocked from
         // the outside, which is almost always antivirus.
-        _ => " Steam выглядит запущенным корректно, но соединение с ним блокируется. Чаще всего это антивирус — добавьте FreeC Tier и Steam в его исключения. Если не поможет — перезагрузите компьютер.",
+        _ => " Steam выглядит запущенным корректно, но соединение с ним блокируется. Чаще всего это антивирус — добавьте FreeC Tier и Steam в его исключения. Если не поможет — перезагрузите компьютер.".into(),
     }
+}
+
+/// Whether the signed-in Steam account has this AppID in its library. Steam
+/// keeps a per-app key under `HKCU\Software\Valve\Steam\Apps` for everything
+/// the account owns, installed or not, so a missing key is a strong signal
+/// that the license is missing — but only a signal, never a gate: the hint it
+/// drives still names the fallback cause.
+#[cfg(not(windows))]
+pub fn steam_app_in_library(_app_id: u32) -> Option<bool> {
+    None
+}
+
+#[cfg(windows)]
+pub fn steam_app_in_library(app_id: u32) -> Option<bool> {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
+    };
+    let path = HSTRING::from(format!("Software\\Valve\\Steam\\Apps\\{app_id}"));
+    let mut key = HKEY::default();
+    let status = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, &path, Some(0), KEY_READ, &mut key) };
+    if status == ERROR_SUCCESS {
+        unsafe {
+            let _ = RegCloseKey(key);
+        };
+        return Some(true);
+    }
+    // Steam itself has to be present for the absence to mean anything: without
+    // the parent key we are looking at a machine Steam never wrote to.
+    let mut parent = HKEY::default();
+    let apps = HSTRING::from("Software\\Valve\\Steam\\Apps");
+    let has_apps =
+        unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, &apps, Some(0), KEY_READ, &mut parent) };
+    if has_apps == ERROR_SUCCESS {
+        unsafe {
+            let _ = RegCloseKey(parent);
+        };
+        return Some(false);
+    }
+    None
 }
 
 /// Whether this process runs with an elevated token.
@@ -2206,9 +2262,10 @@ fn run(
                         if wait_error.as_deref() != Some(detail.as_str()) {
                             let elevated = process_elevated();
                             let steam = steam_state();
+                            let in_library = steam_app_in_library(app_id);
                             let mut line = format!(
                                 "Ожидание Steam: {detail}{}",
-                                wait_hint(&detail, elevated, &steam)
+                                wait_hint(&detail, elevated, &steam, app_id, in_library)
                             );
                             let connection_failure = detail.contains("ConnectToGlobalUser")
                                 || detail.contains("IPC pipe");
@@ -2216,7 +2273,7 @@ fn run(
                                 // Process and token states are the diagnosis the
                                 // user cannot see otherwise; log them verbatim.
                                 line.push_str(&format!(
-                                    " [приложение: {} · Steam: {}{}{}]",
+                                    " [приложение: {} · Steam: {}{}{}{}]",
                                     if elevated {
                                         "админ"
                                     } else {
@@ -2235,6 +2292,11 @@ fn run(
                                     match steam.same_user {
                                         Some(false) => " · другой пользователь",
                                         _ => "",
+                                    },
+                                    match in_library {
+                                        Some(false) => " · нет в библиотеке",
+                                        Some(true) => " · есть в библиотеке",
+                                        None => "",
                                     },
                                 ));
                             }
@@ -2320,6 +2382,7 @@ mod wait_hint_tests {
 
     #[test]
     fn connect_to_global_user_gets_actionable_hints() {
+        const APP: u32 = DEFAULT_APP_ID;
         let normal = SteamState {
             processes: 1,
             elevated: Some(false),
@@ -2331,8 +2394,11 @@ mod wait_hint_tests {
             elevated: Some(false),
             same_user: Some(false),
         };
-        assert!(wait_hint("ConnectToGlobalUser failed.", false, &foreign)
-            .contains("другой учётной записи"));
+        let owned = Some(true);
+        assert!(
+            wait_hint("ConnectToGlobalUser failed.", false, &foreign, APP, owned)
+                .contains("другой учётной записи")
+        );
         // Several steam.exe instances: a hung one is holding the pipe.
         let doubled = SteamState {
             processes: 2,
@@ -2342,7 +2408,9 @@ mod wait_hint_tests {
         assert!(wait_hint(
             "Cannot create IPC pipe to Steam client process.",
             false,
-            &doubled
+            &doubled,
+            APP,
+            owned
         )
         .contains("несколько процессов Steam"));
         // Clean tokens on both sides: point at antivirus, not at Steam restarts
@@ -2351,34 +2419,65 @@ mod wait_hint_tests {
             "Cannot create IPC pipe to Steam client process.",
             false,
             &normal,
+            APP,
+            owned,
         );
         assert!(hint.contains("антивирус"));
+        // The account never added the app the client connects under: Steam
+        // refuses the connection and no token or process state shows why.
+        let missing = wait_hint(
+            "ConnectToGlobalUser failed.",
+            false,
+            &normal,
+            APP,
+            Some(false),
+        );
+        assert!(missing.contains("библиотеке Steam"), "{missing}");
+        assert!(missing.contains(&APP.to_string()), "{missing}");
+        // Unknown library state must not invent a cause.
+        assert!(
+            wait_hint("ConnectToGlobalUser failed.", false, &normal, APP, None)
+                .contains("антивирус")
+        );
         // Elevated app + unelevated Steam keeps the elevation advice.
         let unelevated_steam = SteamState {
             processes: 1,
             elevated: Some(false),
             same_user: Some(true),
         };
-        assert!(
-            wait_hint("ConnectToGlobalUser failed.", true, &unelevated_steam)
-                .contains("без прав администратора")
-        );
+        assert!(wait_hint(
+            "ConnectToGlobalUser failed.",
+            true,
+            &unelevated_steam,
+            APP,
+            owned
+        )
+        .contains("без прав администратора"));
         let elevated_steam = SteamState {
             processes: 1,
             elevated: Some(true),
             same_user: Some(true),
         };
-        assert!(wait_hint("ConnectToGlobalUser failed.", true, &elevated_steam).contains("UAC"));
+        assert!(wait_hint(
+            "ConnectToGlobalUser failed.",
+            true,
+            &elevated_steam,
+            APP,
+            owned
+        )
+        .contains("UAC"));
         // Unrecognized details and non-init errors get no hint.
         assert_eq!(
             wait_hint(
                 "Steam client appears to be out of date",
                 true,
-                &elevated_steam
+                &elevated_steam,
+                APP,
+                Some(false)
             ),
             ""
         );
-        assert_eq!(wait_hint("", false, &normal), "");
+        assert_eq!(wait_hint("", false, &normal, APP, Some(false)), "");
     }
 
     /// Live probe of the Steam client diagnostics. Asserts only structural
@@ -2398,6 +2497,17 @@ mod wait_hint_tests {
         assert!(
             state.same_user.is_some(),
             "same-user must be resolved when steam.exe runs"
+        );
+        // A client that ran at least once has written its Apps key, so the
+        // library probe must answer rather than shrug — otherwise the missing
+        // license can never be told apart from a blocked connection.
+        let mine = steam_app_in_library(DEFAULT_APP_ID);
+        eprintln!("app {DEFAULT_APP_ID} in library: {mine:?}");
+        assert!(mine.is_some(), "library state must resolve with Steam up");
+        assert_eq!(
+            steam_app_in_library(u32::MAX),
+            Some(false),
+            "an AppID nobody owns must read as absent, not unknown"
         );
     }
 }
