@@ -50,6 +50,15 @@ fn snapshot(state: tauri::State<'_, Handle>) -> Snapshot {
 fn dispatch(state: tauri::State<'_, Handle>, command: Command) -> Result<(), String> {
     state.send(command).map_err(|e| e.to_string())
 }
+/// Avatars are fetched on demand instead of riding along in the snapshot: the
+/// UI polls that once a second and caches what it gets back here forever.
+#[tauri::command]
+fn avatars(
+    state: tauri::State<'_, Handle>,
+    ids: Vec<String>,
+) -> std::collections::BTreeMap<String, String> {
+    state.avatars(&ids)
+}
 #[tauri::command]
 fn settings(state: tauri::State<'_, Desktop>) -> Settings {
     state.settings.lock().unwrap().clone()
@@ -549,6 +558,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             snapshot,
             dispatch,
+            avatars,
             settings,
             save_settings,
             set_autostart,
