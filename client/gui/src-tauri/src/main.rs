@@ -17,6 +17,9 @@ struct Settings {
     check_updates: bool,
     autostart: bool,
     theme: String,
+    /// Set once the user has walked the first-run window. Until then the app
+    /// opens on it, because the Steam library step is a hard prerequisite.
+    onboarded: bool,
     /// Accent swatch picked in Settings, `#rrggbb`. Empty means «follow the
     /// theme preset»; it layers on top of `dark`/`light`, while «Своя» keeps
     /// its own accent in `custom_colors`.
@@ -32,6 +35,7 @@ impl Default for Settings {
             check_updates: true,
             autostart: false,
             theme: "dark".into(),
+            onboarded: false,
             accent: String::new(),
             custom_colors: Default::default(),
         }
@@ -40,6 +44,17 @@ impl Default for Settings {
 struct Desktop {
     settings: Mutex<Settings>,
     update: Mutex<Option<tauri_plugin_updater::Update>>,
+    /// The Steam AppID this client connects under. The account needs a license
+    /// for it, so the first-run window has to name it and watch for it.
+    app_id: u32,
+}
+
+#[derive(Serialize)]
+struct SteamApp {
+    app_id: u32,
+    /// `None` when Steam has never run on this machine and the registry says
+    /// nothing either way — the UI must not claim the app is missing then.
+    in_library: Option<bool>,
 }
 
 #[tauri::command]
@@ -58,6 +73,48 @@ fn avatars(
     ids: Vec<String>,
 ) -> std::collections::BTreeMap<String, String> {
     state.avatars(&ids)
+}
+/// Which AppID the client connects under, and whether the signed-in Steam
+/// account has it. Drives the first-run window: without that license Steam
+/// refuses the connection outright.
+#[tauri::command]
+fn steam_app(state: tauri::State<'_, Desktop>) -> SteamApp {
+    SteamApp {
+        app_id: state.app_id,
+        in_library: freec_runtime::steam_app_in_library(state.app_id),
+    }
+}
+/// Sends the user to Steam for the license the client needs. Only the app's
+/// own AppID is ever used — the webview passes no URL, so this cannot become a
+/// generic «open anything» primitive.
+///
+/// `steam://run` is the short path, and the one the store page's own «Играть»
+/// button uses for this app: for an account without the license Steam grants
+/// the free one and then offers the download, which the user can decline —
+/// the license is what the connection needs, the files are not. `store` opens
+/// the page instead, which is also what the UI offers once the app is already
+/// in the library, so this never launches a game somebody has installed.
+#[tauri::command]
+fn open_steam_app(state: tauri::State<'_, Desktop>, store: bool) -> Result<(), String> {
+    let app_id = state.app_id;
+    #[cfg(windows)]
+    {
+        let deep = if store {
+            format!("steam://store/{app_id}")
+        } else {
+            format!("steam://run/{app_id}")
+        };
+        if open_url(&deep).is_ok() {
+            return Ok(());
+        }
+        // No steam:// handler registered: the browser still gets them there.
+        open_url(&format!("https://store.steampowered.com/app/{app_id}/"))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (app_id, store);
+        Err("Доступно только в Windows-клиенте".into())
+    }
 }
 #[tauri::command]
 fn settings(state: tauri::State<'_, Desktop>) -> Settings {
@@ -494,6 +551,7 @@ fn main() {
             app.manage(Desktop {
                 settings: Mutex::new(settings),
                 update: Mutex::new(None),
+                app_id,
             });
             let open = MenuItem::with_id(app, "open", "Открыть FreeC Tier", true, None::<&str>)?;
             let exit = MenuItem::with_id(app, "quit", "Выйти", true, None::<&str>)?;
@@ -559,6 +617,8 @@ fn main() {
             snapshot,
             dispatch,
             avatars,
+            steam_app,
+            open_steam_app,
             settings,
             save_settings,
             set_autostart,

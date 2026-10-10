@@ -7,7 +7,8 @@ type Peer = { steam_id: string; name: string; ip: string; active: boolean; state
 type Network = { id: string; name: string; subnet: string; owner: string; revision: number; adapter: boolean; lobby?: string; public: boolean; can_invite: boolean; password: boolean; members: Peer[] };
 type Snapshot = { steam: string; steam_id?: string; nickname?: string; relay: string; networks: Network[]; friends: { steam_id: string; name: string }[]; events: string[]; received: number; sent: number; dropped: number; joins?: { id: string; name: string; password: boolean }[]; public_networks?: { lobby: string; name: string }[] };
 type Command = { type: string; [key: string]: unknown };
-type Settings = { minimize_to_tray: boolean; check_updates: boolean; autostart?: boolean; theme: string; accent?: string; custom_colors?: Record<string, string> };
+type Settings = { minimize_to_tray: boolean; check_updates: boolean; autostart?: boolean; theme: string; onboarded?: boolean; accent?: string; custom_colors?: Record<string, string> };
+type SteamAppState = { app_id: number; in_library: boolean | null };
 
 let state: Snapshot = { steam: 'waiting', relay: 'unknown', networks: [], friends: [], events: [], received: 0, sent: 0, dropped: 0 };
 let selected: string | undefined;
@@ -22,6 +23,8 @@ let appVersion = '';
 let createPublic = false;
 let discoverQuery = '';
 let copied = 0;
+let steamApp: SteamAppState | null = null;
+let welcomePoll = 0;
 const app = document.querySelector<HTMLDivElement>('#app')!;
 app.innerHTML = `
   <nav class="rail" aria-label="Разделы">
@@ -44,9 +47,8 @@ app.innerHTML = `
   <dialog id="invite-dialog"><div class="dialog-heading"><h2>Пригласить друга</h2><button class="icon-button close" aria-label="Закрыть">×</button></div><div id="friend-list"></div><button id="overlay" class="button">Открыть список в Steam</button></dialog>
   <dialog id="delete-dialog"><form id="delete-form"><div class="dialog-heading"><h2>Удалить сеть?</h2><button class="icon-button close" type="button" aria-label="Закрыть">×</button></div><p id="delete-description"></p><p>У остальных участников сеть останется.</p><div class="dialog-actions"><button type="button" class="button close">Отмена</button><button class="button danger" type="submit">Удалить сеть</button></div></form></dialog>
   <dialog id="password-dialog"><form id="password-form"><div class="dialog-heading"><h2 id="password-title">Пароль сети</h2><button class="icon-button close" type="button" aria-label="Закрыть">×</button></div><label for="password-input">Пароль</label><input id="password-input" type="password" maxlength="128" autocomplete="current-password" /><p class="hint" id="password-hint"></p><div class="dialog-actions"><button class="button primary" type="submit">Продолжить</button></div></form></dialog>
-  <dialog id="steam-help-dialog"><div class="dialog-heading"><h2>Скрыть статус в Steam</h2><button class="icon-button close" type="button" aria-label="Закрыть">×</button></div><p class="steam-help-note">Приложение работает через Steam, поэтому Steam показывает запущенную игру. Скройте её в своей библиотеке:</p><div class="steam-help">
-    <section class="step"><span class="step-num">1</span><div class="step-body"><h3>Скрыть игру в библиотеке</h3><p>Библиотека → правый клик по игре → «Управление» → «Сделать приватной».</p><img class="step-shot" src="/steam/library.png" alt="Контекстное меню игры в библиотеке Steam" loading="lazy" /></div></section>
-  </div></dialog>`;
+  <dialog id="steam-help-dialog"><div class="dialog-heading"><h2>Скрыть статус в Steam</h2><button class="icon-button close" type="button" aria-label="Закрыть">×</button></div><p class="steam-help-note">FreeC Tier подключается к Steam под идентификатором игры, поэтому Steam считает её запущенной.</p><div class="steam-help">${hideStep(1)}</div></dialog>
+  <dialog id="welcome-dialog"></dialog>`;
 
 const content = document.querySelector<HTMLElement>('#content')!;
 // Keyed DOM reconciliation keeps focus, open details and scroll containers alive.
@@ -264,6 +266,70 @@ async function copyAddress(ip: string) {
   setTimeout(() => { copied = 0; render(); }, 1600);
 }
 
+// Hiding the game is both the second first-run step and its own entry in
+// Settings, so the instruction exists once.
+function hideStep(number: number) {
+  return `<section class="step"><span class="step-num">${number}</span><div class="step-body"><h3>Скрыть игру в библиотеке</h3><p>Иначе друзья в Steam будут видеть, что вы «играете» в неё. Библиотека → правый клик по игре → «Управление» → «Сделать приватной».</p><img class="step-shot" src="/steam/library.png" alt="Контекстное меню игры в библиотеке Steam" loading="lazy" /></div></section>`;
+}
+// The library step is a prerequisite, not advice: without a license for the
+// AppID the client connects under, Steam refuses the connection outright and
+// every other diagnostic still looks clean. So the app opens on it.
+function welcomeHTML() {
+  const id = steamApp?.app_id;
+  const known = id === 324810 ? ' — бесплатная игра <b>TOXIKK</b>' : '';
+  const done = steamApp?.in_library === true;
+  const status = done
+    ? '<p class="step-state ok">Приложение уже в библиотеке — шаг выполнен.</p>'
+    : steamApp?.in_library === false
+      ? '<p class="step-state warn">В библиотеке пока не видно.</p>'
+      : '<p class="step-state">Проверяем библиотеку…</p>';
+  // Hidden once the license is there: the same deep link would launch the
+  // game for somebody who also installed it.
+  const add = done ? '' : '<button class="button primary" id="welcome-add">Добавить в Steam</button>';
+  const note = done ? '' : '<p class="hint">Steam выдаст лицензию и предложит загрузку — её можно отменить, приложение останется в библиотеке.</p>';
+  return `<div class="dialog-heading"><h2>Настройка FreeC Tier</h2></div>
+    <p>Связь между компьютерами идёт через Steam, поэтому клиент подключается под идентификатором игры. Два шага — и возвращаться к этому не придётся.</p>
+    <div class="steam-help">
+      <section class="step"><span class="step-num">1</span><div class="step-body"><h3>Добавить приложение в библиотеку Steam</h3><p>FreeC Tier подключается под AppID <code>${id ?? '…'}</code>${known}. Лицензия бесплатная, но Steam выдаёт её только по запросу. Без неё клиент Steam отказывает в соединении, а по другим признакам причину не видно.</p><div class="step-actions">${add}<button class="text-button" id="welcome-store">Открыть страницу в магазине</button></div>${note}${status}</div></section>
+      ${hideStep(2)}
+    </div>
+    <div class="dialog-actions"><button class="button" id="welcome-later">Позже</button><button class="button primary" id="welcome-done">Готово</button></div>`;
+}
+function renderWelcome() {
+  const dialog = document.querySelector<HTMLDialogElement>('#welcome-dialog')!;
+  patch(dialog, welcomeHTML());
+  // Steam needs a moment to register the license, and the poll keeps looking
+  // after that in case the user takes longer in the client.
+  const toSteam = (store: boolean) => async () => {
+    if (await desktop('open_steam_app', { store })) setTimeout(() => void refreshSteamApp(), 2000);
+  };
+  const add = document.querySelector<HTMLButtonElement>('#welcome-add');
+  if (add) add.onclick = toSteam(false);
+  document.querySelector<HTMLButtonElement>('#welcome-store')!.onclick = toSteam(true);
+  document.querySelector<HTMLButtonElement>('#welcome-later')!.onclick = () => closeWelcome(false);
+  document.querySelector<HTMLButtonElement>('#welcome-done')!.onclick = () => closeWelcome(true);
+  dialog.querySelectorAll<HTMLImageElement>('.step-shot').forEach(image => image.addEventListener('error', () => image.classList.add('missing')));
+}
+async function refreshSteamApp() {
+  if (!isTauri()) return;
+  try { steamApp = await invoke<SteamAppState>('steam_app'); } catch { return; }
+  if (document.querySelector<HTMLDialogElement>('#welcome-dialog')!.open) renderWelcome();
+}
+function openWelcome() {
+  renderWelcome();
+  const dialog = document.querySelector<HTMLDialogElement>('#welcome-dialog')!;
+  if (!dialog.open) dialog.showModal();
+  void refreshSteamApp();
+  // The user acts in Steam, not here, so keep looking until the license lands.
+  window.clearInterval(welcomePoll);
+  welcomePoll = window.setInterval(() => void refreshSteamApp(), 2000);
+}
+function closeWelcome(done: boolean) {
+  window.clearInterval(welcomePoll);
+  document.querySelector<HTMLDialogElement>('#welcome-dialog')!.close();
+  if (done && !preferences.onboarded) void savePreferences({ ...preferences, onboarded: true });
+}
+
 function openPassword(id: string, editing: boolean) {
   const dialog = document.querySelector<HTMLDialogElement>('#password-dialog')!;
   dialog.dataset.network = id; dialog.dataset.editing = String(editing);
@@ -339,7 +405,7 @@ function renderSettings() {
     ${preferences.theme === 'custom' ? `<div class="card" id="theme-editor">${THEME_GROUPS.map(([title, tokens]) => `<h3 class="editor-title">${escape(title)}</h3>${tokens.map(token => `<label class="row color-row"><span class="row-label">${escape(THEME_LABELS[token] ?? token)}</span><input type="color" class="color-input" data-token="${token}" value="${escape(preferences.custom_colors?.[token] ?? '#000000')}" aria-label="${escape(THEME_LABELS[token] ?? token)}" /></label>`).join('')}`).join('')}<div class="row"><span class="row-label muted">Изменения применяются сразу.</span><button class="button" id="theme-reset">Сбросить</button></div></div>` : ''}
     <h2 class="group-title">Служба</h2><div class="card"><div class="row"><span class="row-label">Служба FreeC Tier<small id="service-status">Проверяем…</small></span><div class="row-actions"><button class="button" id="service-install">Переустановить</button><button class="button" id="service-uninstall">Удалить</button></div></div></div>
     <h2 class="group-title">Обновления</h2><div class="card"><label class="row"><span class="row-label">Проверять при запуске</span><input id="auto-update" type="checkbox" class="switch" ${preferences.check_updates ? 'checked' : ''} /></label><div class="row"><span class="row-label muted" id="update-message" role="status">${escape(updateMessage)}</span><div class="row-actions"><button class="button" id="check-update" ${updating ? 'disabled' : ''}>${updating ? 'Проверяем…' : 'Проверить'}</button>${updateVersion ? `<button class="button primary" id="install-update" ${updating ? 'disabled' : ''}>Установить ${escape(updateVersion)}</button>` : ''}</div></div></div>
-    <h2 class="group-title">Steam</h2><div class="card"><button class="row row-button" id="steam-help"><span class="row-label">Скрыть статус «играет»</span><span class="chev" aria-hidden="true">→</span></button></div>
+    <h2 class="group-title">Steam</h2><div class="card"><button class="row row-button" id="steam-setup"><span class="row-label">Настройка Steam<small>Приложение в библиотеке и его видимость</small></span><span class="chev" aria-hidden="true">→</span></button><button class="row row-button" id="steam-help"><span class="row-label">Скрыть статус «играет»</span><span class="chev" aria-hidden="true">→</span></button></div>
     <h2 class="group-title">Дополнительно</h2><div class="card"><button class="row row-button" id="diagnostics"><span class="row-label">Диагностика</span><span class="chev" aria-hidden="true">→</span></button><div class="row"><span class="row-label">Завершение работы</span><button class="button" id="quit">Выйти</button></div></div></section>`);
   document.querySelector<HTMLButtonElement>('#theme-dark')!.onclick = () => setTheme('dark');
   document.querySelector<HTMLButtonElement>('#theme-light')!.onclick = () => setTheme('light');
@@ -386,6 +452,7 @@ function renderSettings() {
   document.querySelector<HTMLInputElement>('#auto-update')!.onchange = e => { void savePreferences({ ...preferences, check_updates: (e.target as HTMLInputElement).checked }); };
   document.querySelector<HTMLButtonElement>('#diagnostics')!.onclick = () => { page = 'diagnostics'; render(); };
   document.querySelector<HTMLButtonElement>('#quit')!.onclick = () => { void desktop('quit'); };
+  document.querySelector<HTMLButtonElement>('#steam-setup')!.onclick = openWelcome;
   document.querySelector<HTMLButtonElement>('#steam-help')!.onclick = () => (document.querySelector('#steam-help-dialog') as HTMLDialogElement).showModal();
   document.querySelector<HTMLButtonElement>('#check-update')!.onclick = () => { void checkUpdate(); };
   const install = document.querySelector<HTMLButtonElement>('#install-update');
@@ -528,5 +595,13 @@ render();
 // place in this utility; right click stays inert until custom actions exist.
 if (isTauri()) document.addEventListener('contextmenu', e => e.preventDefault());
 if (isTauri()) void invoke<string>('version').then(value => { if (value) { setVersion(value); if (page === 'settings') renderSettings(); } }).catch(() => {});
-if (isTauri()) void invoke<Settings>('settings').then(result => { if (result) { preferences = result; applyTheme(preferences.theme); } if (page === 'settings') renderSettings(); if (preferences.check_updates) void checkUpdate(); }).catch(error => notice(`Не удалось загрузить настройки: ${String(error)}`));
+document.querySelector('#welcome-dialog')!.addEventListener('close', () => window.clearInterval(welcomePoll));
+if (isTauri()) void invoke<Settings>('settings').then(result => {
+  if (result) { preferences = result; applyTheme(preferences.theme); }
+  if (page === 'settings') renderSettings();
+  // The Steam library step gates every connection, so a client that has not
+  // been through it opens on it instead of on an empty network list.
+  if (!preferences.onboarded) openWelcome();
+  if (preferences.check_updates) void checkUpdate();
+}).catch(error => notice(`Не удалось загрузить настройки: ${String(error)}`));
 void poll();
