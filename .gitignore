@@ -10,6 +10,7 @@ steam_appid.txt
 **/.cache/
 **/test-results/
 **/playwright-report/
+/.zcode/
 
 # Local design/planning material; product README stays versioned for packaging.
 /docs/
