@@ -10,7 +10,7 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "windows": [{ "title": "FreeC Tier", "theme": "Dark", "width": 1060, "height": 720, "minWidth": 720, "minHeight": 520 }],
+    "windows": [{ "title": "FreeC Tier", "theme": "Dark", "width": 1060, "height": 720, "minWidth": 720, "minHeight": 520, "visible": false }],
     "security": {
       "csp": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src ipc: http://ipc.localhost"
     }

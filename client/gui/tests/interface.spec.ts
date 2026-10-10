@@ -216,10 +216,17 @@ test('real state rendering is escaped and adapter action reaches IPC', async ({ 
   // The service card reports the companion service state; autostart toggles
   // straight through the per-user Run key.
   await expect(page.locator('#service-status')).toHaveText('Установлена и запущена');
+  // «Запускать в трее» only means anything together with autostart, so it
+  // stays locked until that is on and then rides in the same Run command.
+  await expect(page.getByLabel('Запускать в трее')).toBeDisabled();
   await page.getByLabel('Запускать при входе в Windows').check();
-  expect(await page.evaluate(() => (window as unknown as {lastAutostart: unknown}).lastAutostart)).toEqual({ enabled: true });
+  expect(await page.evaluate(() => (window as unknown as {lastAutostart: unknown}).lastAutostart)).toEqual({ enabled: true, tray: false });
   await expect(page.getByLabel('Запускать при входе в Windows')).toBeChecked();
-  expect(await page.evaluate(() => (window as unknown as {savedSettings: unknown}).savedSettings)).toEqual({ settings: { minimize_to_tray: false, check_updates: true, autostart: true, theme: 'light', onboarded: true } });
+  await expect(page.getByLabel('Запускать в трее')).toBeEnabled();
+  await page.getByLabel('Запускать в трее').check();
+  expect(await page.evaluate(() => (window as unknown as {lastAutostart: unknown}).lastAutostart)).toEqual({ enabled: true, tray: true });
+  await expect(page.getByLabel('Запускать в трее')).toBeChecked();
+  expect(await page.evaluate(() => (window as unknown as {savedSettings: unknown}).savedSettings)).toEqual({ settings: { minimize_to_tray: false, check_updates: true, autostart: true, start_in_tray: true, theme: 'light', onboarded: true } });
   await page.getByRole('button', { name: 'Проверить', exact: true }).click();
   await expect(page.locator('#update-message')).toContainText('Доступна версия 0.3.0');
   await expect(page.getByRole('button', { name: 'Установить 0.3.0' })).toBeVisible();
