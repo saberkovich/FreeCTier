@@ -7,7 +7,7 @@ type Peer = { steam_id: string; name: string; ip: string; active: boolean; state
 type Network = { id: string; name: string; subnet: string; owner: string; revision: number; adapter: boolean; lobby?: string; public: boolean; can_invite: boolean; password: boolean; members: Peer[] };
 type Snapshot = { steam: string; steam_id?: string; nickname?: string; relay: string; networks: Network[]; friends: { steam_id: string; name: string }[]; events: string[]; received: number; sent: number; dropped: number; joins?: { id: string; name: string; password: boolean }[]; public_networks?: { lobby: string; name: string }[] };
 type Command = { type: string; [key: string]: unknown };
-type Settings = { minimize_to_tray: boolean; check_updates: boolean; autostart?: boolean; theme: string; onboarded?: boolean; accent?: string; custom_colors?: Record<string, string> };
+type Settings = { minimize_to_tray: boolean; check_updates: boolean; autostart?: boolean; start_in_tray?: boolean; theme: string; onboarded?: boolean; accent?: string; custom_colors?: Record<string, string> };
 type SteamAppState = { app_id: number; in_library: boolean | null };
 
 let state: Snapshot = { steam: 'waiting', relay: 'unknown', networks: [], friends: [], events: [], received: 0, sent: 0, dropped: 0 };
@@ -401,7 +401,7 @@ function updateDynamic() {
 function renderSettings() {
   heading('Настройки', appLabel());
   contentHTML(`<section class="page narrow" id="settings-page"><div class="page-head"><div><h1>Настройки</h1><p class="page-sub">Поведение клиента, служба и обновления</p></div></div>
-    <div class="card"><div class="row"><span class="row-label">Тема</span><div class="segmented" role="group" aria-label="Тема"><button id="theme-dark" class="seg ${preferences.theme === 'dark' ? 'active' : ''}" aria-pressed="${preferences.theme === 'dark'}">Тёмная</button><button id="theme-light" class="seg ${preferences.theme === 'light' ? 'active' : ''}" aria-pressed="${preferences.theme === 'light'}">Светлая</button><button id="theme-custom" class="seg ${preferences.theme === 'custom' ? 'active' : ''}" aria-pressed="${preferences.theme === 'custom'}">Своя</button></div></div>${preferences.theme === 'custom' ? '' : `<div class="row"><span class="row-label">Акцентный цвет<small>Главный цвет кнопок и выделений</small></span><div class="swatches">${accentSwatches()}</div></div>`}<label class="row"><span class="row-label">Сворачивать в трей</span><input id="minimize-tray" type="checkbox" class="switch" ${preferences.minimize_to_tray ? 'checked' : ''} /></label><label class="row"><span class="row-label">Запускать при входе в Windows</span><input id="autostart" type="checkbox" class="switch" ${preferences.autostart ? "checked" : ""} /></label></div>
+    <div class="card"><div class="row"><span class="row-label">Тема</span><div class="segmented" role="group" aria-label="Тема"><button id="theme-dark" class="seg ${preferences.theme === 'dark' ? 'active' : ''}" aria-pressed="${preferences.theme === 'dark'}">Тёмная</button><button id="theme-light" class="seg ${preferences.theme === 'light' ? 'active' : ''}" aria-pressed="${preferences.theme === 'light'}">Светлая</button><button id="theme-custom" class="seg ${preferences.theme === 'custom' ? 'active' : ''}" aria-pressed="${preferences.theme === 'custom'}">Своя</button></div></div>${preferences.theme === 'custom' ? '' : `<div class="row"><span class="row-label">Акцентный цвет<small>Главный цвет кнопок и выделений</small></span><div class="swatches">${accentSwatches()}</div></div>`}<label class="row"><span class="row-label">Сворачивать в трей</span><input id="minimize-tray" type="checkbox" class="switch" ${preferences.minimize_to_tray ? 'checked' : ''} /></label><label class="row"><span class="row-label">Запускать при входе в Windows</span><input id="autostart" type="checkbox" class="switch" ${preferences.autostart ? "checked" : ""} /></label><label class="row"><span class="row-label">Запускать в трее<small>Окно не появится при входе в Windows — только значок рядом с часами</small></span><input id="start-tray" type="checkbox" class="switch" ${preferences.start_in_tray ? 'checked' : ''} ${preferences.autostart ? '' : 'disabled'} /></label></div>
     ${preferences.theme === 'custom' ? `<div class="card" id="theme-editor">${THEME_GROUPS.map(([title, tokens]) => `<h3 class="editor-title">${escape(title)}</h3>${tokens.map(token => `<label class="row color-row"><span class="row-label">${escape(THEME_LABELS[token] ?? token)}</span><input type="color" class="color-input" data-token="${token}" value="${escape(preferences.custom_colors?.[token] ?? '#000000')}" aria-label="${escape(THEME_LABELS[token] ?? token)}" /></label>`).join('')}`).join('')}<div class="row"><span class="row-label muted">Изменения применяются сразу.</span><button class="button" id="theme-reset">Сбросить</button></div></div>` : ''}
     <h2 class="group-title">Служба</h2><div class="card"><div class="row"><span class="row-label">Служба FreeC Tier<small id="service-status">Проверяем…</small></span><div class="row-actions"><button class="button" id="service-install">Переустановить</button><button class="button" id="service-uninstall">Удалить</button></div></div></div>
     <h2 class="group-title">Обновления</h2><div class="card"><label class="row"><span class="row-label">Проверять при запуске</span><input id="auto-update" type="checkbox" class="switch" ${preferences.check_updates ? 'checked' : ''} /></label><div class="row"><span class="row-label muted" id="update-message" role="status">${escape(updateMessage)}</span><div class="row-actions"><button class="button" id="check-update" ${updating ? 'disabled' : ''}>${updating ? 'Проверяем…' : 'Проверить'}</button>${updateVersion ? `<button class="button primary" id="install-update" ${updating ? 'disabled' : ''}>Установить ${escape(updateVersion)}</button>` : ''}</div></div></div>
@@ -442,12 +442,21 @@ function renderSettings() {
     if (await desktop('uninstall_service')) setTimeout(() => void refreshServiceStatus(), 2500);
   };
 
+  // The Run key is the source of truth, and it carries both answers in one
+  // command line: persist the preferences only after it was rewritten, and
+  // revert the switch on failure.
+  const autostart = async (enabled: boolean, tray: boolean) => {
+    if (!(await desktop('set_autostart', { enabled, tray }))) return false;
+    void savePreferences({ ...preferences, autostart: enabled, start_in_tray: tray });
+    return true;
+  };
   document.querySelector<HTMLInputElement>('#autostart')!.onchange = async e => {
     const input = e.target as HTMLInputElement;
-    // The scheduled task is the source of truth: persist the preference only
-    // after the task was created or removed, and revert on failure.
-    if (await desktop('set_autostart', { enabled: input.checked })) void savePreferences({ ...preferences, autostart: input.checked });
-    else input.checked = !input.checked;
+    if (!(await autostart(input.checked, preferences.start_in_tray ?? false))) input.checked = !input.checked;
+  };
+  document.querySelector<HTMLInputElement>('#start-tray')!.onchange = async e => {
+    const input = e.target as HTMLInputElement;
+    if (!(await autostart(preferences.autostart ?? false, input.checked))) input.checked = !input.checked;
   };
   document.querySelector<HTMLInputElement>('#auto-update')!.onchange = e => { void savePreferences({ ...preferences, check_updates: (e.target as HTMLInputElement).checked }); };
   document.querySelector<HTMLButtonElement>('#diagnostics')!.onclick = () => { page = 'diagnostics'; render(); };

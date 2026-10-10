@@ -20,6 +20,10 @@ struct Settings {
     /// Set once the user has walked the first-run window. Until then the app
     /// opens on it, because the Steam library step is a hard prerequisite.
     onboarded: bool,
+    /// Start into the tray when Windows launches the app. Carried in the Run
+    /// key as `--tray`, not read from here at startup: only the autostart
+    /// launch may stay hidden, a launch the user asked for must show up.
+    start_in_tray: bool,
     /// Accent swatch picked in Settings, `#rrggbb`. Empty means «follow the
     /// theme preset»; it layers on top of `dark`/`light`, while «Своя» keeps
     /// its own accent in `custom_colors`.
@@ -36,6 +40,7 @@ impl Default for Settings {
             autostart: false,
             theme: "dark".into(),
             onboarded: false,
+            start_in_tray: false,
             accent: String::new(),
             custom_colors: Default::default(),
         }
@@ -197,7 +202,7 @@ fn uninstall_service() -> Result<(), String> {
 /// Autostart uses the per-user Run key: the manifest is asInvoker, so no UAC
 /// appears at logon and no scheduled task is needed.
 #[tauri::command]
-fn set_autostart(enabled: bool) -> Result<(), String> {
+fn set_autostart(enabled: bool, tray: bool) -> Result<(), String> {
     #[cfg(windows)]
     {
         use winreg::enums::{HKEY_CURRENT_USER, KEY_SET_VALUE};
@@ -210,13 +215,28 @@ fn set_autostart(enabled: bool) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         if enabled {
             let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-            key.set_value("FreeC Tier", &format!("\"{}\"", exe.display()))
+            // The flag rides in the command Windows runs, so only this launch
+            // starts hidden — double-clicking the app still opens the window.
+            let command = if tray {
+                format!("\"{}\" {TRAY_ARG}", exe.display())
+            } else {
+                format!("\"{}\"", exe.display())
+            };
+            key.set_value("FreeC Tier", &command)
                 .map_err(|e| e.to_string())?;
         } else {
             let _ = key.delete_value("FreeC Tier");
         }
     }
+    #[cfg(not(windows))]
+    let _ = tray;
     Ok(())
+}
+/// Marks a launch that must stay in the tray. Written into the autostart Run
+/// key by `set_autostart`.
+const TRAY_ARG: &str = "--tray";
+fn started_in_tray() -> bool {
+    std::env::args().any(|arg| arg == TRAY_ARG)
 }
 
 fn update_config() -> Option<(&'static str, &'static str)> {
@@ -592,6 +612,12 @@ fn main() {
                     }
                 })
                 .build(app)?;
+            // The window is configured hidden so an autostart launch never
+            // flashes it on the desktop. Everything else reveals it here,
+            // once the tray icon exists to put it back.
+            if !started_in_tray() {
+                show(app.handle());
+            }
             Ok(())
         })
         .on_window_event(|window, event| match event {
