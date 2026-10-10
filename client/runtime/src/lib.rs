@@ -11,6 +11,7 @@ const INIT_RETRY: Duration = Duration::from_secs(5);
 const INIT_RETRY_MAX: Duration = Duration::from_secs(60);
 
 use anyhow::{ensure, Context, Result};
+use base64::Engine as _;
 use ed25519_dalek::SigningKey;
 use freec_core::{
     admission::{self, Password},
@@ -177,6 +178,10 @@ pub enum Command {
 pub struct Handle {
     tx: mpsc::SyncSender<Command>,
     pub snapshot: Arc<Mutex<Snapshot>>,
+    /// Steam avatars as `data:image/png;base64,…`, keyed by SteamID. Kept out
+    /// of the snapshot on purpose: the UI polls that every second, and an
+    /// avatar is tens of kilobytes that never change.
+    avatars: Arc<Mutex<BTreeMap<String, String>>>,
     worker: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
 }
 
@@ -191,6 +196,15 @@ impl Handle {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
+    }
+    /// Avatars the worker has already decoded, for the requested members only.
+    /// Unknown IDs are simply absent — the caller asks again later, and the
+    /// worker keeps nudging Steam until the image arrives.
+    pub fn avatars(&self, ids: &[String]) -> BTreeMap<String, String> {
+        let cache = self.avatars.lock().unwrap_or_else(|p| p.into_inner());
+        ids.iter()
+            .filter_map(|id| cache.get(id).map(|url| (id.clone(), url.clone())))
+            .collect()
     }
     /// Stop the worker and wait for it to drop the Steam client. `steam_api64.dll`
     /// can hang on process unload if `SteamAPI_Shutdown` has not run yet.
@@ -235,9 +249,11 @@ pub fn start(root: Option<PathBuf>, app_id: u32) -> Result<Handle> {
         relay: "unknown".into(),
         ..Default::default()
     }));
+    let avatars = Arc::new(Mutex::new(BTreeMap::new()));
     let handle = Handle {
         tx,
         snapshot: snapshot.clone(),
+        avatars: avatars.clone(),
         worker: Arc::new(Mutex::new(None)),
     };
     let worker = handle.worker.clone();
@@ -245,7 +261,7 @@ pub fn start(root: Option<PathBuf>, app_id: u32) -> Result<Handle> {
         .name("freec-steam".into())
         .spawn(move || {
             let _instance_lock = lock;
-            run(root, app_id, rx, snapshot)
+            run(root, app_id, rx, snapshot, avatars)
         })?;
     *worker.lock().unwrap_or_else(|p| p.into_inner()) = Some(join);
     Ok(handle)
@@ -298,10 +314,19 @@ struct Engine {
     join_sent: BTreeMap<Uuid, (String, Instant)>,
     grace: BTreeMap<u64, Instant>,
     guests: BTreeMap<(Uuid, u64), Instant>,
+    avatars: Arc<Mutex<BTreeMap<String, String>>>,
+    /// SteamIDs already passed to `RequestUserInformation`. Steam answers with
+    /// a callback whenever it feels like it, so the ask must not repeat on
+    /// every view refresh.
+    avatars_asked: BTreeSet<u64>,
 }
 
 impl Engine {
-    fn new(root: &std::path::Path, app_id: u32) -> Result<Self> {
+    fn new(
+        root: &std::path::Path,
+        app_id: u32,
+        avatars: Arc<Mutex<BTreeMap<String, String>>>,
+    ) -> Result<Self> {
         let client = Client::init_app(app_id)?;
         ensure!(
             client.user().logged_on(),
@@ -370,6 +395,8 @@ impl Engine {
             join_sent: BTreeMap::new(),
             grace: BTreeMap::new(),
             guests: BTreeMap::new(),
+            avatars,
+            avatars_asked: BTreeSet::new(),
         })
     }
 
@@ -1577,7 +1604,42 @@ impl Engine {
         Ok(())
     }
 
-    fn update_view(&self, view: &mut Snapshot) {
+    /// Pulls avatars for everyone currently on screen. Steam serves them from
+    /// its own local cache, so a hit is a memory copy; a miss means the image
+    /// is not downloaded yet and `RequestUserInformation` starts that once.
+    fn refresh_avatars(&mut self) {
+        let wanted: BTreeSet<u64> = std::iter::once(self.local.as_str())
+            .chain(
+                self.networks
+                    .values()
+                    .flat_map(|signed| signed.network.members.iter())
+                    .map(|member| member.steam_id.as_str()),
+            )
+            .filter_map(|id| id.parse::<u64>().ok())
+            .filter(|id| *id != 0)
+            .collect();
+        let friends = self.client.friends();
+        let mut cache = self.avatars.lock().unwrap_or_else(|p| p.into_inner());
+        for id in wanted {
+            if cache.contains_key(&id.to_string()) {
+                continue;
+            }
+            match friends.get_friend(SteamId::from_raw(id)).medium_avatar() {
+                Some(rgba) => {
+                    if let Some(url) = encode_avatar(&rgba) {
+                        cache.insert(id.to_string(), url);
+                    }
+                }
+                None => {
+                    if self.avatars_asked.insert(id) {
+                        friends.request_user_information(SteamId::from_raw(id), false);
+                    }
+                }
+            }
+        }
+    }
+
+    fn update_view(&mut self, view: &mut Snapshot) {
         view.steam = "online".into();
         view.steam_id = Some(self.local.clone());
         view.nickname = Some(self.client.friends().name());
@@ -1655,7 +1717,28 @@ impl Engine {
             })
             .collect();
         view.public_networks = self.public_networks.clone();
+        self.refresh_avatars();
     }
+}
+
+/// Steam hands out avatars as 64×64 RGBA. PNG keeps the alpha channel and is
+/// the only encoding an `<img>` takes without extra work in the webview.
+fn encode_avatar(rgba: &[u8]) -> Option<String> {
+    const SIDE: u32 = 64;
+    if rgba.len() != (SIDE * SIDE * 4) as usize {
+        return None;
+    }
+    let mut png = Vec::new();
+    let mut encoder = png::Encoder::new(&mut png, SIDE, SIDE);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().ok()?;
+    writer.write_image_data(rgba).ok()?;
+    writer.finish().ok()?;
+    Some(format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(&png)
+    ))
 }
 
 impl Drop for Engine {
@@ -2058,7 +2141,13 @@ pub fn demote_via_shell(_exe: &std::path::Path) -> bool {
     false
 }
 
-fn run(root: PathBuf, app_id: u32, rx: mpsc::Receiver<Command>, shared: Arc<Mutex<Snapshot>>) {
+fn run(
+    root: PathBuf,
+    app_id: u32,
+    rx: mpsc::Receiver<Command>,
+    shared: Arc<Mutex<Snapshot>>,
+    avatars: Arc<Mutex<BTreeMap<String, String>>>,
+) {
     let mut engine: Option<Engine> = None;
     let mut view = Snapshot {
         steam: "waiting".into(),
@@ -2090,7 +2179,7 @@ fn run(root: PathBuf, app_id: u32, rx: mpsc::Receiver<Command>, shared: Arc<Mute
                     retry = Instant::now() + INIT_RETRY;
                     backoff = INIT_RETRY;
                 }
-                None => match Engine::new(&root, app_id) {
+                None => match Engine::new(&root, app_id, avatars.clone()) {
                     Ok(next) => {
                         wait_error = None;
                         backoff = INIT_RETRY;

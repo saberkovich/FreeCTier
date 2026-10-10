@@ -12,6 +12,9 @@ serde_json.workspace = true
 uuid.workspace = true
 steamworks = { version = "0.13.1", features = ["raw-bindings"] }
 ed25519-dalek = "2"
+# Steam hands out avatars as raw RGBA; the UI needs something an <img> accepts.
+png = "0.18"
+base64 = "0.22"
 directories = "6"
 fs2 = "0.4"
 hex = "0.4"

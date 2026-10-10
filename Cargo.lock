@@ -1250,12 +1250,14 @@ name = "freec-runtime"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "directories",
  "ed25519-dalek",
  "freec-core",
  "freec-ipc",
  "fs2",
  "hex",
+ "png 0.18.1",
  "serde",
  "serde_json",
  "steamworks",

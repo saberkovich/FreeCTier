@@ -64,9 +64,17 @@ const labels: Record<string, string> = { connected: 'Подключён', connec
 function network() { return state.networks.find(n => n.id === selected); }
 function appLabel() { return appVersion ? `FreeC Tier ${appVersion}` : 'FreeC Tier'; }
 // Identity colors: avatars differ by name so the rail stays scannable, while
-// saturation and lightness stay with the theme.
-function hue(value: string) { let total = 0; for (const point of value || '?') total = (total * 31 + point.codePointAt(0)!) % 360; return total; }
+// saturation and lightness stay with the theme. The hue arrives as a class,
+// not a style attribute — the webview CSP is `style-src 'self'` and drops
+// inline styles, which silently left every avatar unpainted.
+function hueClass(value: string) { let total = 0; for (const point of value || '?') total = (total * 31 + point.codePointAt(0)!) % 4093; return `hue-${total % 12}`; }
 function initials(value: string) { return escape([...(value || '?')].slice(0, 2).join('').toUpperCase()); }
+// Steam avatars are fetched once per member and kept for the session.
+const avatars = new Map<string, string>();
+function face(steamId: string | undefined, name: string) {
+  const url = steamId && avatars.get(steamId);
+  return url ? `<img src="${escape(url)}" alt="" />` : initials(name);
+}
 function quality(ping?: number) { return ping == null ? 'none' : ping < 40 ? 'good' : ping < 80 ? 'ok' : 'bad'; }
 function online(peer: Peer) { return peer.active && peer.state !== 'offline' && peer.state !== 'removed'; }
 
@@ -76,9 +84,6 @@ function applyTheme(theme: string) {
   // No `custom` block in CSS: the :root defaults act as the base and the
   // user's palette is layered on top as inline variables.
   root.dataset.theme = theme === 'custom' ? 'custom' : theme === 'light' ? 'light' : 'dark';
-  // Read the preset accent with every override stripped, so the stylesheet
-  // stays the only place where a theme's own accent is written down.
-  presetAccent = getComputedStyle(root).getPropertyValue('--accent').trim();
   if (theme === 'custom') {
     for (const [token, value] of Object.entries(preferences.custom_colors ?? {})) {
       if (value) root.style.setProperty(`--${token}`, value);
@@ -101,9 +106,9 @@ function setAccent(color?: string) {
   applyTheme(preferences.theme);
   void savePreferences(preferences);
 }
-let presetAccent = '';
 // Three alternatives next to whatever the current theme calls its own accent.
-const ACCENTS: Array<[string, string]> = [['#8b5cf6', 'Фиолетовый'], ['#22c1d6', 'Бирюзовый'], ['#3ecf8e', 'Зелёный']];
+const ACCENT_SLOTS = ['--accent-preset', '--accent-slot-1', '--accent-slot-2', '--accent-slot-3'] as const;
+const ACCENT_LABELS = ['По умолчанию', 'Фиолетовый', 'Бирюзовый', 'Зелёный'];
 const THEME_TOKENS = ['accent', 'accent-hover', 'accent-soft', 'focus', 'text', 'muted', 'faint', 'bg', 'surface', 'surface-2', 'surface-3', 'line', 'line-soft', 'success', 'warning', 'danger'] as const;
 const THEME_LABELS: Record<string, string> = {
   accent: 'Акцент', 'accent-hover': 'Акцент (наведение)', 'accent-soft': 'Акцент (подложка)', focus: 'Обводка фокуса',
@@ -136,10 +141,10 @@ function render() {
   renderJoinsBar();
   renderHeaderUpdate();
   const connected = state.steam === 'online';
-  patch(document.querySelector<HTMLElement>('#session')!, `<span class="steam-pill ${connected ? 'online' : 'offline'}"><i aria-hidden="true"></i>${connected ? 'Steam подключён' : 'Steam не подключён'}</span>${state.nickname ? `<span class="account"><span class="account-face" aria-hidden="true" style="--h:${hue(state.nickname)}">${initials(state.nickname)}</span><span class="account-name">${escape(state.nickname)}</span></span>` : ''}`);
+  patch(document.querySelector<HTMLElement>('#session')!, `<span class="steam-pill ${connected ? 'online' : 'offline'}"><i aria-hidden="true"></i>${connected ? 'Steam подключён' : 'Steam не подключён'}</span>${state.nickname ? `<span class="account"><span class="account-face ${hueClass(state.nickname)}" aria-hidden="true">${face(state.steam_id, state.nickname)}</span><span class="account-name">${escape(state.nickname)}</span></span>` : ''}`);
   patch(document.querySelector<HTMLElement>('#network-list')!, state.networks.map(n => {
     const current = n.id === selected && page === 'networks';
-    return `<button id="network-${n.id}" class="rail-net ${current ? 'selected' : ''}" data-select="${n.id}" title="${escape(n.name)}" aria-label="${escape(n.name)}" ${current ? 'aria-current="page"' : ''} style="--h:${hue(n.name)}"><span class="rail-pill" aria-hidden="true"></span><span class="rail-avatar" aria-hidden="true">${initials(n.name)}</span><span class="rail-dot ${n.adapter ? 'on' : ''}" aria-hidden="true"></span></button>`;
+    return `<button id="network-${n.id}" class="rail-net ${hueClass(n.name)} ${current ? 'selected' : ''}" data-select="${n.id}" title="${escape(n.name)}" aria-label="${escape(n.name)}" ${current ? 'aria-current="page"' : ''}><span class="rail-pill" aria-hidden="true"></span><span class="rail-avatar" aria-hidden="true">${initials(n.name)}</span><span class="rail-dot ${n.adapter ? 'on' : ''}" aria-hidden="true"></span></button>`;
   }).join(''));
   document.querySelectorAll<HTMLButtonElement>('[data-select]').forEach(button => button.onclick = () => { selected = button.dataset.select; page = 'networks'; render(); });
   document.querySelector('#discover')!.classList.toggle('selected', page === 'discover');
@@ -243,8 +248,8 @@ function member(active: Network, peer: Peer, owner: boolean, connected: boolean)
   const lit = peer.ping_ms == null ? 4 : peer.ping_ms < 40 ? 4 : peer.ping_ms < 80 ? 3 : 2;
   const manage = owner && peer.steam_id !== active.owner;
   const removable = manage || (peer.may_kick && peer.active);
-  return `<div class="member ${here ? '' : 'off'}" id="peer-${active.id}-${peer.steam_id}" data-q="${here ? quality(peer.ping_ms) : 'none'}" style="--h:${hue(name)}">
-    <div class="member-face"><span class="avatar" aria-hidden="true">${initials(name)}</span><span class="member-dot ${here ? escape(peer.state) : ''}" aria-hidden="true"></span></div>
+  return `<div class="member ${hueClass(name)} ${here ? '' : 'off'}" id="peer-${active.id}-${peer.steam_id}" data-q="${here ? quality(peer.ping_ms) : 'none'}">
+    <div class="member-face"><span class="avatar" aria-hidden="true">${face(peer.steam_id, name)}</span><span class="member-dot ${here ? escape(peer.state) : ''}" aria-hidden="true"></span></div>
     <div class="member-id"><div class="member-name"><strong>${escape(name)}</strong>${role.length ? `<span class="role ${peer.steam_id === active.owner ? 'owner' : ''}">${role.join(' · ')}</span>` : ''}</div><code>${escape(peer.ip)}</code></div>
     ${manage ? `<div class="member-perms"><label class="chip"><input type="checkbox" data-permission="invite" data-peer="${peer.steam_id}" aria-label="Приглашать: ${escape(name)}" ${peer.can_invite ? 'checked' : ''} ${connected ? '' : 'disabled'} />Приглашать</label><label class="chip"><input type="checkbox" data-permission="kick" data-peer="${peer.steam_id}" aria-label="Исключать: ${escape(name)}" ${peer.can_kick ? 'checked' : ''} ${connected ? '' : 'disabled'} />Исключать</label></div>` : ''}
     ${here
@@ -302,7 +307,7 @@ function renderDiscovery() {
     <div class="page-head"><div><h1>Публичные сети</h1><p class="page-sub">Открытые сети, которые сейчас видит Steam</p></div><div class="page-actions"><input id="discover-search" class="search" placeholder="Поиск по названию" aria-label="Поиск по названию" autocomplete="off" /><button class="button" id="refresh-public" ${state.steam === 'online' ? '' : 'disabled'}>Обновить</button></div></div>
     ${joins.map(j => `<div class="card" id="pending-${j.id}"><div class="row"><span class="row-label">${escape(j.name)}<small>${j.password ? 'Требуется пароль' : 'Подключение…'}</small></span><div class="row-actions">${j.password ? `<button class="button primary" data-password="${j.id}">Ввести пароль</button>` : ''}<button class="text-button" data-cancel-join="${j.id}">Отмена</button></div></div></div>`).join('')}
     ${found.length
-      ? `<div class="discover-grid">${found.map(n => `<div class="pub-card"><div class="pub-head"><span class="avatar" aria-hidden="true" style="--h:${hue(n.name)}">${initials(n.name)}</span><div style="min-width:0"><b>${escape(n.name)}</b><small>Публичная сеть</small></div></div><button class="button primary" data-lobby="${escape(n.lobby)}">Войти</button></div>`).join('')}</div>`
+      ? `<div class="discover-grid">${found.map(n => `<div class="pub-card ${hueClass(n.name)}"><div class="pub-head"><span class="avatar" aria-hidden="true">${initials(n.name)}</span><div class="pub-id"><b>${escape(n.name)}</b><small>Публичная сеть</small></div></div><button class="button primary" data-lobby="${escape(n.lobby)}">Войти</button></div>`).join('')}</div>`
       : `<div class="card"><p class="hint">${query ? 'Ничего не найдено по этому запросу.' : 'Сети не найдены. Нажмите «Обновить», чтобы повторить поиск.'}</p></div>`}
     </section>`);
   document.querySelector<HTMLButtonElement>('#refresh-public')!.onclick = () => { void send({ type: 'discover' }); };
@@ -386,14 +391,18 @@ function renderSettings() {
   const install = document.querySelector<HTMLButtonElement>('#install-update');
   if (install) install.onclick = () => { void installUpdate(); };
 }
+// Swatch colors live in the stylesheet (`--accent-preset`, `--accent-slot-N`)
+// and are read back here only to store the pick — a `style` attribute would be
+// dropped by the CSP, and the palette belongs in CSS anyway.
 function accentSwatches() {
-  const current = (preferences.accent || presetAccent).toLowerCase();
-  // An empty `data-accent` means «follow the theme», so switching dark ↔ light
-  // keeps each preset's own accent instead of pinning yesterday's color.
-  const swatches: Array<[string, string, string]> = [['', presetAccent, 'По умолчанию'], ...ACCENTS.map(([color, label]): [string, string, string] => [color, color, label])];
-  return swatches.map(([value, color, label]) => {
+  const style = getComputedStyle(document.documentElement);
+  const colors = ACCENT_SLOTS.map(token => style.getPropertyValue(token).trim());
+  const current = (preferences.accent || colors[0]).toLowerCase();
+  return colors.map((color, slot) => {
     const active = color.toLowerCase() === current;
-    return `<button class="swatch ${active ? 'active' : ''}" data-accent="${escape(value)}" style="--c:${escape(color)}" aria-label="Акцент: ${escape(label)}" aria-pressed="${active}"></button>`;
+    // Slot 0 stores an empty value — «follow the theme» — so switching
+    // dark ↔ light keeps each preset's own accent instead of pinning one.
+    return `<button class="swatch ${active ? 'active' : ''}" data-slot="${slot}" data-accent="${slot ? escape(color) : ''}" aria-label="Акцент: ${escape(ACCENT_LABELS[slot])}" aria-pressed="${active}"></button>`;
   }).join('');
 }
 function setTheme(theme: string) {
@@ -479,8 +488,25 @@ document.querySelector<HTMLFormElement>('#delete-form')!.onsubmit = async e => {
   if (await send({ type: 'delete', network: dialog.dataset.network })) dialog.close();
 };
 
+// Avatars arrive out of band: ask only for the members still missing one, and
+// keep asking while Steam downloads them in the background.
+async function loadAvatars() {
+  const missing = new Set<string>();
+  for (const network of state.networks) for (const peer of network.members) if (!avatars.has(peer.steam_id)) missing.add(peer.steam_id);
+  if (state.steam_id && !avatars.has(state.steam_id)) missing.add(state.steam_id);
+  if (!missing.size) return;
+  try {
+    const found = await invoke<Record<string, string>>('avatars', { ids: [...missing] });
+    const entries = Object.entries(found || {});
+    if (!entries.length) return;
+    for (const [id, url] of entries) avatars.set(id, url);
+    render();
+  } catch { /* build without the avatar command */ }
+}
+let tick = 0;
 async function poll() {
   if (isTauri()) {
+    if (++tick % 2 === 0) void loadAvatars();
     try {
       const next = await invoke<Snapshot>('snapshot');
       const serialized = JSON.stringify({ steam: next.steam, steam_id: next.steam_id, nickname: next.nickname, relay: next.relay, networks: next.networks, joins: next.joins, public_networks: next.public_networks });

@@ -1,5 +1,8 @@
 :root {
-  --accent: #e03650;
+  /* The theme's own accent, kept apart from `--accent` so the swatch row can
+     still show it after the user overrides the accent inline. */
+  --accent-preset: #e03650;
+  --accent: var(--accent-preset);
   --accent-hover: #f0475f;
   --accent-soft: #3a1119;
   --danger: #f08a92;
@@ -18,7 +21,7 @@
   color-scheme: dark;
 }
 :root[data-theme="light"] {
-  --accent: #d12a44;
+  --accent-preset: #d12a44;
   --accent-hover: #b8233a;
   --accent-soft: #fbe3e7;
   --danger: #b02a38;
@@ -42,6 +45,9 @@
   --ui: "Onest", "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
   --display: "Unbounded", "Onest", "Segoe UI", system-ui, sans-serif;
   --mono: "JetBrains Mono", Consolas, monospace;
+  --accent-slot-1: #8b5cf6;
+  --accent-slot-2: #22c1d6;
+  --accent-slot-3: #3ecf8e;
   --avatar-s: 66%;
   --avatar-l: 44%;
   --ring: color-mix(in oklab, var(--accent) 45%, transparent);
@@ -68,6 +74,12 @@
     --on-line: oklch(from var(--success) 72% calc(c * .6) h);
   }
 }
+
+/* Identity hues are classes, not inline styles: the app runs under a
+   `style-src 'self'` CSP, which drops every style attribute on the floor. */
+.hue-0 { --h: 2; } .hue-1 { --h: 28; } .hue-2 { --h: 50; } .hue-3 { --h: 88; }
+.hue-4 { --h: 124; } .hue-5 { --h: 152; } .hue-6 { --h: 176; } .hue-7 { --h: 198; }
+.hue-8 { --h: 222; } .hue-9 { --h: 258; } .hue-10 { --h: 288; } .hue-11 { --h: 322; }
 
 * { box-sizing: border-box; }
 html, body { height: 100%; }
@@ -240,6 +252,8 @@ code { font-family: var(--mono); font-size: .86em; font-weight: 500; }
   background: linear-gradient(135deg, hsl(var(--h) var(--avatar-s) calc(var(--avatar-l) + 8%)), hsl(calc(var(--h) + 40) var(--avatar-s) calc(var(--avatar-l) - 8%)));
 }
 .member.off .avatar { background: var(--surface-3); color: var(--faint); }
+/* The initials gradient is the placeholder the Steam avatar lands on top of. */
+.avatar img, .account-face img { display: block; width: 100%; height: 100%; border-radius: inherit; object-fit: cover; }
 .member-dot { position: absolute; right: -3px; bottom: -3px; width: 13px; height: 13px; border-radius: 50%; background: var(--faint); border: 3px solid var(--surface); }
 .member:hover .member-dot { border-color: var(--surface-3); }
 .member-dot.connected, .member-dot.local { background: var(--success); }
@@ -296,6 +310,7 @@ code { font-family: var(--mono); font-size: .86em; font-weight: 500; }
 .pub-card:hover { border-color: var(--muted); }
 .pub-head { display: flex; align-items: center; gap: 12px; min-width: 0; }
 .pub-head .avatar { width: 46px; height: 46px; border-radius: 14px; font: 600 14px var(--display); }
+.pub-id { min-width: 0; }
 .pub-head b { display: block; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pub-head small { display: block; font-size: 12px; color: var(--faint); margin-top: 2px; }
 .pub-card .button { width: 100%; }
@@ -347,9 +362,13 @@ code { font-family: var(--mono); font-size: .86em; font-weight: 500; }
 .seg.active { background: var(--accent); color: #fff; }
 
 .swatches { display: flex; gap: 10px; flex: none; }
-.swatch { width: 28px; height: 28px; flex: none; padding: 0; border: 2px solid transparent; border-radius: 50%; background-color: var(--c); transition: transform .12s ease; }
+.swatch { width: 28px; height: 28px; flex: none; padding: 0; border: 2px solid transparent; border-radius: 50%; transition: transform .12s ease; }
 .swatch:hover { transform: scale(1.1); }
 .swatch.active { border-color: var(--text); }
+.swatch[data-slot="0"] { background-color: var(--accent-preset); }
+.swatch[data-slot="1"] { background-color: var(--accent-slot-1); }
+.swatch[data-slot="2"] { background-color: var(--accent-slot-2); }
+.swatch[data-slot="3"] { background-color: var(--accent-slot-3); }
 
 .editor-title { margin: 16px 0 0; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; color: var(--faint); }
 .color-input { width: 46px; height: 28px; flex: 0 0 auto; padding: 2px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-3); }

@@ -132,6 +132,7 @@ test('real state rendering is escaped and adapter action reaches IPC', async ({ 
       if (command === 'settings') return { minimize_to_tray: true, check_updates: true, autostart: false, theme: 'dark' };
       if (command === 'save_settings') Object.assign(window, { savedSettings: args });
       if (command === 'service_status') return { installed: true, running: true };
+      if (command === 'avatars') return { '76561198000000002': 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==' };
       if (command === 'set_autostart') Object.assign(window, { lastAutostart: args });
       if (command === 'check_update') return { configured: true, version: '0.3.0' };
       if (command === 'install_update') Object.assign(window, { installedUpdate: true });
@@ -160,6 +161,12 @@ test('real state rendering is escaped and adapter action reaches IPC', async ({ 
     return event.defaultPrevented;
   })).toBe(true);
   await expect(page.getByText('<script>unsafe</script>', { exact: true })).toBeVisible();
+  // The webview runs under `style-src 'self'`, which drops style attributes:
+  // anything that needs a per-item color has to come from the stylesheet.
+  expect(await page.evaluate(() => [...document.querySelectorAll('[style]')].map(e => e.outerHTML.slice(0, 120)))).toEqual([]);
+  // Steam avatars replace the initials once the worker has decoded them.
+  await expect(page.locator('#peer-67ae3f2d-0734-47f8-bf1b-e5e2bc64a289-76561198000000002 .avatar img')).toBeVisible();
+  await expect(page.locator('#peer-67ae3f2d-0734-47f8-bf1b-e5e2bc64a289-76561198000000001 .avatar img')).toHaveCount(0);
   await page.getByRole('button', { name: 'Включить', exact: true }).click();
   expect(await page.evaluate(() => (window as unknown as {lastCommand: unknown}).lastCommand)).toEqual({ command: { type: 'set_adapter', network: '67ae3f2d-0734-47f8-bf1b-e5e2bc64a289', enabled: true } });
   await page.getByRole('button', { name: 'Публичная' }).click();
