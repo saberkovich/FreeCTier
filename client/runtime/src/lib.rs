@@ -3,6 +3,13 @@ mod steam;
 
 pub const DEFAULT_APP_ID: u32 = 324810;
 
+/// How long the worker waits between looks at Steam. Also the floor of the
+/// init backoff: a readiness check costs nothing, a failed init does.
+const INIT_RETRY: Duration = Duration::from_secs(5);
+/// Ceiling for the init backoff — far enough apart that a client stuck in a
+/// state we cannot fix never sees a steady stream of attempts from us.
+const INIT_RETRY_MAX: Duration = Duration::from_secs(60);
+
 use anyhow::{ensure, Context, Result};
 use ed25519_dalek::SigningKey;
 use freec_core::{
@@ -1692,27 +1699,33 @@ fn describe_steam_error(error: &anyhow::Error) -> String {
     format!("{error:#}")
 }
 
-/// Actionable follow-up for Steam init failures we recognize. Steam's own
-/// detail ("ConnectToGlobalUser failed.") alone doesn't tell the user what
-/// to do. Field evidence (2026-10-04): re-logging the Steam account fixed
-/// this even from an elevated app process — the client's broken login state
-/// is the primary suspect in every case, so lead with it; elevation is the
-/// secondary suspect and the advice depends on both token states.
-fn wait_hint(detail: &str, elevated: bool, steam_elevated: Option<bool>) -> &'static str {
-    if detail.contains("ConnectToGlobalUser") {
-        match (elevated, steam_elevated) {
-            (true, Some(false)) => {
-                " Перезапустите Steam: выйдите из аккаунта и войдите заново. Если не поможет — перезапустите FreeC Tier без прав администратора."
-            }
-            (true, _) => {
-                " Перезапустите Steam: выйдите из аккаунта и войдите заново. Если не поможет — включите контроль учётных записей (UAC) и перезапустите оба приложения."
-            }
-            (false, _) => {
-                " Перезапустите Steam: выйдите из аккаунта и войдите заново, затем дождитесь входа в аккаунт."
-            }
+/// Actionable follow-up for Steam init failures we recognize. Field
+/// evidence: re-logging the Steam account once fixed ConnectToGlobalUser,
+/// but a user who had already re-logged still failed with «Cannot create
+/// IPC pipe» while both tokens were clean — that shape is either a
+/// steam.exe left over from another Windows account (owns the IPC pipe,
+/// refuses everyone else) or antivirus blocking the IPC.
+fn wait_hint(detail: &str, elevated: bool, steam: &SteamState) -> &'static str {
+    let connection_failure = detail.contains("ConnectToGlobalUser") || detail.contains("IPC pipe");
+    if !connection_failure {
+        return "";
+    }
+    if steam.same_user == Some(false) {
+        return " Steam запущен от другой учётной записи Windows — перезагрузите компьютер, чтобы сбросить зависший процесс.";
+    }
+    if steam.processes > 1 {
+        return " Запущено несколько процессов Steam, один из них завис — перезагрузите компьютер, чтобы сбросить его.";
+    }
+    match (elevated, steam.elevated) {
+        (true, Some(false)) => {
+            " Перезапустите Steam: выйдите из аккаунта и войдите заново. Если не поможет — перезапустите FreeC Tier без прав администратора."
         }
-    } else {
-        ""
+        (true, _) => {
+            " Перезапустите Steam: выйдите из аккаунта и войдите заново. Если не поможет — включите контроль учётных записей (UAC) и перезапустите оба приложения."
+        }
+        // Tokens look correct on both sides — the connection is blocked from
+        // the outside, which is almost always antivirus.
+        _ => " Steam выглядит запущенным корректно, но соединение с ним блокируется. Чаще всего это антивирус — добавьте FreeC Tier и Steam в его исключения. Если не поможет — перезагрузите компьютер.",
     }
 }
 
@@ -1748,30 +1761,47 @@ pub fn process_elevated() -> bool {
     false
 }
 
-/// Token elevation of the Steam client process, if it is running. Used to
-/// demote this app only on a PROVEN integrity mismatch: with UAC disabled
-/// every process runs elevated, and demoting based on our own token alone
-/// looped the process forever on such machines.
+/// What the Steam client process looks like from this process: how many
+/// `steam.exe` instances run, and the first one's token elevation and
+/// Windows user. Powers both the demotion gate and the connection-failure
+/// diagnostics: a steam.exe left over from another Windows account owns the
+/// IPC pipe and refuses everyone else, and several instances mean a hung one.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SteamState {
+    pub processes: u32,
+    pub elevated: Option<bool>,
+    pub same_user: Option<bool>,
+}
+
+#[cfg(not(windows))]
+pub fn steam_state() -> SteamState {
+    SteamState::default()
+}
+
 #[cfg(windows)]
-pub fn steam_token_elevated() -> Option<bool> {
+pub fn steam_state() -> SteamState {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::Security::{
-        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+        EqualSid, GetTokenInformation, TokenElevation, TokenUser, SECURITY_MAX_SID_SIZE,
+        TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER,
     };
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
     };
     use windows::Win32::System::Threading::{
-        OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+        GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
     };
     unsafe {
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
+        let mut state = SteamState::default();
+        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+            return state;
+        };
         let mut entry = PROCESSENTRY32W {
             dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
             ..Default::default()
         };
-        let mut pid = None;
+        let mut first_pid = None;
         if Process32FirstW(snapshot, &mut entry).is_ok() {
             loop {
                 let name = String::from_utf16_lossy(&entry.szExeFile);
@@ -1779,8 +1809,10 @@ pub fn steam_token_elevated() -> Option<bool> {
                     .trim_end_matches('\0')
                     .eq_ignore_ascii_case("steam.exe")
                 {
-                    pid = Some(entry.th32ProcessID);
-                    break;
+                    state.processes += 1;
+                    if first_pid.is_none() {
+                        first_pid = Some(entry.th32ProcessID);
+                    }
                 }
                 if Process32NextW(snapshot, &mut entry).is_err() {
                     break;
@@ -1788,27 +1820,161 @@ pub fn steam_token_elevated() -> Option<bool> {
             }
         }
         let _ = CloseHandle(snapshot);
-        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid?).ok()?;
+        let Some(pid) = first_pid else {
+            return state;
+        };
+
+        // Our user SID for the same-account check. GetTokenInformation puts
+        // the TOKEN_USER header and the SID it points to in one buffer, which
+        // must be 8-byte aligned for the TOKEN_USER header (PSID pointer).
+        const SID_BUFFER: usize = (SECURITY_MAX_SID_SIZE as usize + 16).div_ceil(8);
+        let mut my_token = Default::default();
+        let mut my_buffer = [0u64; SID_BUFFER];
+        let my_sid: Option<windows::Win32::Security::PSID> = (|| {
+            OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut my_token).ok()?;
+            let mut returned = 0u32;
+            GetTokenInformation(
+                my_token,
+                TokenUser,
+                Some(my_buffer.as_mut_ptr().cast()),
+                u32::try_from(my_buffer.len() * 8).expect("buffer size"),
+                &mut returned,
+            )
+            .ok()?;
+            Some((*my_buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid)
+        })();
+
+        let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return state;
+        };
         let mut token = Default::default();
         let opened = OpenProcessToken(process, TOKEN_QUERY, &mut token);
         let _ = CloseHandle(process);
-        opened.ok()?;
+        if opened.is_err() {
+            return state;
+        };
         let mut elevation = TOKEN_ELEVATION::default();
         let mut returned = 0u32;
-        let result = GetTokenInformation(
-            token,
-            TokenElevation,
-            Some(&mut elevation as *mut _ as *mut _),
-            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
-            &mut returned,
+        state.elevated = Some(
+            GetTokenInformation(
+                token,
+                TokenElevation,
+                Some(&mut elevation as *mut _ as *mut _),
+                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                &mut returned,
+            )
+            .is_ok()
+                && elevation.TokenIsElevated != 0,
         );
+        if let Some(my_sid) = my_sid {
+            let mut their_buffer = [0u64; SID_BUFFER];
+            let mut returned = 0u32;
+            if GetTokenInformation(
+                token,
+                TokenUser,
+                Some(their_buffer.as_mut_ptr().cast()),
+                u32::try_from(their_buffer.len() * 8).expect("buffer size"),
+                &mut returned,
+            )
+            .is_ok()
+            {
+                let their_sid = (*their_buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid;
+                state.same_user = Some(EqualSid(my_sid, their_sid).is_ok());
+            }
+        }
         let _ = CloseHandle(token);
-        Some(result.is_ok() && elevation.TokenIsElevated != 0)
+        state
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(windows)]
 pub fn steam_token_elevated() -> Option<bool> {
+    steam_state().elevated
+}
+
+/// What `HKCU\Software\Valve\Steam\ActiveProcess` reports about the running
+/// client. `pid` is the `steam.exe` that claimed the key; `ActiveUser` is the
+/// account slot of the signed-in user and stays 0 whenever Steam runs without
+/// a live session — the login window, a client still reconnecting, or one the
+/// user left in offline mode. That window is exactly when `SteamAPI_Init`
+/// answers «ConnectToGlobalUser failed».
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SteamActive {
+    pub pid: u32,
+    pub active_user: u32,
+}
+
+#[cfg(not(windows))]
+pub fn steam_active() -> SteamActive {
+    SteamActive::default()
+}
+
+#[cfg(windows)]
+pub fn steam_active() -> SteamActive {
+    use windows::core::{w, PCWSTR};
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+    // The key lives under HKCU, so whatever we read here always describes the
+    // client of the Windows account we run as — no cross-user ambiguity.
+    let read = |name: PCWSTR| -> u32 {
+        let mut value = 0u32;
+        let mut size = u32::try_from(std::mem::size_of::<u32>()).expect("dword size");
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                w!("Software\\Valve\\Steam\\ActiveProcess"),
+                name,
+                RRF_RT_REG_DWORD,
+                None,
+                Some(std::ptr::addr_of_mut!(value).cast()),
+                Some(&mut size),
+            )
+        };
+        if status == ERROR_SUCCESS {
+            value
+        } else {
+            0
+        }
+    };
+    SteamActive {
+        pid: read(w!("pid")),
+        active_user: read(w!("ActiveUser")),
+    }
+}
+
+/// Why `SteamAPI_Init` cannot succeed yet, or `None` once the client is signed
+/// in and ready.
+///
+/// Games shipped through Steam never need this check: Steam launches them only
+/// after it has a session, so their one and only init call always lands in a
+/// good state. A standalone process starts whenever the user double-clicks it,
+/// so it has to wait for that state itself — and it must not wait by polling
+/// `SteamAPI_Init`, because a failed init keeps the Steam pipe it already
+/// opened (see `run`).
+fn steam_not_ready(state: &SteamState, active: &SteamActive) -> Option<&'static str> {
+    if state.processes == 0 {
+        return Some("Steam не запущен — запустите клиент и войдите в аккаунт.");
+    }
+    if active.pid == 0 {
+        return Some("Steam ещё запускается — подождите, пока клиент откроется.");
+    }
+    if active.active_user == 0 {
+        return Some(
+            "Steam запущен, но вход в аккаунт не завершён — войдите в аккаунт и выключите режим «Не в сети».",
+        );
+    }
+    None
+}
+
+/// Readiness gate for the worker loop. Windows-only: elsewhere there is no
+/// Steam client to inspect and the init call itself is the only signal.
+#[cfg(windows)]
+fn steam_wait_reason() -> Option<&'static str> {
+    steam_not_ready(&steam_state(), &steam_active())
+}
+
+#[cfg(not(windows))]
+fn steam_wait_reason() -> Option<&'static str> {
     None
 }
 
@@ -1900,6 +2066,7 @@ fn run(root: PathBuf, app_id: u32, rx: mpsc::Receiver<Command>, shared: Arc<Mute
         ..Default::default()
     };
     let mut retry = Instant::now();
+    let mut backoff = INIT_RETRY;
     let mut wait_error: Option<String> = None;
     let args: Vec<_> = std::env::args().collect();
     let mut startup_lobby = args
@@ -1908,48 +2075,91 @@ fn run(root: PathBuf, app_id: u32, rx: mpsc::Receiver<Command>, shared: Arc<Mute
         .and_then(|pair| pair[1].parse::<u64>().ok());
     loop {
         if engine.is_none() && Instant::now() >= retry {
-            match Engine::new(&root, app_id) {
-                Ok(next) => {
-                    wait_error = None;
-                    log(&mut view, "Steam подключён. Конфигурации загружены.");
-                    if let Some(lobby) = startup_lobby.take() {
-                        next.join(LobbyId::from_raw(lobby));
+            // Ask Windows whether Steam is signed in before asking Steam. An
+            // init attempt against a client that is still starting or sitting
+            // on the login screen cannot succeed, and it is not free: see the
+            // SteamAPI_Shutdown note below.
+            match steam_wait_reason() {
+                Some(reason) => {
+                    if wait_error.as_deref() != Some(reason) {
+                        log(&mut view, &format!("Ожидание Steam: {reason}"));
+                        wait_error = Some(reason.to_owned());
                     }
-                    engine = Some(next);
+                    // Nothing was spent on the client, so the next look can
+                    // come soon and the backoff stays at its floor.
+                    retry = Instant::now() + INIT_RETRY;
+                    backoff = INIT_RETRY;
                 }
-                Err(error) => {
-                    // The same reason repeats on every retry; logging it each
-                    // time floods the 50-line event log with "Ожидание Steam".
-                    let detail = describe_steam_error(&error);
-                    if wait_error.as_deref() != Some(detail.as_str()) {
-                        let elevated = process_elevated();
-                        let steam_state = steam_token_elevated();
-                        let mut line = format!(
-                            "Ожидание Steam: {detail}{}",
-                            wait_hint(&detail, elevated, steam_state)
-                        );
-                        if detail.contains("ConnectToGlobalUser") {
-                            // Token states are the diagnosis the user cannot
-                            // see otherwise; keep them in the log verbatim.
-                            line.push_str(&format!(
-                                " [приложение: {} · Steam: {}]",
-                                if elevated {
-                                    "админ"
-                                } else {
-                                    "обычный"
-                                },
-                                match steam_state {
-                                    Some(true) => "админ",
-                                    Some(false) => "обычный",
-                                    None => "не найден",
-                                },
-                            ));
+                None => match Engine::new(&root, app_id) {
+                    Ok(next) => {
+                        wait_error = None;
+                        backoff = INIT_RETRY;
+                        log(&mut view, "Steam подключён. Конфигурации загружены.");
+                        if let Some(lobby) = startup_lobby.take() {
+                            next.join(LobbyId::from_raw(lobby));
                         }
-                        log(&mut view, &line);
-                        wait_error = Some(detail);
+                        engine = Some(next);
                     }
-                    retry = Instant::now() + Duration::from_secs(5);
-                }
+                    Err(error) => {
+                        // `SteamAPI_Init` opens the Steam pipe before it connects
+                        // the user, and a failure at the second step keeps the
+                        // first: nothing in the error path releases it. Retrying
+                        // without this leaks one pipe per attempt until the client
+                        // refuses to hand out more and starts answering «Cannot
+                        // create IPC pipe … Steam is probably not running» for a
+                        // Steam that is running perfectly well. Games call init
+                        // once and quit on failure, so they never hit this; a
+                        // resident app has to pair every attempt with a shutdown.
+                        unsafe { steamworks::sys::SteamAPI_Shutdown() };
+                        // The same reason repeats on every retry; logging it each
+                        // time floods the 50-line event log with "Ожидание Steam".
+                        let detail = describe_steam_error(&error);
+                        if wait_error.as_deref() != Some(detail.as_str()) {
+                            let elevated = process_elevated();
+                            let steam = steam_state();
+                            let mut line = format!(
+                                "Ожидание Steam: {detail}{}",
+                                wait_hint(&detail, elevated, &steam)
+                            );
+                            let connection_failure = detail.contains("ConnectToGlobalUser")
+                                || detail.contains("IPC pipe");
+                            if connection_failure {
+                                // Process and token states are the diagnosis the
+                                // user cannot see otherwise; log them verbatim.
+                                line.push_str(&format!(
+                                    " [приложение: {} · Steam: {}{}{}]",
+                                    if elevated {
+                                        "админ"
+                                    } else {
+                                        "обычный"
+                                    },
+                                    match steam.elevated {
+                                        Some(true) => "админ",
+                                        Some(false) => "обычный",
+                                        None => "не найден",
+                                    },
+                                    if steam.processes > 1 {
+                                        format!(" · процессов: {}", steam.processes)
+                                    } else {
+                                        String::new()
+                                    },
+                                    match steam.same_user {
+                                        Some(false) => " · другой пользователь",
+                                        _ => "",
+                                    },
+                                ));
+                            }
+                            log(&mut view, &line);
+                            wait_error = Some(detail);
+                        }
+                        // Steam looked ready and still refused us, so the fault is
+                        // outside both processes (antivirus, a wedged client).
+                        // Back off instead of retrying at a fixed beat — a stuck
+                        // state must not turn into steady pressure on the client.
+                        retry = Instant::now() + backoff;
+                        backoff = (backoff * 2).min(INIT_RETRY_MAX);
+                    }
+                },
             }
         }
         match rx.try_recv() {
@@ -2021,23 +2231,148 @@ mod wait_hint_tests {
 
     #[test]
     fn connect_to_global_user_gets_actionable_hints() {
-        // The Steam re-login advice leads in every branch (field evidence:
-        // it fixed the error even from an elevated app process).
-        let hint = wait_hint("ConnectToGlobalUser failed.", true, Some(false));
-        assert!(hint.contains("выйдите из аккаунта"));
-        assert!(hint.contains("без прав администратора"));
-        // Both elevated (UAC disabled): the fallback advice is UAC, since
-        // restarting "normally" is impossible there.
-        assert!(wait_hint("ConnectToGlobalUser failed.", true, Some(true)).contains("UAC"));
-        assert!(wait_hint("ConnectToGlobalUser failed.", true, None).contains("UAC"));
-        // Unelevated app: same lead, plain wording.
-        assert!(wait_hint("ConnectToGlobalUser failed.", false, Some(false))
-            .contains("выйдите из аккаунта"));
+        let normal = SteamState {
+            processes: 1,
+            elevated: Some(false),
+            same_user: Some(true),
+        };
+        // Cross-account steam.exe owns the IPC pipe: only a reboot helps.
+        let foreign = SteamState {
+            processes: 1,
+            elevated: Some(false),
+            same_user: Some(false),
+        };
+        assert!(wait_hint("ConnectToGlobalUser failed.", false, &foreign)
+            .contains("другой учётной записи"));
+        // Several steam.exe instances: a hung one is holding the pipe.
+        let doubled = SteamState {
+            processes: 2,
+            elevated: Some(false),
+            same_user: Some(true),
+        };
+        assert!(wait_hint(
+            "Cannot create IPC pipe to Steam client process.",
+            false,
+            &doubled
+        )
+        .contains("несколько процессов Steam"));
+        // Clean tokens on both sides: point at antivirus, not at Steam restarts
+        // the user has already tried.
+        let hint = wait_hint(
+            "Cannot create IPC pipe to Steam client process.",
+            false,
+            &normal,
+        );
+        assert!(hint.contains("антивирус"));
+        // Elevated app + unelevated Steam keeps the elevation advice.
+        let unelevated_steam = SteamState {
+            processes: 1,
+            elevated: Some(false),
+            same_user: Some(true),
+        };
+        assert!(
+            wait_hint("ConnectToGlobalUser failed.", true, &unelevated_steam)
+                .contains("без прав администратора")
+        );
+        let elevated_steam = SteamState {
+            processes: 1,
+            elevated: Some(true),
+            same_user: Some(true),
+        };
+        assert!(wait_hint("ConnectToGlobalUser failed.", true, &elevated_steam).contains("UAC"));
         // Unrecognized details and non-init errors get no hint.
         assert_eq!(
-            wait_hint("Steam client appears to be out of date", true, Some(true)),
+            wait_hint(
+                "Steam client appears to be out of date",
+                true,
+                &elevated_steam
+            ),
             ""
         );
-        assert_eq!(wait_hint("", false, None), "");
+        assert_eq!(wait_hint("", false, &normal), "");
+    }
+
+    /// Live probe of the Steam client diagnostics. Asserts only structural
+    /// invariants; run with --nocapture to read the machine's actual state.
+    #[test]
+    fn steam_state_probe_is_structurally_sound() {
+        let state = steam_state();
+        eprintln!("steam_state: {state:?}");
+        if state.processes == 0 {
+            eprintln!("Steam is not running on this machine — nothing to assert");
+            return;
+        }
+        assert!(
+            state.elevated.is_some(),
+            "elevation must be resolved when steam.exe runs"
+        );
+        assert!(
+            state.same_user.is_some(),
+            "same-user must be resolved when steam.exe runs"
+        );
+    }
+}
+
+#[cfg(test)]
+mod steam_ready_tests {
+    use super::*;
+
+    fn running(processes: u32) -> SteamState {
+        SteamState {
+            processes,
+            elevated: Some(false),
+            same_user: Some(true),
+        }
+    }
+
+    #[test]
+    fn init_waits_until_the_client_has_a_signed_in_user() {
+        // No client at all: the plain case, and the only one the old loop
+        // told the user about correctly.
+        assert!(steam_not_ready(&running(0), &SteamActive::default())
+            .expect("no steam.exe must block init")
+            .contains("не запущен"));
+        // steam.exe is up but has not claimed ActiveProcess yet.
+        assert!(steam_not_ready(
+            &running(1),
+            &SteamActive {
+                pid: 0,
+                active_user: 0,
+            }
+        )
+        .expect("a client that has not registered must block init")
+        .contains("ещё запускается"));
+        // The shape behind «ConnectToGlobalUser failed»: client running,
+        // registered, nobody signed in.
+        assert!(steam_not_ready(
+            &running(1),
+            &SteamActive {
+                pid: 1234,
+                active_user: 0,
+            }
+        )
+        .expect("a signed-out client must block init")
+        .contains("вход в аккаунт не завершён"));
+        // Signed in: this is the only state worth spending an init on.
+        assert_eq!(
+            steam_not_ready(
+                &running(1),
+                &SteamActive {
+                    pid: 1234,
+                    active_user: 7,
+                }
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn init_backoff_stays_within_its_bounds() {
+        let mut backoff = INIT_RETRY;
+        for _ in 0..10 {
+            backoff = (backoff * 2).min(INIT_RETRY_MAX);
+            assert!(backoff >= INIT_RETRY && backoff <= INIT_RETRY_MAX);
+        }
+        assert_eq!(backoff, INIT_RETRY_MAX);
     }
 }

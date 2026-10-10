@@ -90,7 +90,7 @@ test('public member invitations follow effective permission without owner contro
 
 test('first run, keyboard create flow, browser fallback and responsive layout', async ({ page }) => {
   await page.goto('/');
-  await expect(page.getByText('Steam не запущен')).toBeVisible();
+  await expect(page.getByText('Steam не подключён')).toBeVisible();
   await page.getByRole('button', { name: 'Создать первую сеть' }).click();
   await expect(page.getByRole('dialog')).toBeVisible();
   await page.getByLabel('Название').fill('Minecraft');
