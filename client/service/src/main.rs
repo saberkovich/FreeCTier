@@ -100,6 +100,20 @@ fn log(message: &str) {
     eprintln!("{message}");
 }
 
+/// Put the calling thread one step above normal priority. The adapter pump and
+/// the pipe writer are latency-critical but use almost no CPU, so they should
+/// preempt ordinary work instead of waiting a scheduler quantum behind it while
+/// a game saturates the machine. One step, not time-critical: a bug in a thread
+/// this cheap must never be able to starve the desktop.
+fn prioritize() {
+    use windows::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+    };
+    unsafe {
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    }
+}
+
 /// SID of the user the service was installed for, from the machine registry.
 fn service_user() -> anyhow::Result<String> {
     use winreg::enums::HKEY_LOCAL_MACHINE;

@@ -10,6 +10,46 @@ mod policy {
     use std::net::Ipv4Addr;
     use uuid::Uuid;
 
+    /// Steam splits anything larger than one datagram into fragments, and a
+    /// lost fragment of an unreliable send takes the whole game packet with
+    /// it. `MTU_NO_FRAGMENT` is the preset that avoids that entirely: its
+    /// packets plus our frame header fit inside `MTU_DataSize` (1200 bytes).
+    #[test]
+    fn no_fragment_mtu_fits_one_steam_datagram() {
+        /// Steam's own per-message framing, with room to spare.
+        const SEGMENT_OVERHEAD: usize = 24;
+        let generated = crate::packet::MTU_NO_FRAGMENT as usize;
+        assert!(
+            generated + crate::wire::HEADER_LEN + SEGMENT_OVERHEAD <= crate::packet::STEAM_DATAGRAM
+        );
+        // The default is deliberately above that bound: a LAN-sized link
+        // matters more to games than avoiding the second fragment.
+        assert!(crate::packet::MTU_DEFAULT > crate::packet::MTU_NO_FRAGMENT);
+    }
+
+    /// Every MTU the settings can produce has to survive the packet path: the
+    /// accept bound must cover the largest configurable link, and a full-size
+    /// packet off such a link must parse and frame.
+    #[test]
+    fn configurable_mtu_range_is_accepted_and_clamped() {
+        use crate::packet::{clamp_mtu, MTU, MTU_DEFAULT, MTU_MAX, MTU_MIN};
+        assert_eq!(clamp_mtu(MTU_DEFAULT), MTU_DEFAULT);
+        assert_eq!(clamp_mtu(0), MTU_MIN);
+        assert_eq!(clamp_mtu(9000), MTU_MAX);
+        assert_eq!(clamp_mtu(MTU_MIN), MTU_MIN);
+        assert!(MTU_MAX as usize <= MTU);
+        for mtu in [MTU_MIN, MTU_DEFAULT, MTU_MAX] {
+            let bytes = sized_packet(
+                Ipv4Addr::new(10, 77, 0, 1),
+                Ipv4Addr::new(10, 77, 0, 2),
+                17,
+                mtu as usize,
+            );
+            Packet::parse(&bytes).unwrap();
+            Frame::encode(Kind::Ipv4, Uuid::nil(), &bytes).unwrap();
+        }
+    }
+
     #[test]
     fn offline_member_admits_with_password_proof_and_both_permissions() {
         use crate::{
@@ -313,14 +353,19 @@ mod policy {
     }
 
     fn packet(src: Ipv4Addr, dst: Ipv4Addr, protocol: u8) -> Vec<u8> {
-        let mut out = vec![0u8; 20];
+        sized_packet(src, dst, protocol, 20)
+    }
+
+    /// Header-only IPv4 packet padded out to `len` bytes.
+    fn sized_packet(src: Ipv4Addr, dst: Ipv4Addr, protocol: u8, len: usize) -> Vec<u8> {
+        let mut out = vec![0u8; len];
         out[0] = 0x45;
-        out[2..4].copy_from_slice(&(20u16).to_be_bytes());
+        out[2..4].copy_from_slice(&(len as u16).to_be_bytes());
         out[8] = 64;
         out[9] = protocol;
         out[12..16].copy_from_slice(&src.octets());
         out[16..20].copy_from_slice(&dst.octets());
-        let mut sum: u32 = out
+        let mut sum: u32 = out[..20]
             .as_chunks::<2>()
             .0
             .iter()
@@ -457,7 +502,14 @@ mod policy {
         let mut trailing = bytes;
         trailing.push(0);
         assert!(Packet::parse(&trailing).is_err());
-        assert!(Frame::encode(Kind::Ipv4, Uuid::new_v4(), &vec![0; 1281]).is_err());
+        // One byte past the widest MTU the settings allow is not a packet any
+        // peer can legitimately send, whatever MTU it runs with.
+        assert!(Frame::encode(
+            Kind::Ipv4,
+            Uuid::new_v4(),
+            &vec![0; crate::packet::MTU_MAX as usize + 1]
+        )
+        .is_err());
     }
 
     #[test]

@@ -375,6 +375,15 @@ code { font-family: var(--mono); font-size: .86em; font-weight: 500; }
 .color-input::-webkit-color-swatch-wrapper { padding: 2px; }
 .color-input::-webkit-color-swatch { border: none; border-radius: 6px; }
 
+/* Numeric field inside a settings row (MTU). The spinners are hidden: the
+   presets are the coarse control, this one is typed. */
+.number-input {
+  width: 96px; flex: 0 0 auto; padding: 8px 12px; border: 1px solid var(--line); border-radius: 10px;
+  background: var(--bg); color: var(--text); font: 600 13px var(--mono); text-align: center; outline: none;
+}
+.number-input:focus { border-color: var(--accent); }
+.number-input::-webkit-inner-spin-button, .number-input::-webkit-outer-spin-button { appearance: none; margin: 0; }
+
 .empty-state { max-width: 470px; margin: 0 auto; padding: 72px 24px; display: flex; flex-direction: column; align-items: center; text-align: center; }
 .empty-art { width: 180px; height: 110px; margin-bottom: 26px; color: var(--faint); opacity: .7; }
 .empty-state h1 { font: 700 24px/1.3 var(--display); letter-spacing: -.02em; }

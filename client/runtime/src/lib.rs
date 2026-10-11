@@ -1,7 +1,12 @@
 mod adapter;
 mod steam;
+mod wake;
 
 pub const DEFAULT_APP_ID: u32 = 324810;
+
+/// MTU bounds for the UI layer, so the window can offer presets and validate
+/// a custom value without depending on `freec-core` directly.
+pub use freec_core::packet::{MTU_DEFAULT, MTU_MAX, MTU_MIN, MTU_NO_FRAGMENT};
 
 /// How long the worker waits between looks at Steam. Also the floor of the
 /// init backoff: a readiness check costs nothing, a failed init does.
@@ -9,6 +14,24 @@ const INIT_RETRY: Duration = Duration::from_secs(5);
 /// Ceiling for the init backoff — far enough apart that a client stuck in a
 /// state we cannot fix never sees a steady stream of attempts from us.
 const INIT_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// Loop period while a LAN is up. Every millisecond spent here is added to the
+/// ping of every packet in both directions, so it is the tightest pace the
+/// high-resolution timer can hold; an arriving packet cuts it short anyway.
+const HOT_PERIOD: Duration = Duration::from_millis(1);
+/// Loop period with no adapter open. Nothing latency-sensitive is in flight,
+/// so this is just a Steam callback pump.
+const IDLE_PERIOD: Duration = Duration::from_millis(15);
+/// How often connection management, lobby upkeep and config sync run. Those
+/// talk to Steam under a lock and gain nothing from the hot pace.
+const SERVICE_PERIOD: Duration = Duration::from_millis(10);
+/// How often the snapshot is handed to the UI. The UI polls once a second;
+/// cloning member lists and the event log any faster would cost more than the
+/// whole packet path.
+const PUBLISH_PERIOD: Duration = Duration::from_millis(100);
+/// Packets moved per adapter per pass. Large enough to clear a burst in one
+/// wake-up, small enough that one busy network cannot starve the others.
+const ADAPTER_BATCH: usize = 256;
 
 use anyhow::{ensure, Context, Result};
 use base64::Engine as _;
@@ -168,6 +191,12 @@ pub enum Command {
         network: Uuid,
     },
     Discover,
+    /// Interface MTU for the virtual adapter. Handled by the facade, not the
+    /// engine: it must work before Steam is up, because the UI sends the
+    /// stored setting at startup.
+    SetMtu {
+        mtu: u32,
+    },
     Delete {
         network: Uuid,
     },
@@ -261,6 +290,7 @@ pub fn start(root: Option<PathBuf>, app_id: u32) -> Result<Handle> {
         .name("freec-steam".into())
         .spawn(move || {
             let _instance_lock = lock;
+            wake::prioritize();
             run(root, app_id, rx, snapshot, avatars)
         })?;
     *worker.lock().unwrap_or_else(|p| p.into_inner()) = Some(join);
@@ -294,6 +324,8 @@ struct Engine {
     sent_revisions: BTreeMap<(u64, Uuid), u64>,
     last_sync: Instant,
     last_view: Instant,
+    /// Scratch buffer for inbound Steam messages, reused across passes.
+    inbox: Vec<(u64, Vec<u8>)>,
     restore: Vec<Uuid>,
     /// Last surfaced service-connect issue, to avoid event-log spam.
     last_service_issue: Option<String>,
@@ -380,6 +412,7 @@ impl Engine {
             sent_revisions: BTreeMap::new(),
             last_sync: Instant::now(),
             last_view: Instant::now() - Duration::from_secs(1),
+            inbox: Vec::new(),
             restore,
             last_service_issue: None,
             last_outgoing_error: None,
@@ -715,6 +748,9 @@ impl Engine {
                 }
             }
             Command::Shutdown => {}
+            // Both are handled by the worker loop before the engine sees a
+            // command: shutdown ends the loop, the MTU goes to the facade.
+            Command::SetMtu { .. } => {}
             Command::SetPermissions {
                 network,
                 steam_id,
@@ -1114,23 +1150,19 @@ impl Engine {
             {
                 let id = member.steam_id.parse()?;
                 allowed.insert(id);
-                // Deterministic initiator avoids simultaneous duplicate sessions.
-                if local < id {
-                    dial.insert(id);
-                }
+                // Both sides dial. Steam's symmetric mode merges the two
+                // attempts into one session, so there is no duplicate to
+                // avoid — and no single side whose silence strands the pair.
+                dial.insert(id);
             }
         }
         for (owner, lobby, _) in self.pending.values() {
             allowed.insert(*owner);
-            if local < *owner {
-                dial.insert(*owner);
-            }
+            dial.insert(*owner);
             for member in self.client.matchmaking().lobby_members(*lobby) {
                 if member.raw() != local {
                     allowed.insert(member.raw());
-                    if local < member.raw() {
-                        dial.insert(member.raw());
-                    }
+                    dial.insert(member.raw());
                 }
             }
         }
@@ -1138,9 +1170,7 @@ impl Engine {
             for member in self.client.matchmaking().lobby_members(lobby) {
                 if member.raw() != local {
                     allowed.insert(member.raw());
-                    if local < member.raw() {
-                        dial.insert(member.raw());
-                    }
+                    dial.insert(member.raw());
                 }
             }
         }
@@ -1148,9 +1178,7 @@ impl Engine {
             for member in self.client.matchmaking().lobby_members(*lobby) {
                 if member.raw() != local {
                     allowed.insert(member.raw());
-                    if local < member.raw() {
-                        dial.insert(member.raw());
-                    }
+                    dial.insert(member.raw());
                 }
             }
         }
@@ -1161,9 +1189,7 @@ impl Engine {
             .retain(|_, time| time.elapsed() < Duration::from_secs(20));
         for (_, peer) in self.guests.keys() {
             allowed.insert(*peer);
-            if local < *peer {
-                dial.insert(*peer);
-            }
+            dial.insert(*peer);
         }
         if let Some(issue) = adapter::current_issue() {
             if self.last_service_issue.as_deref() != Some(issue.as_str()) {
@@ -1173,14 +1199,16 @@ impl Engine {
         } else if self.last_service_issue.take().is_some() {
             log(view, "Служба: подключение восстановлено");
         }
-        let messages = self.transport.tick(&self.client, &allowed, &dial);
-        for (sender, bytes) in messages {
-            if let Err(error) = self.receive(sender, &bytes, view) {
-                view.dropped += 1;
-                // Count malformed packets without flooding logs with untrusted text.
-                if view.dropped.is_power_of_two() {
-                    log(view, &format!("Отклонён пакет: {error:#}"));
-                }
+        for change in self.transport.service(&self.client, &allowed, &dial) {
+            match change {
+                steam::Change::Up(id) => log(
+                    view,
+                    &format!("Соединение восстановлено: {}", self.peer_name(id)),
+                ),
+                steam::Change::Down(id, reason) => log(
+                    view,
+                    &format!("Соединение потеряно: {} — {reason}", self.peer_name(id)),
+                ),
             }
         }
         if self.last_hello.elapsed() >= Duration::from_secs(3) {
@@ -1270,9 +1298,47 @@ impl Engine {
                 }
             }
         }
+        if self.last_view.elapsed() >= Duration::from_millis(500) {
+            self.last_view = Instant::now();
+            self.update_view(view);
+        }
+        Ok(())
+    }
+
+    /// Does the loop have latency-sensitive work? Drives the loop period: the
+    /// hot pace only pays for itself while packets can actually arrive.
+    fn busy(&self) -> bool {
+        !self.adapters.is_empty()
+    }
+
+    /// Rebuild the snapshot on the next housekeeping pass. Called after a UI
+    /// command so its effect is visible immediately instead of at the next
+    /// half-second refresh.
+    fn invalidate_view(&mut self) {
+        self.last_view = Instant::now() - Duration::from_secs(1);
+    }
+
+    /// The packet path, and nothing else. Runs on every wake-up of the engine
+    /// loop — at the hot period or the moment the service signals an inbound
+    /// packet — so everything in here has to be cheap and lock-free.
+    fn pump(&mut self, view: &mut Snapshot) -> Result<()> {
+        let mut inbox = std::mem::take(&mut self.inbox);
+        self.transport.drain(&mut inbox);
+        for (sender, bytes) in inbox.drain(..) {
+            if let Err(error) = self.receive(sender, &bytes, view) {
+                view.dropped += 1;
+                // Count malformed packets without flooding logs with untrusted text.
+                if view.dropped.is_power_of_two() {
+                    log(view, &format!("Отклонён пакет: {error:#}"));
+                }
+            }
+        }
+        // Keep the allocation for the next pass instead of growing a fresh
+        // vector a thousand times a second.
+        self.inbox = inbox;
         for (&id, adapter) in &self.adapters {
             // Bounded batch per interface keeps callbacks and other networks alive.
-            for _ in 0..64 {
+            for _ in 0..ADAPTER_BATCH {
                 let Some(bytes) = adapter.receive()? else {
                     break;
                 };
@@ -1322,11 +1388,22 @@ impl Engine {
                 }
             }
         }
-        if self.last_view.elapsed() >= Duration::from_millis(500) {
-            self.last_view = Instant::now();
-            self.update_view(view);
-        }
         Ok(())
+    }
+
+    /// Display name for the event log. Steam only knows names for friends and
+    /// recent lobby co-members, so the SteamID is the honest fallback.
+    fn peer_name(&self, id: u64) -> String {
+        let name = self
+            .client
+            .friends()
+            .get_friend(SteamId::from_raw(id))
+            .name();
+        if name.is_empty() {
+            id.to_string()
+        } else {
+            name
+        }
     }
 
     fn receive(&mut self, sender: u64, bytes: &[u8], view: &mut Snapshot) -> Result<()> {
@@ -2213,6 +2290,9 @@ fn run(
     let mut retry = Instant::now();
     let mut backoff = INIT_RETRY;
     let mut wait_error: Option<String> = None;
+    let mut waker = wake::Waker::new();
+    let mut serviced = Instant::now() - SERVICE_PERIOD;
+    let mut published = Instant::now() - PUBLISH_PERIOD;
     let args: Vec<_> = std::env::args().collect();
     let mut startup_lobby = args
         .windows(2)
@@ -2313,23 +2393,62 @@ fn run(
                 },
             }
         }
-        match rx.try_recv() {
-            Ok(Command::Shutdown) | Err(mpsc::TryRecvError::Disconnected) => break,
-            Ok(command) => {
-                let result = match engine.as_mut() {
-                    Some(engine) => engine.command(command),
-                    None => Err(anyhow::anyhow!(
-                        "Для этой операции запустите Steam и войдите в аккаунт"
-                    )),
-                };
-                if let Err(error) = result {
-                    log(&mut view, &format!("Ошибка: {error:#}"));
+        // Drain the queue: a UI action can arrive as a burst (enable several
+        // networks, kick a few members) and taking one per pass would stretch
+        // it over several wake-ups.
+        let mut stop = false;
+        let mut acted = false;
+        loop {
+            match rx.try_recv() {
+                Ok(Command::Shutdown) | Err(mpsc::TryRecvError::Disconnected) => {
+                    stop = true;
+                    break;
                 }
+                // Facade-only: the MTU reaches the service through the pipe,
+                // so it must not be gated on a running Steam session — the UI
+                // sends the stored value as soon as the window opens.
+                Ok(Command::SetMtu { mtu }) => {
+                    acted = true;
+                    adapter::set_mtu(mtu);
+                }
+                Ok(command) => {
+                    acted = true;
+                    let result = match engine.as_mut() {
+                        Some(engine) => engine.command(command),
+                        None => Err(anyhow::anyhow!(
+                            "Для этой операции запустите Steam и войдите в аккаунт"
+                        )),
+                    };
+                    if let Err(error) = result {
+                        log(&mut view, &format!("Ошибка: {error:#}"));
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
             }
-            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        if stop {
+            break;
+        }
+        // A command the user just pressed skips both throttles: its result has
+        // to reach the window on this pass, not on the next beat.
+        if acted {
+            serviced = Instant::now() - SERVICE_PERIOD;
+            published = Instant::now() - PUBLISH_PERIOD;
+            if let Some(current) = engine.as_mut() {
+                current.invalidate_view();
+            }
         }
         if let Some(current) = engine.as_mut() {
-            if let Err(error) = current.tick(&mut view) {
+            // Packets every pass; Steam callbacks, connection management and
+            // lobby upkeep on their own slower beat. Mixing them would either
+            // slow the packet path down to the housekeeping pace or hammer the
+            // Steam API thousands of times a second for no gain.
+            let mut result = current.pump(&mut view);
+            if result.is_ok() && serviced.elapsed() >= SERVICE_PERIOD {
+                serviced = Instant::now();
+                result = current.tick(&mut view);
+            }
+            if let Err(error) = result {
                 log(&mut view, &format!("Сессия приостановлена: {error:#}"));
                 engine = None;
                 view.steam = "waiting".into();
@@ -2344,9 +2463,20 @@ fn run(
                 retry = Instant::now() + Duration::from_secs(5);
             }
         }
-        *shared.lock().unwrap_or_else(|p| p.into_inner()) = view.clone();
-        thread::sleep(Duration::from_millis(5));
+        // The UI polls once a second, so publishing faster than this only
+        // burns the clone.
+        if published.elapsed() >= PUBLISH_PERIOD {
+            published = Instant::now();
+            *shared.lock().unwrap_or_else(|p| p.into_inner()) = view.clone();
+        }
+        waker.wait(match engine.as_ref() {
+            Some(engine) if engine.busy() => HOT_PERIOD,
+            _ => IDLE_PERIOD,
+        });
     }
+    // Last word to the UI: the shutdown path below terminates the process, so
+    // nothing else is going to publish the final state.
+    *shared.lock().unwrap_or_else(|p| p.into_inner()) = view.clone();
 }
 
 #[cfg(test)]

@@ -31,6 +31,10 @@ struct Settings {
     /// User-tuned CSS variable overrides for the «Своя» theme, keyed by
     /// token name (`accent`, `bg`, …) with `#rrggbb` values.
     custom_colors: std::collections::BTreeMap<String, String>,
+    /// MTU of the virtual adapter. A setting because the right value depends
+    /// on the game: 1280 suits LAN engines, a lower one avoids Steam
+    /// fragmenting a packet into two datagrams. Clamped in the engine.
+    mtu: u32,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -43,6 +47,7 @@ impl Default for Settings {
             start_in_tray: false,
             accent: String::new(),
             custom_colors: Default::default(),
+            mtu: freec_runtime::MTU_DEFAULT,
         }
     }
 }
@@ -129,6 +134,7 @@ fn settings(state: tauri::State<'_, Desktop>) -> Settings {
 fn save_settings(
     app: tauri::AppHandle,
     state: tauri::State<'_, Desktop>,
+    engine: tauri::State<'_, Handle>,
     settings: Settings,
 ) -> Result<(), String> {
     let mut current = state.settings.lock().unwrap();
@@ -142,6 +148,11 @@ fn save_settings(
         Ok(())
     };
     save().map_err(|e| e.to_string())?;
+    // Only on a real change: the engine re-registers every live network to
+    // apply it, which is cheap but not free.
+    if settings.mtu != current.mtu {
+        let _ = engine.send(Command::SetMtu { mtu: settings.mtu });
+    }
     *current = settings;
     Ok(())
 }
@@ -561,13 +572,18 @@ fn main() {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(freec_runtime::DEFAULT_APP_ID);
             let root = std::env::var_os("FREECTIER_DATA_DIR").map(std::path::PathBuf::from);
-            app.manage(freec_runtime::start(root, app_id)?);
+            let engine = freec_runtime::start(root, app_id)?;
             let path = app.path().app_config_dir()?.join("settings.json");
-            let settings = if path.exists() {
+            let settings: Settings = if path.exists() {
                 serde_json::from_slice(&std::fs::read(path)?)?
             } else {
                 Settings::default()
             };
+            // The adapter MTU lives in the service, so the stored value has to
+            // be handed over before the first network comes up. The worker
+            // takes it without Steam being ready.
+            let _ = engine.send(Command::SetMtu { mtu: settings.mtu });
+            app.manage(engine);
             app.manage(Desktop {
                 settings: Mutex::new(settings),
                 update: Mutex::new(None),

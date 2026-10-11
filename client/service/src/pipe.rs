@@ -30,6 +30,15 @@ use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 /// Only one pipe instance exists; the UI process opens exactly this path.
 pub const PIPE_PATH: &str = "\\\\.\\pipe\\FreeCTierService";
 
+/// Frames queued for the client before new ones are dropped. At tunnel MTU
+/// that is a couple of megabytes — deep enough to ride out a scheduling
+/// hiccup in the UI process, shallow enough that nothing sits in it long
+/// enough to be stale when it arrives.
+const OUTBOUND_QUEUE: usize = 2048;
+
+/// Soft cap on how much the writer coalesces into a single pipe write.
+const WRITE_BATCH: usize = 32 * 1024;
+
 fn stopped() -> io::Error {
     io::Error::other("service stopping")
 }
@@ -242,7 +251,6 @@ impl PipeIo {
     }
 
     fn read_exact(&self, buffer: &mut [u8]) -> io::Result<()> {
-        log(&format!("svc io: reading {} bytes", buffer.len()));
         let mut done = 0;
         while done < buffer.len() {
             let count = self.read_one(&mut buffer[done..])?;
@@ -281,9 +289,18 @@ impl PipeIo {
     }
 
     fn write_frame(&self, frame: &[u8]) -> io::Result<()> {
-        self.write_all(&(frame.len() as u32).to_le_bytes())?;
-        self.write_all(frame)
+        let mut out = Vec::with_capacity(4 + frame.len());
+        push_frame(&mut out, frame);
+        self.write_all(&out)
     }
+}
+
+/// Length-prefix a frame into a shared buffer. One `WriteFile` per batch of
+/// frames instead of two per frame: a syscall costs far more than the copy,
+/// and on the packet path that difference is measurable latency.
+fn push_frame(out: &mut Vec<u8>, frame: &[u8]) {
+    out.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+    out.extend_from_slice(frame);
 }
 
 fn is_stop_set(stop: HANDLE) -> bool {
@@ -302,7 +319,10 @@ pub fn serve(ctl: &Arc<Ctl>, user_sid: &str) {
             user_sid
         }
     ));
-    let adapters = Arc::new(Mutex::new(Adapters::new(ctl.stop_flag.clone())));
+    let adapters = Arc::new(Mutex::new(Adapters::new(
+        ctl.stop_flag.clone(),
+        ctl.stop_event.0 as isize,
+    )));
     adapters.lock().unwrap().prepare();
     loop {
         if ctl.is_stopping() {
@@ -372,14 +392,29 @@ fn run_session(handle: HANDLE, ctl: &Arc<Ctl>, adapters: &Arc<Mutex<Adapters>>) 
     )?)?;
     log("handshake complete");
 
-    let (outbound, outbound_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    // Bounded: an unbounded queue in front of a pipe is bufferbloat. If the
+    // client stops reading, packets must be dropped (see `Adapters`), not
+    // stockpiled until they are both stale and expensive.
+    let (outbound, outbound_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(OUTBOUND_QUEUE);
     let writer_io = Arc::clone(&io);
     let writer_stop = ctl.stop_flag.clone();
     let writer = std::thread::Builder::new()
         .name("freec-svc-writer".into())
         .spawn(move || {
+            crate::prioritize();
+            let mut batch = Vec::with_capacity(WRITE_BATCH + freec_ipc::MAX_FRAME);
             while let Ok(frame) = outbound_rx.recv() {
-                if writer_io.write_frame(&frame).is_err() {
+                batch.clear();
+                push_frame(&mut batch, &frame);
+                // Everything already queued joins this write: one syscall for
+                // a burst, and no extra delay for the first packet in it.
+                while batch.len() < WRITE_BATCH {
+                    match outbound_rx.try_recv() {
+                        Ok(next) => push_frame(&mut batch, &next),
+                        Err(_) => break,
+                    }
+                }
+                if writer_io.write_all(&batch).is_err() {
                     break;
                 }
                 if writer_stop.load(Ordering::SeqCst) {
@@ -394,7 +429,6 @@ fn run_session(handle: HANDLE, ctl: &Arc<Ctl>, adapters: &Arc<Mutex<Adapters>>) 
         if ctl.is_stopping() {
             break;
         }
-        log("session: waiting for frame");
         let frame = match io.read_frame() {
             Ok(frame) => frame,
             Err(error) if is_stopped_error(&error) => break,
@@ -403,8 +437,15 @@ fn run_session(handle: HANDLE, ctl: &Arc<Ctl>, adapters: &Arc<Mutex<Adapters>>) 
 
         match freec_ipc::decode_client_frame(&frame)? {
             freec_ipc::ClientMessage::Hello => anyhow::bail!("Duplicate hello"),
-            freec_ipc::ClientMessage::OpenAdapter { network, local_ip } => {
-                let result = adapters.lock().unwrap().open(network, local_ip);
+            freec_ipc::ClientMessage::OpenAdapter {
+                network,
+                local_ip,
+                mtu,
+            } => {
+                let result = adapters
+                    .lock()
+                    .unwrap()
+                    .open(network, local_ip, mtu.map(u32::from));
                 let reply = match result {
                     Ok(()) => freec_ipc::ServiceMessage::AdapterOpened { network },
                     Err(error) => freec_ipc::ServiceMessage::AdapterError {
