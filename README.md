@@ -10,7 +10,6 @@
 
 [![Release](https://img.shields.io/github/v/release/saberkovich/FreeCTier?include_prereleases&style=for-the-badge&color=7C5CFF&labelColor=14141B)](https://github.com/saberkovich/FreeCTier/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/saberkovich/FreeCTier/total?style=for-the-badge&color=2ED3A0&labelColor=14141B)](https://github.com/saberkovich/FreeCTier/releases)
-[![Build](https://img.shields.io/github/actions/workflow/status/saberkovich/FreeCTier/release.yml?style=for-the-badge&label=build&labelColor=14141B)](https://github.com/saberkovich/FreeCTier/actions)
 [![License](https://img.shields.io/github/license/saberkovich/FreeCTier?style=for-the-badge&color=F5B544&labelColor=14141B)](LICENSE)
 
 ![Rust](https://img.shields.io/badge/Rust-1.90+-000000?style=flat-square&logo=rust&logoColor=white)
