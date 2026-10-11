@@ -385,3 +385,85 @@ test('custom theme seeds from the current theme, previews live and persists', as
   await expect(page.locator('#theme-editor')).toHaveCount(0);
   expect(await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--accent').trim())).toBe('#e03650');
 });
+
+test('language menu in the first-run window switches every surface and persists', async ({ page }) => {
+  await page.addInitScript(() => {
+    const snapshot = { steam: 'waiting', steam_id: '1', relay: 'unknown', networks: [], friends: [], events: [], sent: 0, received: 0, dropped: 0 };
+    Object.assign(window, { isTauri: true, __TAURI_INTERNALS__: { invoke: async (command: string, args: unknown) => {
+      if (command === 'snapshot') return structuredClone(snapshot);
+      if (command === 'settings') return { minimize_to_tray: true, check_updates: false, autostart: false, theme: 'dark', language: 'ru' };
+      if (command === 'version') return '0.2.0';
+      if (command === 'steam_app') return { app_id: 324810, in_library: false };
+      if (command === 'save_settings') Object.assign(window, { savedSettings: args });
+      if (command === 'service_status') return { installed: true, running: true };
+    } } });
+  });
+  const saved = async () => await page.evaluate(() => (window as unknown as {savedSettings?: {settings?: {language?: string}}}).savedSettings?.settings?.language);
+  await page.goto('/');
+  const dialog = page.locator('#welcome-dialog');
+  await expect(dialog.getByRole('heading', { name: 'Настройка FreeC Tier' })).toBeVisible();
+  const picker = dialog.locator('#welcome-language');
+  const current = picker.locator('.lang-current');
+  await expect(current).toHaveText('Русский');
+  // Flags are images, not emoji: Windows has no flag glyphs.
+  const flagsLoaded = () => picker.locator('img.flag').evaluateAll(images => images.map(image => (image as HTMLImageElement).complete && (image as HTMLImageElement).naturalWidth > 0));
+  await current.click();
+  const menu = picker.locator('.lang-menu');
+  await expect(menu).toBeVisible();
+  await expect(menu.locator('.lang-option .lang-name')).toHaveText(['English', 'Русский']);
+  await expect.poll(flagsLoaded).toEqual([true, true, true]);
+  // The dialog re-renders every 2 s while it watches the Steam library; an
+  // open menu must outlive that.
+  await page.waitForTimeout(2300);
+  await expect(menu).toBeVisible();
+  await page.screenshot({ path: '../../.cache/screenshots/language-menu.png' });
+  // Escape closes the menu first, not the whole dialog.
+  await page.keyboard.press('Escape');
+  await expect(menu).toBeHidden();
+  await expect(dialog).toBeVisible();
+  await current.click();
+  await menu.getByRole('option', { name: 'English' }).click();
+  await expect(menu).toBeHidden();
+  await expect(dialog.getByRole('heading', { name: 'FreeC Tier setup' })).toBeVisible();
+  await expect(dialog.getByText('Not in your library yet.')).toBeVisible();
+  await expect(dialog.getByText('Hide the game in your library')).toBeVisible();
+  await expect(current).toHaveText('English');
+  expect(await saved()).toBe('en');
+  expect(await page.evaluate(() => document.documentElement.lang)).toBe('en');
+  // Static markup behind the dialog followed too.
+  await expect(page.locator('#settings')).toHaveAttribute('title', 'Settings');
+  await expect(page.locator('#create-dialog h2')).toHaveText('New network');
+  await page.screenshot({ path: '../../.cache/screenshots/welcome-en.png' });
+  await dialog.getByRole('button', { name: 'Done' }).click();
+  // Settings carries the same menu for later.
+  await page.locator('#settings').click();
+  await expect(page.locator('#page-title')).toHaveText('Settings');
+  await expect(page.getByText('Check automatically')).toBeVisible();
+  await page.screenshot({ path: '../../.cache/screenshots/settings-en.png' });
+  await page.locator('#settings-language .lang-current').click();
+  await page.locator('#settings-language').getByRole('option', { name: 'Русский' }).click();
+  await expect(page.locator('#page-title')).toHaveText('Настройки');
+  await expect(page.locator('#settings')).toHaveAttribute('title', 'Настройки');
+  expect(await saved()).toBe('ru');
+  // Edge's autofill re-scans form fields when the page language changes and
+  // leaves an empty `style=""` on them; only real inline styles matter here.
+  expect(await page.evaluate(() => [...document.querySelectorAll('[style]:not([style=""])')].map(e => e.outerHTML.slice(0, 120)))).toEqual([]);
+});
+
+test.describe('outside the former Soviet Union', () => {
+  test.use({ locale: 'en-US' });
+  test('the browser preview opens in English', async ({ page }) => {
+    await page.goto('/');
+    await expect(page.locator('#page-title')).toHaveText('My networks');
+    await expect(page.getByRole('button', { name: 'Create your first network' })).toBeVisible();
+    expect(await page.evaluate(() => document.documentElement.lang)).toBe('en');
+  });
+});
+
+test.describe('in a post-Soviet region with an English system', () => {
+  test.use({ locale: 'en-KZ' });
+  test('the browser preview opens in Russian', async ({ page }) => {
+    await page.goto('/');
+    await expect(page.locator('#page-title')).toHaveText('Мои сети');
+  });
+});
