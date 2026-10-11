@@ -629,7 +629,7 @@ async function loadAvatars() {
   } catch { /* build without the avatar command */ }
 }
 let tick = 0;
-async function poll() {
+async function refresh() {
   if (isTauri()) {
     if (++tick % 2 === 0) void loadAvatars();
     try {
@@ -645,8 +645,16 @@ async function poll() {
       updateDynamic();
     } catch (error) { notice(`Нет связи с ядром: ${String(error)}`); }
   }
+}
+// A window in the tray renders nothing, so neither the snapshot clone nor the
+// avatar fetch is worth waking it for — the webview is usually suspended at
+// that point anyway. Becoming visible refreshes at once instead of showing a
+// second of stale state.
+async function poll() {
+  if (!document.hidden) await refresh();
   setTimeout(poll, 1000);
 }
+document.addEventListener('visibilitychange', () => { if (!document.hidden) void refresh(); });
 applyTheme(preferences.theme);
 render();
 // The webview's default context menu (back/reload/print/view source) has no

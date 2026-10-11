@@ -23,8 +23,9 @@ mod policy {
             generated + crate::wire::HEADER_LEN + SEGMENT_OVERHEAD <= crate::packet::STEAM_DATAGRAM
         );
         // The default is deliberately above that bound: a LAN-sized link
-        // matters more to games than avoiding the second fragment.
-        assert!(crate::packet::MTU_DEFAULT > crate::packet::MTU_NO_FRAGMENT);
+        // matters more to games than avoiding the second fragment. Both sides
+        // are constants, so the check belongs to compilation, not to the run.
+        const { assert!(crate::packet::MTU_DEFAULT > crate::packet::MTU_NO_FRAGMENT) };
     }
 
     /// Every MTU the settings can produce has to survive the packet path: the
@@ -37,7 +38,7 @@ mod policy {
         assert_eq!(clamp_mtu(0), MTU_MIN);
         assert_eq!(clamp_mtu(9000), MTU_MAX);
         assert_eq!(clamp_mtu(MTU_MIN), MTU_MIN);
-        assert!(MTU_MAX as usize <= MTU);
+        const { assert!(MTU_MAX as usize <= MTU) };
         for mtu in [MTU_MIN, MTU_DEFAULT, MTU_MAX] {
             let bytes = sized_packet(
                 Ipv4Addr::new(10, 77, 0, 1),

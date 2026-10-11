@@ -389,12 +389,69 @@ fn force_exit() -> ! {
     }
 }
 fn show(app: &tauri::AppHandle) {
+    // Wake the renderer before the window appears: on the main thread the call
+    // runs inline, so there is no frame of empty window.
+    set_webview_dormant(app, false);
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
     }
 }
+
+/// Puts the WebView2 renderer to sleep while the window is in the tray.
+///
+/// This app lives in the tray: the networks run in the Rust engine and the
+/// window is open for a minute a day. WebView2 does not care — it keeps a full
+/// renderer process (plus its GPU surface) alive for a window nobody is
+/// looking at, which is most of what Task Manager attributes to the app.
+/// `TrySuspend` lets the runtime release that memory and rebuild it on
+/// `Resume`; the page state survives, so the UI comes back exactly as it was.
+///
+/// Hiding the window is not enough on its own — WebView2 keeps compositing
+/// until the controller itself is invisible, and it refuses to suspend while
+/// visible. Hence the two calls, in opposite orders on the two paths.
+#[cfg(windows)]
+fn set_webview_dormant(app: &tauri::AppHandle, dormant: bool) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static DORMANT: AtomicBool = AtomicBool::new(false);
+    if DORMANT.swap(dormant, Ordering::SeqCst) == dormant {
+        return;
+    }
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let _ = window.with_webview(move |webview| {
+        use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_3;
+        use windows_core::Interface;
+        let controller = webview.controller();
+        // Every call is best effort: a WebView2 runtime without the suspend
+        // interface costs memory, never correctness, and a refused suspend
+        // (a download in flight, say) just leaves the renderer up.
+        unsafe {
+            let core = controller
+                .CoreWebView2()
+                .and_then(|core| core.cast::<ICoreWebView2_3>())
+                .ok();
+            if dormant {
+                let _ = controller.SetIsVisible(false);
+                if let Some(core) = core {
+                    let handler = webview2_com::TrySuspendCompletedHandler::create(Box::new(
+                        |_result, _suspended| Ok(()),
+                    ));
+                    let _ = core.TrySuspend(&handler);
+                }
+            } else {
+                if let Some(core) = core {
+                    let _ = core.Resume();
+                }
+                let _ = controller.SetIsVisible(true);
+            }
+        }
+    });
+}
+#[cfg(not(windows))]
+fn set_webview_dormant(_app: &tauri::AppHandle, _dormant: bool) {}
 
 #[cfg(windows)]
 fn show_startup_error(message: &str) {
@@ -631,7 +688,11 @@ fn main() {
             // The window is configured hidden so an autostart launch never
             // flashes it on the desktop. Everything else reveals it here,
             // once the tray icon exists to put it back.
-            if !started_in_tray() {
+            if started_in_tray() {
+                // Nothing will ever look at this webview until the user opens
+                // the window, so it must not hold a renderer for the session.
+                set_webview_dormant(app.handle(), true);
+            } else {
                 show(app.handle());
             }
             Ok(())
@@ -639,6 +700,7 @@ fn main() {
         .on_window_event(|window, event| match event {
             tauri::WindowEvent::CloseRequested { api, .. } => {
                 if window.hide().is_ok() {
+                    set_webview_dormant(window.app_handle(), true);
                     api.prevent_close();
                 }
             }
@@ -652,6 +714,17 @@ fn main() {
                         .minimize_to_tray =>
             {
                 let _ = window.hide();
+                set_webview_dormant(window.app_handle(), true);
+            }
+            // A minimized window renders nothing either, and restoring it from
+            // the taskbar never goes through `show`, so both halves live here.
+            // The visibility term matters as much as the minimize one: a
+            // hidden window still gets resize events, and waking the renderer
+            // for one would undo every suspend above.
+            tauri::WindowEvent::Resized(_) => {
+                let hidden =
+                    !window.is_visible().unwrap_or(true) || window.is_minimized().unwrap_or(false);
+                set_webview_dormant(window.app_handle(), hidden);
             }
             _ => {}
         })

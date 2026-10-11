@@ -10,7 +10,16 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "windows": [{ "title": "FreeC Tier", "theme": "Dark", "width": 1060, "height": 720, "minWidth": 720, "minHeight": 520, "visible": false }],
+    "windows": [{
+      "title": "FreeC Tier",
+      "theme": "Dark",
+      "width": 1060,
+      "height": 720,
+      "minWidth": 720,
+      "minHeight": 520,
+      "visible": false,
+      "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-extensions --disable-breakpad --disable-background-networking --js-flags=--max-old-space-size=96"
+    }],
     "security": {
       "csp": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src ipc: http://ipc.localhost"
     }
