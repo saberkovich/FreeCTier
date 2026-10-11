@@ -66,6 +66,7 @@ test('public member invitations follow effective permission without owner contro
   await expect(page.locator('#invite')).toBeEnabled();
   await expect(page.locator('#access-public')).toHaveCount(0);
   await expect(page.locator('[data-invite]')).toHaveCount(0);
+  await expect(page.locator('#rename-network')).toHaveCount(0);
   await page.locator('#invite').click();
   await expect(page.locator('#invite-dialog')).toBeVisible();
   await page.locator('[data-friend]').click();
@@ -93,7 +94,7 @@ test('first run, keyboard create flow, browser fallback and responsive layout', 
   await expect(page.getByText('Steam не подключён')).toBeVisible();
   await page.getByRole('button', { name: 'Создать первую сеть' }).click();
   await expect(page.getByRole('dialog')).toBeVisible();
-  await page.getByLabel('Название').fill('Minecraft');
+  await page.getByRole('dialog').getByLabel('Название').fill('Minecraft');
   await page.getByRole('dialog').getByRole('button', { name: 'Публичная' }).click();
   await expect(page.getByRole('dialog').getByRole('button', { name: 'Публичная' })).toHaveClass(/active/);
   await page.screenshot({ path: '../../.cache/screenshots/create-dialog.png' });
@@ -138,10 +139,11 @@ test('real state rendering is escaped and adapter action reaches IPC', async ({ 
       if (command === 'install_update') Object.assign(window, { installedUpdate: true });
       if (command === 'dispatch') {
         Object.assign(window, { lastCommand: args });
-        const action = (args as { command: { type: string; public?: boolean; can_invite?: boolean; can_kick?: boolean } }).command;
+        const action = (args as { command: { type: string; public?: boolean; can_invite?: boolean; can_kick?: boolean; name?: string } }).command;
         const network = fixture.networks[0];
         if (action.type === 'set_access') { network.public = action.public!; network.members[1].can_invite = network.public; }
         if (action.type === 'set_permissions') { network.members[1].can_invite = action.can_invite!; network.members[1].can_kick = action.can_kick!; }
+        if (action.type === 'rename') network.name = action.name!;
         network.members[1].may_invite = network.members[1].can_invite;
       }
     } } });
@@ -187,6 +189,14 @@ test('real state rendering is escaped and adapter action reaches IPC', async ({ 
   await expect(page.getByRole('checkbox', { name: 'Исключать: Test friend' })).toBeChecked();
   await expect(page.getByText('МОЖЕТ ПРИГЛАШАТЬ')).toBeVisible();
   await page.screenshot({ path: '../../.cache/screenshots/network-fixture.png', fullPage: true });
+  // Only the owner sees the pencil, and a rename lands in the hero and the IPC.
+  await page.locator('#rename-network').click();
+  await expect(page.locator('#rename-dialog')).toBeVisible();
+  await expect(page.locator('#rename-name')).toHaveValue('Minecraft');
+  await page.locator('#rename-name').fill('CS LAN');
+  await page.locator('#rename-dialog').getByRole('button', { name: 'Сохранить' }).click();
+  expect(await page.evaluate(() => (window as unknown as {lastCommand: unknown}).lastCommand)).toEqual({ command: { type: 'rename', network: '67ae3f2d-0734-47f8-bf1b-e5e2bc64a289', name: 'CS LAN' } });
+  await expect(page.getByRole('heading', { name: 'CS LAN' })).toBeVisible();
   await page.locator('#settings').click();
   await page.getByRole('button', { name: 'Диагностика' }).click();
   await page.locator('summary').click();

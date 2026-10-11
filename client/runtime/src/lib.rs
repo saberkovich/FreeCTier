@@ -177,6 +177,10 @@ pub enum Command {
         network: Uuid,
         public: bool,
     },
+    Rename {
+        network: Uuid,
+        name: String,
+    },
     SetMemberInvite {
         network: Uuid,
         steam_id: String,
@@ -709,6 +713,30 @@ impl Engine {
                 let signed = SignedNetwork::sign(next, &self.key)?;
                 self.store.save(&signed)?;
                 self.networks.insert(network, signed);
+            }
+            Command::Rename { network, name } => {
+                let mut next = self
+                    .networks
+                    .get(&network)
+                    .context("Unknown network")?
+                    .network
+                    .clone();
+                next.set_name(&self.local, name)?;
+                let signed = SignedNetwork::sign(next, &self.key)?;
+                self.store.save(&signed)?;
+                self.networks.insert(network, signed);
+                // Discovery cards and the Steam invite dialog read the lobby's
+                // `name` key, so a rename has to reach the lobbies that are up
+                // right now. A dead lobby fails the refresh quietly — the stale
+                // loop tears it down and the next publish writes the new name.
+                let published = self.published.get(&network).copied();
+                let admission = self
+                    .lobby
+                    .filter(|(id, _)| *id == network)
+                    .map(|(_, lobby)| lobby);
+                for lobby in published.into_iter().chain(admission) {
+                    let _ = self.publish_metadata(network, lobby);
+                }
             }
             Command::SetMemberInvite {
                 network,
