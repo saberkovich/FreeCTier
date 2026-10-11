@@ -555,17 +555,24 @@ async function savePreferences(next: Settings) {
   if (await desktop('save_settings', { settings: next })) preferences = next;
   if (page === 'settings') renderSettings();
 }
-async function checkUpdate() {
-  if (!isTauri()) { notice('Проверка обновлений доступна в desktop-клиенте.'); return; }
+// A background check is silent: it never flashes «Проверяем…», never clears an
+// update already on offer, and a failed attempt (offline laptop) says nothing —
+// the next one is five minutes away.
+let lastUpdateCheck = 0;
+async function checkUpdate(quiet = false) {
+  if (!isTauri()) { if (!quiet) notice('Проверка обновлений доступна в desktop-клиенте.'); return; }
   if (updating) return;
-  updating = true; updateMessage = 'Проверяем…'; updateVersion = null;
+  lastUpdateCheck = Date.now();
+  updating = true;
+  if (!quiet) { updateMessage = 'Проверяем…'; updateVersion = null; }
   if (page === 'settings') renderSettings();
   try {
     const result = await invoke<{ configured: boolean; version: string | null }>('check_update');
+    const announced = result.version !== null && result.version !== updateVersion;
     updateVersion = result.version;
     updateMessage = !result.configured ? 'Обновления не настроены в этой сборке.' : result.version ? `Доступна версия ${result.version}.` : 'Установлена актуальная версия.';
-    if (result.version && page !== 'settings') notice(`Доступна версия ${result.version}.`);
-  } catch (error) { updateMessage = `Не удалось проверить обновления: ${String(error)}`; }
+    if (announced && page !== 'settings') notice(`Доступна версия ${result.version}.`);
+  } catch (error) { if (!quiet) updateMessage = `Не удалось проверить обновления: ${String(error)}`; }
   finally { updating = false; if (page === 'settings') renderSettings(); renderHeaderUpdate(); }
 }
 function openCreate() { setCreateAccess(false); (document.querySelector('#create-dialog') as HTMLDialogElement).showModal(); }
@@ -671,3 +678,11 @@ if (isTauri()) void invoke<Settings>('settings').then(result => {
   if (preferences.check_updates) void checkUpdate();
 }).catch(error => notice(`Не удалось загрузить настройки: ${String(error)}`));
 void poll();
+// Periodic update check while the app runs. The setting is read at each tick,
+// so the switch takes effect without a restart. A hidden window's webview is
+// suspended and its timers stall, so the missed check happens the moment the
+// window comes back instead.
+const UPDATE_INTERVAL = 5 * 60 * 1000;
+function updateDue() { return isTauri() && preferences.check_updates && !document.hidden && Date.now() - lastUpdateCheck >= UPDATE_INTERVAL; }
+window.setInterval(() => { if (updateDue()) void checkUpdate(true); }, 30 * 1000);
+document.addEventListener('visibilitychange', () => { if (updateDue()) void checkUpdate(true); });
