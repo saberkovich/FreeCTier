@@ -147,8 +147,11 @@ npm --prefix client/gui run tauri dev
 ## Лицензия
 
 [MIT](LICENSE) © 2026 Kirill Dunaev
-❤️ Made with Claude
 
 <div align="center">
 <sub>Сделано на Rust 🦀 · Работает на Steam</sub>
+</div>
+
+<div align="center">
+<sub>❤️ Made with Claude</sub>
 </div>
