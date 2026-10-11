@@ -29,3 +29,9 @@ winreg = "0.55"
 windows-service = "0.8"
 serde.workspace = true
 serde_json.workspace = true
+
+# Already in the graph through Tauri; named here so the tray path can suspend
+# the WebView2 renderer instead of paying for it while the window is hidden.
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.39"
+windows-core = "0.62"
