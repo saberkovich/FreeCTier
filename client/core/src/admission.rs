@@ -61,11 +61,12 @@ impl Password {
         member_key: &str,
     ) -> Result<String> {
         let key = self.key(password)?;
-        // This message surfaces verbatim in the GUI event log, which is Russian;
-        // every other error here is internal and stays English.
+        // This message surfaces verbatim in the GUI event log, so it is the
+        // one error here that speaks the user's language; every other one is
+        // internal and stays English.
         ensure!(
             hex::encode(key.verifying_key().as_bytes()) == self.verifier,
-            "Неверный пароль сети"
+            crate::i18n::t("error.wrong_password")
         );
         Ok(hex::encode(
             key.sign(&proof_message(snapshot, steam_id, member_key)?)

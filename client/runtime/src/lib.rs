@@ -4,6 +4,9 @@ mod wake;
 
 pub const DEFAULT_APP_ID: u32 = 324810;
 
+/// Interface strings for the desktop shell — tray, startup dialogs — from the
+/// same catalogs the engine and the window use.
+pub use freec_core::i18n;
 /// MTU bounds for the UI layer, so the window can offer presets and validate
 /// a custom value without depending on `freec-core` directly.
 pub use freec_core::packet::{MTU_DEFAULT, MTU_MAX, MTU_MIN, MTU_NO_FRAGMENT};
@@ -39,6 +42,7 @@ use ed25519_dalek::SigningKey;
 use freec_core::{
     admission::{self, Password},
     config::{Access, Network, Operation, SignedNetwork},
+    i18n::{t, tf},
     packet::Packet,
     storage::Store,
     wire::{Frame, Kind},
@@ -66,6 +70,11 @@ pub struct Snapshot {
     pub networks: Vec<NetworkView>,
     pub friends: Vec<FriendView>,
     pub events: Vec<String>,
+    /// Engine errors logged so far. The window raises a notice when it grows,
+    /// which keeps that decision independent of the language the line is in.
+    pub errors: u64,
+    /// The newest error line, for that notice.
+    pub last_error: Option<String>,
     pub received: u64,
     pub sent: u64,
     pub dropped: u64,
@@ -360,10 +369,7 @@ impl Engine {
         avatars: Arc<Mutex<BTreeMap<String, String>>>,
     ) -> Result<Self> {
         let client = Client::init_app(app_id)?;
-        ensure!(
-            client.user().logged_on(),
-            "Steam не авторизован — войдите в аккаунт"
-        );
+        ensure!(client.user().logged_on(), t("error.steam_signed_out"));
         let local = client.user().steam_id().raw().to_string();
         let store = Store::new(root.join("accounts").join(&local))?;
         let key = store.owner_key()?;
@@ -826,7 +832,7 @@ impl Engine {
             self.pending
                 .get(&network)
                 .is_some_and(|(_, _, time)| time.elapsed() >= Duration::from_secs(3)),
-            "Ожидаем ответ владельца; повторите через несколько секунд"
+            t("error.owner_pending")
         );
         let (peer, signed) = self.offers.get(&network).context("No pending invitation")?;
         let public_key = hex::encode(self.key.verifying_key().as_bytes());
@@ -1023,17 +1029,17 @@ impl Engine {
                         if self.adapters.keys().any(|active| {
                             self.networks[active].network.subnet == config.network.subnet
                         }) {
-                            log(view, "Сеть не включилась автоматически: конфликт подсетей");
+                            log(view, &t("event.auto_on_conflict"));
                             continue;
                         }
                         match adapter::Adapter::open(&config.network, &self.local) {
                             Ok(adapter) => {
                                 self.adapters.insert(id, adapter);
-                                log(view, "Сеть включена автоматически");
+                                log(view, &t("event.auto_on"));
                             }
                             Err(error) => log(
                                 view,
-                                &format!("Сеть не включилась автоматически: {error:#}"),
+                                &tf("event.auto_on_failed", &[("error", &format!("{error:#}"))]),
                             ),
                         }
                     }
@@ -1062,7 +1068,7 @@ impl Engine {
             if let Some((_, lobby, _)) = self.pending.remove(&id) {
                 self.client.matchmaking().leave_lobby(lobby);
             }
-            log(view, "Истекло время ожидания подключения к сети");
+            log(view, &t("event.join_timeout"));
         }
         let stale: Vec<_> = self
             .published
@@ -1193,21 +1199,23 @@ impl Engine {
         }
         if let Some(issue) = adapter::current_issue() {
             if self.last_service_issue.as_deref() != Some(issue.as_str()) {
-                log(view, &format!("Служба: {issue}"));
+                log(view, &tf("event.service", &[("issue", &issue)]));
                 self.last_service_issue = Some(issue);
             }
         } else if self.last_service_issue.take().is_some() {
-            log(view, "Служба: подключение восстановлено");
+            log(view, &t("event.service_restored"));
         }
         for change in self.transport.service(&self.client, &allowed, &dial) {
             match change {
-                steam::Change::Up(id) => log(
-                    view,
-                    &format!("Соединение восстановлено: {}", self.peer_name(id)),
-                ),
+                steam::Change::Up(id) => {
+                    log(view, &tf("event.peer_up", &[("name", &self.peer_name(id))]))
+                }
                 steam::Change::Down(id, reason) => log(
                     view,
-                    &format!("Соединение потеряно: {} — {reason}", self.peer_name(id)),
+                    &tf(
+                        "event.peer_down",
+                        &[("name", &self.peer_name(id)), ("reason", &t(reason))],
+                    ),
                 ),
             }
         }
@@ -1268,7 +1276,10 @@ impl Engine {
             .collect();
         for id in auto_join {
             if let Err(error) = self.request_join(id, "") {
-                log(view, &format!("Подключение: {error:#}"));
+                log(
+                    view,
+                    &tf("event.connect_failed", &[("error", &format!("{error:#}"))]),
+                );
             }
         }
         self.sent_revisions
@@ -1329,7 +1340,10 @@ impl Engine {
                 view.dropped += 1;
                 // Count malformed packets without flooding logs with untrusted text.
                 if view.dropped.is_power_of_two() {
-                    log(view, &format!("Отклонён пакет: {error:#}"));
+                    log(
+                        view,
+                        &tf("event.packet_rejected", &[("error", &format!("{error:#}"))]),
+                    );
                 }
             }
         }
@@ -1382,7 +1396,7 @@ impl Engine {
                     view.dropped += 1;
                     let message = format!("{error:#}");
                     if self.last_outgoing_error.as_deref() != Some(message.as_str()) {
-                        log(view, &format!("Адаптер: {message}"));
+                        log(view, &tf("event.adapter", &[("message", &message)]));
                         self.last_outgoing_error = Some(message);
                     }
                 }
@@ -1485,7 +1499,7 @@ impl Engine {
                 if let Some((_, lobby, _)) = self.pending.remove(&frame.network) {
                     self.client.matchmaking().leave_lobby(lobby);
                 }
-                log(view, "Конфигурация сети получена и сохранена");
+                log(view, &t("event.config_received"));
             }
             Kind::Ipv4 => {
                 let config = &self
@@ -1621,7 +1635,7 @@ impl Engine {
                     &Frame::encode(Kind::Config, frame.network, &serde_json::to_vec(&next)?)?,
                     true,
                 )?;
-                log(view, "Участник допущен автоматически");
+                log(view, &t("event.member_admitted"));
             }
             Kind::Offer => {
                 let signed: SignedNetwork = serde_json::from_slice(frame.payload)?;
@@ -1840,6 +1854,15 @@ fn log(view: &mut Snapshot, message: &str) {
     }
 }
 
+/// An engine error: logged like any event, and counted so the window can pop
+/// it up without recognizing an «Ошибка:»/«Error:» prefix in some language.
+fn log_error(view: &mut Snapshot, error: &anyhow::Error) {
+    let line = tf("event.error", &[("error", &format!("{error:#}"))]);
+    log(view, &line);
+    view.errors += 1;
+    view.last_error = Some(line);
+}
+
 /// Steam's init path fills a detailed `SteamErrMsg`, but the crate's
 /// `Display` shows only static text ("Some other failure") and drops it —
 /// pull the payload back out so the event log shows the real reason.
@@ -1859,7 +1882,8 @@ fn describe_steam_error(error: &anyhow::Error) -> String {
     format!("{error:#}")
 }
 
-/// Actionable follow-up for Steam init failures we recognize. Field
+/// Actionable follow-up for Steam init failures we recognize, as a catalog
+/// key (`steam_hint.*`; the library one takes `{app_id}`). Field
 /// evidence: re-logging the Steam account once fixed ConnectToGlobalUser,
 /// but a user who had already re-logged still failed with «Cannot create
 /// IPC pipe» while both tokens were clean — that shape is either a
@@ -1869,39 +1893,32 @@ fn wait_hint(
     detail: &str,
     elevated: bool,
     steam: &SteamState,
-    app_id: u32,
     in_library: Option<bool>,
-) -> String {
+) -> Option<&'static str> {
     let connection_failure = detail.contains("ConnectToGlobalUser") || detail.contains("IPC pipe");
     if !connection_failure {
-        return String::new();
+        return None;
     }
     if steam.same_user == Some(false) {
-        return " Steam запущен от другой учётной записи Windows — перезагрузите компьютер, чтобы сбросить зависший процесс.".into();
+        return Some("steam_hint.other_account");
     }
     if steam.processes > 1 {
-        return " Запущено несколько процессов Steam, один из них завис — перезагрузите компьютер, чтобы сбросить его.".into();
+        return Some("steam_hint.several_processes");
     }
     // The app connects to Steam under a published AppID, and Steam refuses the
     // connection outright when the signed-in account holds no license for it.
     // Nothing in the token or process state shows that, so an account that
     // never added the (free) app looks exactly like a blocked one.
     if in_library == Some(false) {
-        return format!(
-            " Похоже, приложения {app_id}, через которое работает FreeC Tier, нет в вашей библиотеке Steam. Откройте store.steampowered.com/app/{app_id} и нажмите «Играть» — оно бесплатное, скачивать его не нужно. Если оно уже в библиотеке, причина внешняя: чаще всего антивирус, добавьте FreeC Tier и Steam в его исключения."
-        );
+        return Some("steam_hint.not_in_library");
     }
-    match (elevated, steam.elevated) {
-        (true, Some(false)) => {
-            " Перезапустите Steam: выйдите из аккаунта и войдите заново. Если не поможет — перезапустите FreeC Tier без прав администратора.".into()
-        }
-        (true, _) => {
-            " Перезапустите Steam: выйдите из аккаунта и войдите заново. Если не поможет — включите контроль учётных записей (UAC) и перезапустите оба приложения.".into()
-        }
+    Some(match (elevated, steam.elevated) {
+        (true, Some(false)) => "steam_hint.restart_unelevated",
+        (true, _) => "steam_hint.restart_uac",
         // Tokens look correct on both sides — the connection is blocked from
         // the outside, which is almost always antivirus.
-        _ => " Steam выглядит запущенным корректно, но соединение с ним блокируется. Чаще всего это антивирус — добавьте FreeC Tier и Steam в его исключения. Если не поможет — перезагрузите компьютер.".into(),
-    }
+        _ => "steam_hint.antivirus",
+    })
 }
 
 /// Whether the signed-in Steam account has this AppID in its library. Steam
@@ -2158,8 +2175,8 @@ pub fn steam_active() -> SteamActive {
     }
 }
 
-/// Why `SteamAPI_Init` cannot succeed yet, or `None` once the client is signed
-/// in and ready.
+/// Why `SteamAPI_Init` cannot succeed yet, as a catalog key (`steam_wait.*`),
+/// or `None` once the client is signed in and ready.
 ///
 /// Games shipped through Steam never need this check: Steam launches them only
 /// after it has a session, so their one and only init call always lands in a
@@ -2169,15 +2186,13 @@ pub fn steam_active() -> SteamActive {
 /// opened (see `run`).
 fn steam_not_ready(state: &SteamState, active: &SteamActive) -> Option<&'static str> {
     if state.processes == 0 {
-        return Some("Steam не запущен — запустите клиент и войдите в аккаунт.");
+        return Some("steam_wait.not_running");
     }
     if active.pid == 0 {
-        return Some("Steam ещё запускается — подождите, пока клиент откроется.");
+        return Some("steam_wait.starting");
     }
     if active.active_user == 0 {
-        return Some(
-            "Steam запущен, но вход в аккаунт не завершён — войдите в аккаунт и выключите режим «Не в сети».",
-        );
+        return Some("steam_wait.signed_out");
     }
     None
 }
@@ -2307,7 +2322,10 @@ fn run(
             match steam_wait_reason() {
                 Some(reason) => {
                     if wait_error.as_deref() != Some(reason) {
-                        log(&mut view, &format!("Ожидание Steam: {reason}"));
+                        log(
+                            &mut view,
+                            &tf("event.steam_wait", &[("reason", &t(reason))]),
+                        );
                         wait_error = Some(reason.to_owned());
                     }
                     // Nothing was spent on the client, so the next look can
@@ -2319,7 +2337,7 @@ fn run(
                     Ok(next) => {
                         wait_error = None;
                         backoff = INIT_RETRY;
-                        log(&mut view, "Steam подключён. Конфигурации загружены.");
+                        log(&mut view, &t("event.steam_ready"));
                         if let Some(lobby) = startup_lobby.take() {
                             next.join(LobbyId::from_raw(lobby));
                         }
@@ -2343,43 +2361,55 @@ fn run(
                             let elevated = process_elevated();
                             let steam = steam_state();
                             let in_library = steam_app_in_library(app_id);
-                            let mut line = format!(
-                                "Ожидание Steam: {detail}{}",
-                                wait_hint(&detail, elevated, &steam, app_id, in_library)
-                            );
+                            let mut reason = detail.clone();
+                            if let Some(hint) = wait_hint(&detail, elevated, &steam, in_library) {
+                                reason.push(' ');
+                                reason.push_str(&tf(hint, &[("app_id", &app_id)]));
+                            }
                             let connection_failure = detail.contains("ConnectToGlobalUser")
                                 || detail.contains("IPC pipe");
                             if connection_failure {
                                 // Process and token states are the diagnosis the
                                 // user cannot see otherwise; log them verbatim.
-                                line.push_str(&format!(
-                                    " [приложение: {} · Steam: {}{}{}{}]",
-                                    if elevated {
-                                        "админ"
+                                let token = |elevated| {
+                                    t(if elevated {
+                                        "steam_diag.admin"
                                     } else {
-                                        "обычный"
-                                    },
-                                    match steam.elevated {
-                                        Some(true) => "админ",
-                                        Some(false) => "обычный",
-                                        None => "не найден",
-                                    },
-                                    if steam.processes > 1 {
-                                        format!(" · процессов: {}", steam.processes)
-                                    } else {
-                                        String::new()
-                                    },
-                                    match steam.same_user {
-                                        Some(false) => " · другой пользователь",
-                                        _ => "",
-                                    },
-                                    match in_library {
-                                        Some(false) => " · нет в библиотеке",
-                                        Some(true) => " · есть в библиотеке",
-                                        None => "",
-                                    },
+                                        "steam_diag.standard"
+                                    })
+                                };
+                                let mut details = Vec::new();
+                                if steam.processes > 1 {
+                                    details.push(tf(
+                                        "steam_diag.processes",
+                                        &[("count", &steam.processes)],
+                                    ));
+                                }
+                                if steam.same_user == Some(false) {
+                                    details.push(t("steam_diag.other_user"));
+                                }
+                                match in_library {
+                                    Some(false) => details.push(t("steam_diag.not_in_library")),
+                                    Some(true) => details.push(t("steam_diag.in_library")),
+                                    None => {}
+                                }
+                                let details: String =
+                                    details.iter().map(|part| format!(" · {part}")).collect();
+                                let steam_token = steam
+                                    .elevated
+                                    .map(token)
+                                    .unwrap_or_else(|| t("steam_diag.not_found"));
+                                reason.push(' ');
+                                reason.push_str(&tf(
+                                    "steam_diag.line",
+                                    &[
+                                        ("app", &token(elevated)),
+                                        ("steam", &steam_token),
+                                        ("details", &details),
+                                    ],
                                 ));
                             }
+                            let line = tf("event.steam_wait", &[("reason", &reason)]);
                             log(&mut view, &line);
                             wait_error = Some(detail);
                         }
@@ -2415,12 +2445,10 @@ fn run(
                     acted = true;
                     let result = match engine.as_mut() {
                         Some(engine) => engine.command(command),
-                        None => Err(anyhow::anyhow!(
-                            "Для этой операции запустите Steam и войдите в аккаунт"
-                        )),
+                        None => Err(anyhow::anyhow!(t("error.steam_required"))),
                     };
                     if let Err(error) = result {
-                        log(&mut view, &format!("Ошибка: {error:#}"));
+                        log_error(&mut view, &error);
                     }
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -2449,7 +2477,10 @@ fn run(
                 result = current.tick(&mut view);
             }
             if let Err(error) = result {
-                log(&mut view, &format!("Сессия приостановлена: {error:#}"));
+                log(
+                    &mut view,
+                    &tf("event.session_paused", &[("error", &format!("{error:#}"))]),
+                );
                 engine = None;
                 view.steam = "waiting".into();
                 view.relay = "unknown".into();
@@ -2512,102 +2543,75 @@ mod wait_hint_tests {
 
     #[test]
     fn connect_to_global_user_gets_actionable_hints() {
-        const APP: u32 = DEFAULT_APP_ID;
-        let normal = SteamState {
-            processes: 1,
-            elevated: Some(false),
-            same_user: Some(true),
+        const GLOBAL: &str = "ConnectToGlobalUser failed.";
+        const PIPE: &str = "Cannot create IPC pipe to Steam client process.";
+        let state = |processes, elevated, same_user| SteamState {
+            processes,
+            elevated,
+            same_user,
         };
-        // Cross-account steam.exe owns the IPC pipe: only a reboot helps.
-        let foreign = SteamState {
-            processes: 1,
-            elevated: Some(false),
-            same_user: Some(false),
-        };
+        let normal = state(1, Some(false), Some(true));
         let owned = Some(true);
-        assert!(
-            wait_hint("ConnectToGlobalUser failed.", false, &foreign, APP, owned)
-                .contains("другой учётной записи")
+        // Cross-account steam.exe owns the IPC pipe: only a reboot helps.
+        assert_eq!(
+            wait_hint(GLOBAL, false, &state(1, Some(false), Some(false)), owned),
+            Some("steam_hint.other_account")
         );
         // Several steam.exe instances: a hung one is holding the pipe.
-        let doubled = SteamState {
-            processes: 2,
-            elevated: Some(false),
-            same_user: Some(true),
-        };
-        assert!(wait_hint(
-            "Cannot create IPC pipe to Steam client process.",
-            false,
-            &doubled,
-            APP,
-            owned
-        )
-        .contains("несколько процессов Steam"));
+        assert_eq!(
+            wait_hint(PIPE, false, &state(2, Some(false), Some(true)), owned),
+            Some("steam_hint.several_processes")
+        );
         // Clean tokens on both sides: point at antivirus, not at Steam restarts
         // the user has already tried.
-        let hint = wait_hint(
-            "Cannot create IPC pipe to Steam client process.",
-            false,
-            &normal,
-            APP,
-            owned,
+        assert_eq!(
+            wait_hint(PIPE, false, &normal, owned),
+            Some("steam_hint.antivirus")
         );
-        assert!(hint.contains("антивирус"));
         // The account never added the app the client connects under: Steam
         // refuses the connection and no token or process state shows why.
-        let missing = wait_hint(
-            "ConnectToGlobalUser failed.",
-            false,
-            &normal,
-            APP,
-            Some(false),
+        assert_eq!(
+            wait_hint(GLOBAL, false, &normal, Some(false)),
+            Some("steam_hint.not_in_library")
         );
-        assert!(missing.contains("библиотеке Steam"), "{missing}");
-        assert!(missing.contains(&APP.to_string()), "{missing}");
+        // The hint names the AppID it is about, in every language.
+        for language in freec_core::i18n::available() {
+            let text = freec_core::i18n::translate(
+                language,
+                "steam_hint.not_in_library",
+                &[("app_id", &DEFAULT_APP_ID)],
+            );
+            assert!(
+                text.contains(&DEFAULT_APP_ID.to_string()),
+                "{language}: {text}"
+            );
+        }
         // Unknown library state must not invent a cause.
-        assert!(
-            wait_hint("ConnectToGlobalUser failed.", false, &normal, APP, None)
-                .contains("антивирус")
+        assert_eq!(
+            wait_hint(GLOBAL, false, &normal, None),
+            Some("steam_hint.antivirus")
         );
         // Elevated app + unelevated Steam keeps the elevation advice.
-        let unelevated_steam = SteamState {
-            processes: 1,
-            elevated: Some(false),
-            same_user: Some(true),
-        };
-        assert!(wait_hint(
-            "ConnectToGlobalUser failed.",
-            true,
-            &unelevated_steam,
-            APP,
-            owned
-        )
-        .contains("без прав администратора"));
-        let elevated_steam = SteamState {
-            processes: 1,
-            elevated: Some(true),
-            same_user: Some(true),
-        };
-        assert!(wait_hint(
-            "ConnectToGlobalUser failed.",
-            true,
-            &elevated_steam,
-            APP,
-            owned
-        )
-        .contains("UAC"));
+        assert_eq!(
+            wait_hint(GLOBAL, true, &normal, owned),
+            Some("steam_hint.restart_unelevated")
+        );
+        let elevated_steam = state(1, Some(true), Some(true));
+        assert_eq!(
+            wait_hint(GLOBAL, true, &elevated_steam, owned),
+            Some("steam_hint.restart_uac")
+        );
         // Unrecognized details and non-init errors get no hint.
         assert_eq!(
             wait_hint(
                 "Steam client appears to be out of date",
                 true,
                 &elevated_steam,
-                APP,
                 Some(false)
             ),
-            ""
+            None
         );
-        assert_eq!(wait_hint("", false, &normal, APP, Some(false)), "");
+        assert_eq!(wait_hint("", false, &normal, Some(false)), None);
     }
 
     /// Live probe of the Steam client diagnostics. Asserts only structural
@@ -2660,7 +2664,7 @@ mod steam_ready_tests {
         // told the user about correctly.
         assert!(steam_not_ready(&running(0), &SteamActive::default())
             .expect("no steam.exe must block init")
-            .contains("не запущен"));
+            .eq("steam_wait.not_running"));
         // steam.exe is up but has not claimed ActiveProcess yet.
         assert!(steam_not_ready(
             &running(1),
@@ -2670,7 +2674,7 @@ mod steam_ready_tests {
             }
         )
         .expect("a client that has not registered must block init")
-        .contains("ещё запускается"));
+        .eq("steam_wait.starting"));
         // The shape behind «ConnectToGlobalUser failed»: client running,
         // registered, nobody signed in.
         assert!(steam_not_ready(
@@ -2681,7 +2685,7 @@ mod steam_ready_tests {
             }
         )
         .expect("a signed-out client must block init")
-        .contains("вход в аккаунт не завершён"));
+        .eq("steam_wait.signed_out"));
         // Signed in: this is the only state worth spending an init on.
         assert_eq!(
             steam_not_ready(

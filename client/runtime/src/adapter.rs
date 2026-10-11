@@ -11,6 +11,7 @@
 
 use anyhow::{Context, Result};
 use freec_core::config::Network;
+use freec_core::i18n::t;
 use std::collections::BTreeMap;
 use std::io;
 use std::net::Ipv4Addr;
@@ -408,10 +409,10 @@ fn client() -> Arc<PipeClient> {
 /// Human-readable reason for a pipe connect failure, for the event log.
 fn describe_connect_error(error: &io::Error) -> String {
     match error.raw_os_error() {
-        Some(2) => "служба не запущена".to_owned(),
-        Some(5) => "доступ к пайпу службы запрещён".to_owned(),
-        Some(231) => "служба занята другим подключением".to_owned(),
-        Some(232) => "служба перезапускается".to_owned(),
+        Some(2) => t("service.not_running"),
+        Some(5) => t("service.access_denied"),
+        Some(231) => t("service.busy"),
+        Some(232) => t("service.restarting"),
         _ => format!("{error}"),
     }
 }
@@ -553,7 +554,7 @@ fn pipe_reader(client: Arc<PipeClient>) {
 fn open_service_adapter(network: Uuid, local_ip: Ipv4Addr) -> Result<Receiver<Vec<u8>>> {
     let client = client();
     if !client.wait_connected(OPEN_TIMEOUT) {
-        anyhow::bail!("Служба FreeC Tier не запущена — переустановите её в настройках приложения");
+        anyhow::bail!(t("service.reinstall_needed"));
     }
     let inbound = client.register_queue(network);
     client.live.lock().unwrap().insert(network, local_ip);
@@ -563,7 +564,7 @@ fn open_service_adapter(network: Uuid, local_ip: Ipv4Addr) -> Result<Receiver<Ve
     if !client.send(frame) {
         client.drop_queue(&network);
         client.live.lock().unwrap().remove(&network);
-        anyhow::bail!("Служба FreeC Tier не запущена — переустановите её в настройках приложения");
+        anyhow::bail!(t("service.reinstall_needed"));
     }
     // A timeout still cleans up: the live map drives adapter re-registration
     // after reconnects, and a stale entry would reopen an adapter the engine
@@ -580,7 +581,7 @@ fn open_service_adapter(network: Uuid, local_ip: Ipv4Addr) -> Result<Receiver<Ve
             client.pending_opens.lock().unwrap().remove(&network);
             client.drop_queue(&network);
             client.live.lock().unwrap().remove(&network);
-            anyhow::bail!("Служба FreeC Tier не отвечает");
+            anyhow::bail!(t("service.no_answer"));
         }
     };
     match result {
@@ -626,10 +627,7 @@ impl Adapter {
             network: self.network,
             packet: bytes.to_vec(),
         })?;
-        anyhow::ensure!(
-            self.client.send_packet(frame),
-            "Служба FreeC Tier не успевает принимать пакеты"
-        );
+        anyhow::ensure!(self.client.send_packet(frame), t("service.overloaded"));
         Ok(())
     }
 }

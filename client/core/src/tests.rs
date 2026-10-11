@@ -607,3 +607,187 @@ mod policy {
         assert_eq!(reopened.owner_key().unwrap().to_bytes(), key.to_bytes());
     }
 }
+
+#[cfg(test)]
+mod i18n {
+    use crate::i18n::{pick_language, placeholders, translate, FALLBACK};
+    use std::collections::{BTreeSet, HashMap};
+
+    fn parse(tag: &str, json: &str) -> HashMap<String, String> {
+        serde_json::from_str(json).unwrap_or_else(|error| panic!("{tag}.json: {error}"))
+    }
+
+    fn source() -> HashMap<String, String> {
+        let (_, json) = crate::i18n::LOCALES
+            .iter()
+            .find(|(tag, _)| *tag == FALLBACK)
+            .expect("the source language ships");
+        parse(FALLBACK, json)
+    }
+
+    /// Translations come back from Crowdin, so every file is checked against
+    /// the source: valid JSON, no keys the code never asks for, and the same
+    /// placeholders — a renamed `{name}` would silently drop the value.
+    #[test]
+    fn every_locale_parses_and_matches_the_source() {
+        let source = source();
+        for (tag, json) in crate::i18n::LOCALES {
+            for (key, text) in parse(tag, json) {
+                let original = source
+                    .get(&key)
+                    .unwrap_or_else(|| panic!("{tag}.json has `{key}`, which en.json lacks"));
+                assert_eq!(
+                    placeholders(&text),
+                    placeholders(original),
+                    "{tag}.json `{key}` placeholders"
+                );
+            }
+        }
+        // Russian is maintained alongside the source, not by Crowdin, so it
+        // must be complete; other languages may lag and fall back to English.
+        let russian = parse("ru", include_str!("../../../locales/ru.json"));
+        let missing: BTreeSet<_> = source
+            .keys()
+            .filter(|key| !russian.contains_key(*key))
+            .collect();
+        assert!(missing.is_empty(), "ru.json lacks {missing:?}");
+    }
+
+    #[test]
+    fn placeholders_fill_and_unknown_text_stays_visible() {
+        assert_eq!(
+            translate(
+                "en",
+                "event.peer_down",
+                &[("name", &"Bob"), ("reason", &"gone")]
+            ),
+            "Connection lost: Bob — gone"
+        );
+        assert_eq!(
+            translate(
+                "ru",
+                "event.peer_down",
+                &[("name", &"Bob"), ("reason", &"gone")]
+            ),
+            "Соединение потеряно: Bob — gone"
+        );
+        // A placeholder nobody filled stays readable rather than vanishing.
+        assert_eq!(
+            translate("en", "event.peer_down", &[]),
+            "Connection lost: {name} — {reason}"
+        );
+        // An unknown language falls back to the source, an unknown key shows itself.
+        assert_eq!(translate("xx", "tray.quit", &[]), "Quit");
+        assert_eq!(translate("ru", "no.such_key", &[]), "no.such_key");
+    }
+
+    /// First-run language. A display language we ship wins; otherwise the
+    /// former Soviet republics outside the Baltics get Russian — by country or
+    /// by interface language — and everybody else English.
+    #[test]
+    fn first_run_language_follows_the_country() {
+        assert_eq!(pick_language("ru-RU", &["RU"]), "ru");
+        assert_eq!(
+            pick_language("ru-LV", &["LV"]),
+            "ru",
+            "a Russian Windows is a choice"
+        );
+        assert_eq!(pick_language("en-US", &["KZ"]), "ru");
+        assert_eq!(pick_language("en-US", &["US", "UZ"]), "ru");
+        assert_eq!(pick_language("uk-UA", &[]), "ru");
+        assert_eq!(pick_language("kk-KZ", &[]), "ru");
+        assert_eq!(pick_language("ka", &["GE"]), "ru");
+        assert_eq!(pick_language("en-GB", &["GB"]), "en");
+        assert_eq!(pick_language("de-DE", &["DE"]), "en");
+        for baltic in ["LV", "LT", "EE"] {
+            assert_eq!(pick_language("en-US", &[baltic]), "en", "{baltic}");
+        }
+        assert_eq!(pick_language("lv-LV", &["LV"]), "en");
+        assert_eq!(pick_language("lt-LT", &["LT"]), "en");
+        assert_eq!(pick_language("et-EE", &["EE"]), "en");
+        assert_eq!(pick_language("", &[]), "en");
+    }
+
+    /// Every key the code asks for exists in the source catalog. A scan, not a
+    /// parser: literal keys after `t(`, `tf(`, `h(` and in `data-i18n*`
+    /// attributes, in every file that renders user-facing text.
+    #[test]
+    fn every_key_used_in_code_exists() {
+        let source = source();
+        let files = [
+            (
+                "runtime/src/lib.rs",
+                include_str!("../../runtime/src/lib.rs"),
+            ),
+            (
+                "runtime/src/steam.rs",
+                include_str!("../../runtime/src/steam.rs"),
+            ),
+            (
+                "runtime/src/adapter.rs",
+                include_str!("../../runtime/src/adapter.rs"),
+            ),
+            (
+                "gui/src-tauri/src/main.rs",
+                include_str!("../../gui/src-tauri/src/main.rs"),
+            ),
+            ("core/src/admission.rs", include_str!("admission.rs")),
+            ("gui/src/main.ts", include_str!("../../gui/src/main.ts")),
+        ];
+        let mut found = 0;
+        for (name, text) in files {
+            for key in used_keys(text) {
+                found += 1;
+                assert!(
+                    source.contains_key(key),
+                    "{name} uses `{key}`, missing from en.json"
+                );
+            }
+        }
+        assert!(
+            found > 100,
+            "the scan found only {found} keys — is it still matching?"
+        );
+    }
+
+    fn used_keys(text: &str) -> Vec<&str> {
+        let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        let mut keys = Vec::new();
+        for (index, _) in text.match_indices('(') {
+            let head = &text[..index];
+            let call = ["tf", "t", "h"].into_iter().find(|name| {
+                head.ends_with(name)
+                    && !head[..head.len() - name.len()]
+                        .bytes()
+                        .last()
+                        .is_some_and(ident)
+            });
+            if call.is_some() {
+                keys.extend(quoted(&text[index + 1..]));
+            }
+        }
+        for (index, _) in text.match_indices("data-i18n") {
+            let rest = &text[index..];
+            if let Some(eq) = rest.find('=') {
+                if rest[..eq].bytes().all(|b| ident(b) || b == b'-') {
+                    keys.extend(quoted(&rest[eq + 1..]));
+                }
+            }
+        }
+        keys.retain(|key| {
+            key.contains('.')
+                && key
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'.')
+        });
+        keys
+    }
+
+    /// The string literal right after an opening paren or `=`, if any.
+    fn quoted(rest: &str) -> Option<&str> {
+        let rest = rest.trim_start();
+        let quote = rest.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+        let body = &rest[1..];
+        body.find(quote).map(|end| &body[..end])
+    }
+}

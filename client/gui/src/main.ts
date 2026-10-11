@@ -2,12 +2,13 @@ import { invoke, isTauri } from '@tauri-apps/api/core';
 import morphdom from 'morphdom';
 import './fonts';
 import './styles.css';
+import { bindLanguagePicker, h, initialLanguage, language, languagePicker, setLanguage, t, translateStatic } from './i18n';
 
 type Peer = { steam_id: string; name: string; ip: string; active: boolean; state: string; ping_ms?: number; can_invite: boolean; may_invite: boolean; can_kick: boolean; may_kick: boolean };
 type Network = { id: string; name: string; subnet: string; owner: string; revision: number; adapter: boolean; lobby?: string; public: boolean; can_invite: boolean; password: boolean; members: Peer[] };
-type Snapshot = { steam: string; steam_id?: string; nickname?: string; relay: string; networks: Network[]; friends: { steam_id: string; name: string }[]; events: string[]; received: number; sent: number; dropped: number; joins?: { id: string; name: string; password: boolean }[]; public_networks?: { lobby: string; name: string }[] };
+type Snapshot = { steam: string; steam_id?: string; nickname?: string; relay: string; networks: Network[]; friends: { steam_id: string; name: string }[]; events: string[]; errors?: number; last_error?: string; received: number; sent: number; dropped: number; joins?: { id: string; name: string; password: boolean }[]; public_networks?: { lobby: string; name: string }[] };
 type Command = { type: string; [key: string]: unknown };
-type Settings = { minimize_to_tray: boolean; check_updates: boolean; autostart?: boolean; start_in_tray?: boolean; theme: string; onboarded?: boolean; accent?: string; custom_colors?: Record<string, string>; mtu?: number };
+type Settings = { minimize_to_tray: boolean; check_updates: boolean; autostart?: boolean; start_in_tray?: boolean; theme: string; onboarded?: boolean; accent?: string; custom_colors?: Record<string, string>; mtu?: number; language?: string };
 type SteamAppState = { app_id: number; in_library: boolean | null };
 
 let state: Snapshot = { steam: 'waiting', relay: 'unknown', networks: [], friends: [], events: [], received: 0, sent: 0, dropped: 0 };
@@ -15,7 +16,8 @@ let selected: string | undefined;
 let previous = '';
 let page: 'networks' | 'settings' | 'diagnostics' | 'discover' = 'networks';
 let preferences: Settings = { minimize_to_tray: true, check_updates: true, autostart: false, theme: 'dark' };
-let updateMessage = 'Проверок ещё не было.';
+// Kept as a catalog key, not as text, so a language switch re-renders it.
+let updateStatus: { key: string; params?: Record<string, string> } = { key: 'update.never' };
 let updateVersion: string | null = null;
 let updating = false;
 let busy = false;
@@ -34,20 +36,23 @@ const MTU_MIN = 576;
 const MTU_MAX = 1500;
 const MTU_DEFAULT = 1280;
 const MTU_PRESETS: { value: number; hint: string }[] = [
-  { value: 1280, hint: 'Рекомендуется: размер, который ожидают игры в локальной сети.' },
-  { value: 1152, hint: 'Пакет целиком помещается в одну посылку Steam — меньше потерь на плохом канале, но некоторые игры ждут размер побольше.' },
-  { value: 1500, hint: 'Как в обычной Ethernet-сети. Steam будет делить большие пакеты на части.' },
+  { value: 1280, hint: 'mtu.hint_1280' },
+  { value: 1152, hint: 'mtu.hint_1152' },
+  { value: 1500, hint: 'mtu.hint_1500' },
 ];
 const app = document.querySelector<HTMLDivElement>('#app')!;
+setLanguage(initialLanguage());
+// Static markup carries catalog keys (`data-i18n*`) instead of text, so a
+// language switch refills it in place — dialogs stay open through a switch.
 app.innerHTML = `
-  <nav class="rail" aria-label="Разделы">
-    <a class="brand" href="#" aria-label="FreeC Tier — мои сети"><span class="brand-mark" aria-hidden="true">F</span><small class="brand-version sr-only" id="brand-version"></small></a>
+  <nav class="rail" data-i18n-aria-label="nav.sections">
+    <a class="brand" href="#" data-i18n-aria-label="nav.home"><span class="brand-mark" aria-hidden="true">F</span><small class="brand-version sr-only" id="brand-version"></small></a>
     <span class="rail-sep" aria-hidden="true"></span>
-    <div id="network-list" role="group" aria-label="Сохранённые сети"></div>
-    <button class="rail-button add" id="create" title="Создать сеть" aria-label="Создать сеть">+</button>
-    <button class="rail-button live" id="discover" title="Публичные сети">LIVE</button>
+    <div id="network-list" role="group" data-i18n-aria-label="nav.saved_networks"></div>
+    <button class="rail-button add" id="create" data-i18n-title="nav.create" data-i18n-aria-label="nav.create">+</button>
+    <button class="rail-button live" id="discover" data-i18n-title="nav.public">LIVE</button>
     <span class="rail-grow"></span>
-    <button class="rail-button cog" id="settings" title="Настройки" aria-label="Настройки"><span aria-hidden="true">⚙</span></button>
+    <button class="rail-button cog" id="settings" data-i18n-title="nav.settings" data-i18n-aria-label="nav.settings"><span aria-hidden="true">⚙</span></button>
   </nav>
   <div class="main">
     <header class="topbar"><div class="topbar-title" id="page-title">FreeC Tier</div><span class="topbar-sub" id="page-sub"></span><span class="topbar-grow"></span><button id="header-update" class="header-update" hidden></button><div id="session" role="status"></div></header>
@@ -55,13 +60,14 @@ app.innerHTML = `
   </div>
   <div id="notice" role="status" hidden></div>
   <div id="joins-bar" role="status" hidden></div>
-  <dialog id="create-dialog"><form id="create-form"><div class="dialog-heading"><h2>Новая сеть</h2><button class="icon-button close" type="button" aria-label="Закрыть">×</button></div><p>Подсеть 10.77.x.0/24 назначится автоматически.</p><label for="network-name">Название</label><input id="network-name" name="name" maxlength="64" required placeholder="Например, Minecraft" autocomplete="off" /><label>Доступ</label><div class="segmented wide" role="group" aria-label="Доступ"><button type="button" id="create-private" class="seg active" aria-pressed="true">Приватная</button><button type="button" id="create-public" class="seg" aria-pressed="false">Публичная</button></div><label id="create-password-label" hidden>Пароль (необязательно)<input id="create-password" type="password" maxlength="128" autocomplete="new-password" /></label><p class="hint">В публичной сети участники с разрешением могут приглашать друзей.</p><div class="dialog-actions"><button type="button" class="button close">Отмена</button><button class="button primary" type="submit">Создать сеть</button></div></form></dialog>
-  <dialog id="join-dialog"><form id="join-form"><div class="dialog-heading"><h2>Подключиться по lobby</h2><button class="icon-button close" type="button" aria-label="Закрыть">×</button></div><label for="lobby-id">Steam Lobby ID</label><input id="lobby-id" name="lobby" required inputmode="numeric" pattern="[0-9]{1,20}" placeholder="64-битный идентификатор" /><div class="dialog-actions"><button type="button" class="button close">Отмена</button><button class="button primary" type="submit">Присоединиться</button></div></form></dialog>
-  <dialog id="invite-dialog"><div class="dialog-heading"><h2>Пригласить друга</h2><button class="icon-button close" aria-label="Закрыть">×</button></div><div id="friend-list"></div><button id="overlay" class="button">Открыть список в Steam</button></dialog>
-  <dialog id="delete-dialog"><form id="delete-form"><div class="dialog-heading"><h2>Удалить сеть?</h2><button class="icon-button close" type="button" aria-label="Закрыть">×</button></div><p id="delete-description"></p><p>У остальных участников сеть останется.</p><div class="dialog-actions"><button type="button" class="button close">Отмена</button><button class="button danger" type="submit">Удалить сеть</button></div></form></dialog>
-  <dialog id="password-dialog"><form id="password-form"><div class="dialog-heading"><h2 id="password-title">Пароль сети</h2><button class="icon-button close" type="button" aria-label="Закрыть">×</button></div><label for="password-input">Пароль</label><input id="password-input" type="password" maxlength="128" autocomplete="current-password" /><p class="hint" id="password-hint"></p><div class="dialog-actions"><button class="button primary" type="submit">Продолжить</button></div></form></dialog>
-  <dialog id="steam-help-dialog"><div class="dialog-heading"><h2>Скрыть статус в Steam</h2><button class="icon-button close" type="button" aria-label="Закрыть">×</button></div><p class="steam-help-note">FreeC Tier подключается к Steam под идентификатором игры, поэтому Steam считает её запущенной.</p><div class="steam-help">${hideStep(1)}</div></dialog>
+  <dialog id="create-dialog"><form id="create-form"><div class="dialog-heading"><h2 data-i18n="create.title"></h2><button class="icon-button close" type="button" data-i18n-aria-label="common.close">×</button></div><p data-i18n="create.subnet_note"></p><label for="network-name" data-i18n="create.name"></label><input id="network-name" name="name" maxlength="64" required data-i18n-placeholder="create.name_placeholder" autocomplete="off" /><label data-i18n="access.label"></label><div class="segmented wide" role="group" data-i18n-aria-label="access.label"><button type="button" id="create-private" class="seg active" aria-pressed="true" data-i18n="access.private"></button><button type="button" id="create-public" class="seg" aria-pressed="false" data-i18n="access.public"></button></div><label id="create-password-label" hidden><span data-i18n="create.password"></span><input id="create-password" type="password" maxlength="128" autocomplete="new-password" /></label><p class="hint" data-i18n="create.hint"></p><div class="dialog-actions"><button type="button" class="button close" data-i18n="common.cancel"></button><button class="button primary" type="submit" data-i18n="create.submit"></button></div></form></dialog>
+  <dialog id="join-dialog"><form id="join-form"><div class="dialog-heading"><h2 data-i18n="join.title"></h2><button class="icon-button close" type="button" data-i18n-aria-label="common.close">×</button></div><label for="lobby-id" data-i18n="join.lobby_id"></label><input id="lobby-id" name="lobby" required inputmode="numeric" pattern="[0-9]{1,20}" data-i18n-placeholder="join.lobby_placeholder" /><div class="dialog-actions"><button type="button" class="button close" data-i18n="common.cancel"></button><button class="button primary" type="submit" data-i18n="join.submit"></button></div></form></dialog>
+  <dialog id="invite-dialog"><div class="dialog-heading"><h2 data-i18n="invite.title"></h2><button class="icon-button close" data-i18n-aria-label="common.close">×</button></div><div id="friend-list"></div><button id="overlay" class="button" data-i18n="invite.overlay"></button></dialog>
+  <dialog id="delete-dialog"><form id="delete-form"><div class="dialog-heading"><h2 data-i18n="delete.title"></h2><button class="icon-button close" type="button" data-i18n-aria-label="common.close">×</button></div><p id="delete-description"></p><p data-i18n="delete.others_keep"></p><div class="dialog-actions"><button type="button" class="button close" data-i18n="common.cancel"></button><button class="button danger" type="submit" data-i18n="delete.submit"></button></div></form></dialog>
+  <dialog id="password-dialog"><form id="password-form"><div class="dialog-heading"><h2 id="password-title" data-i18n="password.title"></h2><button class="icon-button close" type="button" data-i18n-aria-label="common.close">×</button></div><label for="password-input" data-i18n="password.label"></label><input id="password-input" type="password" maxlength="128" autocomplete="current-password" /><p class="hint" id="password-hint"></p><div class="dialog-actions"><button class="button primary" type="submit" data-i18n="password.continue"></button></div></form></dialog>
+  <dialog id="steam-help-dialog"><div class="dialog-heading"><h2 data-i18n="steam_help.title"></h2><button class="icon-button close" type="button" data-i18n-aria-label="common.close">×</button></div><p class="steam-help-note" data-i18n="steam_help.note"></p><div class="steam-help">${hideStep(1)}</div></dialog>
   <dialog id="welcome-dialog"></dialog>`;
+translateStatic();
 
 const content = document.querySelector<HTMLElement>('#content')!;
 // Keyed DOM reconciliation keeps focus, open details and scroll containers alive.
@@ -69,13 +75,16 @@ function patch(element: HTMLElement, html: string) {
   const next = element.cloneNode(false) as HTMLElement; next.innerHTML = html;
   morphdom(element, next, { childrenOnly: true, onBeforeElUpdated(from, to) {
     if (from instanceof HTMLDetailsElement) to.toggleAttribute('open', from.open);
+    // An open language menu must survive the welcome dialog's 2 s re-render.
+    if (from.classList.contains('lang-picker') && from.querySelector('.lang-menu:not([hidden])')) return false;
     if (from.id === 'event-log' || from.id === 'counters') return false;
     return !from.isEqualNode(to);
   } });
 }
 function contentHTML(html: string) { patch(content, html); }
 function escape(value: string) { return value.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!)); }
-const labels: Record<string, string> = { connected: 'Подключён', connecting: 'Подключение…', reconnecting: 'Переподключение…', offline: 'Не в сети', local: 'Этот компьютер', removed: 'Доступ отозван' };
+const PEER_STATES = ['connected', 'connecting', 'reconnecting', 'offline', 'local', 'removed'];
+function peerLabel(value: string) { return PEER_STATES.includes(value) ? t(`peer.${value}`) : value; }
 function network() { return state.networks.find(n => n.id === selected); }
 function appLabel() { return appVersion ? `FreeC Tier ${appVersion}` : 'FreeC Tier'; }
 // Identity colors: avatars differ by name so the rail stays scannable, while
@@ -123,20 +132,29 @@ function setAccent(color?: string) {
 }
 // Three alternatives next to whatever the current theme calls its own accent.
 const ACCENT_SLOTS = ['--accent-preset', '--accent-slot-1', '--accent-slot-2', '--accent-slot-3'] as const;
-const ACCENT_LABELS = ['По умолчанию', 'Фиолетовый', 'Бирюзовый', 'Зелёный'];
+const ACCENT_LABELS = ['accent.default', 'accent.violet', 'accent.teal', 'accent.green'];
 const THEME_TOKENS = ['accent', 'accent-hover', 'accent-soft', 'focus', 'text', 'muted', 'faint', 'bg', 'surface', 'surface-2', 'surface-3', 'line', 'line-soft', 'success', 'warning', 'danger'] as const;
-const THEME_LABELS: Record<string, string> = {
-  accent: 'Акцент', 'accent-hover': 'Акцент (наведение)', 'accent-soft': 'Акцент (подложка)', focus: 'Обводка фокуса',
-  text: 'Текст', muted: 'Приглушённый текст', faint: 'Слабый текст', bg: 'Фон',
-  surface: 'Поверхность', 'surface-2': 'Панель слева', 'surface-3': 'Поверхность 3',
-  line: 'Линии', 'line-soft': 'Тонкие линии',
-  success: 'Успех', warning: 'Предупреждение', danger: 'Опасность',
-};
+// Catalog key of a theme token's label: `surface-2` → `theme.token_surface_2`.
+function tokenLabel(token: string) { return t(`theme.token_${token.replace(/-/g, '_')}`); }
 const THEME_GROUPS: Array<[string, string[]]> = [
-  ['Основные цвета', ['bg', 'surface', 'surface-2', 'surface-3', 'text', 'muted', 'faint', 'line', 'line-soft']],
-  ['Акцент', ['accent', 'accent-hover', 'accent-soft', 'focus']],
-  ['Статусы', ['success', 'warning', 'danger']],
+  ['theme.group_base', ['bg', 'surface', 'surface-2', 'surface-3', 'text', 'muted', 'faint', 'line', 'line-soft']],
+  ['theme.group_accent', ['accent', 'accent-hover', 'accent-soft', 'focus']],
+  ['theme.group_status', ['success', 'warning', 'danger']],
 ];
+// Everything on screen follows at once: static markup through its keys, the
+// current page and any open dialog by re-rendering. Lines already in the
+// engine's event log keep the language they were written in.
+function applyLanguage(code: string) {
+  setLanguage(code);
+  translateStatic();
+  render();
+  if (document.querySelector<HTMLDialogElement>('#welcome-dialog')!.open) renderWelcome();
+  if (document.querySelector<HTMLDialogElement>('#invite-dialog')!.open) openInvite();
+}
+function chooseLanguage(code: string) {
+  applyLanguage(code);
+  void savePreferences({ ...preferences, language: language() });
+}
 function setVersion(value: string) {
   appVersion = value;
   const brand = document.querySelector('#brand-version'); if (brand) brand.textContent = value;
@@ -144,7 +162,7 @@ function setVersion(value: string) {
 }
 function notice(message: string) { const el = document.querySelector<HTMLElement>('#notice')!; el.textContent = message; el.hidden = false; setTimeout(() => { el.hidden = true; }, 7000); }
 async function send(command: Command): Promise<boolean> {
-  if (!isTauri()) { notice('Это браузерный просмотр. Для работы со Steam запустите desktop-клиент.'); return false; }
+  if (!isTauri()) { notice(t('notice.browser_preview')); return false; }
   if (busy) return false;
   busy = true;
   try { await invoke('dispatch', { command }); return true; }
@@ -156,7 +174,7 @@ function render() {
   renderJoinsBar();
   renderHeaderUpdate();
   const connected = state.steam === 'online';
-  patch(document.querySelector<HTMLElement>('#session')!, `<span class="steam-pill ${connected ? 'online' : 'offline'}"><i aria-hidden="true"></i>${connected ? 'Steam подключён' : 'Steam не подключён'}</span>${state.nickname ? `<span class="account"><span class="account-face ${hueClass(state.nickname)}" aria-hidden="true">${face(state.steam_id, state.nickname)}</span><span class="account-name">${escape(state.nickname)}</span></span>` : ''}`);
+  patch(document.querySelector<HTMLElement>('#session')!, `<span class="steam-pill ${connected ? 'online' : 'offline'}"><i aria-hidden="true"></i>${connected ? h('session.steam_on') : h('session.steam_off')}</span>${state.nickname ? `<span class="account"><span class="account-face ${hueClass(state.nickname)}" aria-hidden="true">${face(state.steam_id, state.nickname)}</span><span class="account-name">${escape(state.nickname)}</span></span>` : ''}`);
   patch(document.querySelector<HTMLElement>('#network-list')!, state.networks.map(n => {
     const current = n.id === selected && page === 'networks';
     return `<button id="network-${n.id}" class="rail-net ${hueClass(n.name)} ${current ? 'selected' : ''}" data-select="${n.id}" title="${escape(n.name)}" aria-label="${escape(n.name)}" ${current ? 'aria-current="page"' : ''}><span class="rail-pill" aria-hidden="true"></span><span class="rail-avatar" aria-hidden="true">${initials(n.name)}</span><span class="rail-dot ${n.adapter ? 'on' : ''}" aria-hidden="true"></span></button>`;
@@ -169,12 +187,12 @@ function render() {
   if (page === 'discover') { renderDiscovery(); return; }
   const active = network();
   if (!active) {
-    heading('Мои сети', 'Пока ни одной сети');
-    contentHTML(`<section class="empty-state" id="empty"><svg class="empty-art" viewBox="0 0 180 110" role="img" aria-hidden="true"><path d="M42 48 L90 60 M138 48 L90 60" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" /><rect x="20" y="14" width="44" height="34" rx="9" fill="none" stroke="currentColor" stroke-width="2" /><rect x="116" y="14" width="44" height="34" rx="9" fill="none" stroke="currentColor" stroke-width="2" /><rect x="66" y="60" width="48" height="38" rx="10" fill="var(--accent)" /></svg><h1>Объедините компьютеры в одну сеть</h1><p>Как в одной локальной сети — для игр и любых LAN-приложений.</p><button class="button primary" id="create-first">Создать первую сеть</button></section>`);
+    heading(t('home.title'), t('home.empty_sub'));
+    contentHTML(`<section class="empty-state" id="empty"><svg class="empty-art" viewBox="0 0 180 110" role="img" aria-hidden="true"><path d="M42 48 L90 60 M138 48 L90 60" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" /><rect x="20" y="14" width="44" height="34" rx="9" fill="none" stroke="currentColor" stroke-width="2" /><rect x="116" y="14" width="44" height="34" rx="9" fill="none" stroke="currentColor" stroke-width="2" /><rect x="66" y="60" width="48" height="38" rx="10" fill="var(--accent)" /></svg><h1>${h('empty.title')}</h1><p>${h('empty.text')}</p><button class="button primary" id="create-first">${h('empty.create')}</button></section>`);
     document.querySelector<HTMLButtonElement>('#create-first')!.onclick = openCreate;
     return;
   }
-  heading(active.name, `Виртуальная сеть · ${active.members.length} участн.`);
+  heading(active.name, t('network.sub', { count: active.members.length }));
   renderNetwork(active, connected);
 }
 function heading(title: string, sub: string) {
@@ -190,37 +208,36 @@ function renderNetwork(active: Network, connected: boolean) {
   const away = active.members.filter(m => !online(m));
   const pings = present.map(m => m.ping_ms).filter((p): p is number => p != null);
   const average = pings.length ? Math.round(pings.reduce((a, b) => a + b, 0) / pings.length) : '—';
-  const statusText = !local?.active ? 'Доступ к сети отозван владельцем'
-    : on ? 'Сеть включена · вы в одной LAN'
-    : 'Сеть выключена · нажмите, чтобы включить';
+  const statusText = h(!local?.active ? 'network.status_revoked' : on ? 'network.status_on' : 'network.status_off');
+  const power = h(on ? 'network.turn_off' : 'network.turn_on');
   contentHTML(`<section class="page net-page" id="detail-${active.id}">
     <section class="hero ${on ? 'on' : ''}">
-      <div class="hero-power">${on ? '<span class="hero-ring" aria-hidden="true"></span>' : ''}<button id="toggle-adapter" class="power" aria-label="${on ? 'Выключить' : 'Включить'}" title="${on ? 'Выключить' : 'Включить'}" ${!connected || !local?.active ? 'disabled' : ''}><svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M12 3v8M6.3 6.3a8 8 0 1 0 11.4 0" /></svg></button></div>
+      <div class="hero-power">${on ? '<span class="hero-ring" aria-hidden="true"></span>' : ''}<button id="toggle-adapter" class="power" aria-label="${power}" title="${power}" ${!connected || !local?.active ? 'disabled' : ''}><svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M12 3v8M6.3 6.3a8 8 0 1 0 11.4 0" /></svg></button></div>
       <div class="hero-body">
-        <div class="hero-name"><h1>${escape(active.name)}</h1><span class="tag">${active.public ? 'Публичная' : 'Приватная'}</span></div>
+        <div class="hero-name"><h1>${escape(active.name)}</h1><span class="tag">${h(active.public ? 'access.public' : 'access.private')}</span></div>
         <p class="hero-status">${statusText}</p>
-        <div class="hero-actions">${local?.active ? `<button id="copy-ip" class="ip-chip" title="Скопировать адрес"><span class="ip-label">ВАШ IP</span><code>${escape(local.ip)}</code><span class="ip-copy">${copied === 1 ? 'СКОПИРОВАНО' : 'КОПИРОВАТЬ'}</span></button>` : ''}<button id="invite" class="button primary" ${!active.can_invite || !connected ? 'disabled' : ''}>+ Пригласить друга</button></div>
+        <div class="hero-actions">${local?.active ? `<button id="copy-ip" class="ip-chip" title="${h('network.copy_ip')}"><span class="ip-label">${h('network.your_ip')}</span><code>${escape(local.ip)}</code><span class="ip-copy">${h(copied === 1 ? 'network.copied' : 'network.copy')}</span></button>` : ''}<button id="invite" class="button primary" ${!active.can_invite || !connected ? 'disabled' : ''}>${h('network.invite')}</button></div>
       </div>
-      <div class="hero-stats"><div><strong>${present.length}<small>/${active.members.length}</small></strong><span>в сети</span></div><div><strong>${average}<small> мс</small></strong><span>средний пинг</span></div></div>
+      <div class="hero-stats"><div><strong>${present.length}<small>/${active.members.length}</small></strong><span>${h('network.online')}</span></div><div><strong>${average}<small> ${h('common.ms')}</small></strong><span>${h('network.average_ping')}</span></div></div>
     </section>
-    ${!connected ? '<p class="hint warning">Steam не подключён — включение сети и приглашения недоступны. Причина в журнале событий на вкладке «Диагностика».</p>' : ''}
+    ${!connected ? `<p class="hint warning">${h('network.steam_off_warning')}</p>` : ''}
     <div class="net-grid">
-      <section class="members" aria-label="Участники">
-        <h2 class="members-head">В СЕТИ — ${present.length}</h2>
-        ${present.map(peer => member(active, peer, owner, connected)).join('') || '<p class="hint">Пока никого. Пригласите друга из Steam.</p>'}
-        ${away.length ? `<h2 class="members-head">НЕ В СЕТИ — ${away.length}</h2>${away.map(peer => member(active, peer, owner, connected)).join('')}` : ''}
+      <section class="members" aria-label="${h('network.members')}">
+        <h2 class="members-head">${h('network.online_head', { count: present.length })}</h2>
+        ${present.map(peer => member(active, peer, owner, connected)).join('') || `<p class="hint">${h('network.nobody')}</p>`}
+        ${away.length ? `<h2 class="members-head">${h('network.offline_head', { count: away.length })}</h2>${away.map(peer => member(active, peer, owner, connected)).join('')}` : ''}
       </section>
       <aside class="net-side">
-        <div class="panel"><div class="panel-head">ДОСТУП</div>
+        <div class="panel"><div class="panel-head">${h('network.access_head')}</div>
           ${owner
-            ? `<div class="segmented wide" role="group" aria-label="Доступ"><button id="access-private" class="seg ${active.public ? '' : 'active'}" aria-pressed="${!active.public}" ${connected ? '' : 'disabled'}>Приватная</button><button id="access-public" class="seg ${active.public ? 'active' : ''}" aria-pressed="${active.public}" ${connected ? '' : 'disabled'}>Публичная</button></div>`
-            : `<p class="row-label">${active.public ? 'Публичная' : 'Приватная'}</p>`}
-          <p class="hint">${active.public ? 'Сеть видна в списке публичных. Участники с правом могут приглашать друзей.' : 'Вход только по приглашению владельца или участников с правом приглашать.'}</p>
-          ${active.public && owner ? `<button class="button wide" id="set-password" ${connected ? '' : 'disabled'}>Пароль: ${active.password ? 'задан' : 'не задан'} · ${active.password ? 'Изменить' : 'Установить'}</button>` : ''}
+            ? `<div class="segmented wide" role="group" aria-label="${h('access.label')}"><button id="access-private" class="seg ${active.public ? '' : 'active'}" aria-pressed="${!active.public}" ${connected ? '' : 'disabled'}>${h('access.private')}</button><button id="access-public" class="seg ${active.public ? 'active' : ''}" aria-pressed="${active.public}" ${connected ? '' : 'disabled'}>${h('access.public')}</button></div>`
+            : `<p class="row-label">${h(active.public ? 'access.public' : 'access.private')}</p>`}
+          <p class="hint">${h(active.public ? 'access.public_hint' : 'access.private_hint')}</p>
+          ${active.public && owner ? `<button class="button wide" id="set-password" ${connected ? '' : 'disabled'}>${h(active.password ? 'network.password_set' : 'network.password_unset')}</button>` : ''}
         </div>
-        <div class="panel"><div class="panel-head">ТРАФИК · ПАКЕТЫ</div><div class="meter"><span>↑ Отправлено</span><b id="traffic-sent">${state.sent}</b></div><div class="meter"><span>↓ Получено</span><b id="traffic-received">${state.received}</b></div></div>
-        <button class="side-link" id="go-diagnostics">Диагностика <span aria-hidden="true">→</span></button>
-        <button class="text-button danger" id="delete-network">Удалить сеть с компьютера</button>
+        <div class="panel"><div class="panel-head">${h('network.traffic_head')}</div><div class="meter"><span>↑ ${h('network.sent')}</span><b id="traffic-sent">${state.sent}</b></div><div class="meter"><span>↓ ${h('network.received')}</span><b id="traffic-received">${state.received}</b></div></div>
+        <button class="side-link" id="go-diagnostics">${h('diagnostics.title')} <span aria-hidden="true">→</span></button>
+        <button class="text-button danger" id="delete-network">${h('network.delete')}</button>
       </aside>
     </div></section>`);
   document.querySelector<HTMLButtonElement>('#invite')!.onclick = openInvite;
@@ -244,9 +261,7 @@ function renderNetwork(active: Network, connected: boolean) {
   document.querySelector<HTMLButtonElement>('#delete-network')!.onclick = () => {
     const dialog = document.querySelector<HTMLDialogElement>('#delete-dialog')!;
     dialog.dataset.network = active.id;
-    document.querySelector('#delete-description')!.textContent = owner
-      ? `«${active.name}» будет удалена с этого компьютера. Как владелец вы потеряете управление сетью, если не сохраните её конфигурацию.`
-      : `«${active.name}» будет удалена с этого компьютера.`;
+    document.querySelector('#delete-description')!.textContent = t(owner ? 'delete.owner' : 'delete.member', { name: active.name });
     dialog.showModal();
   };
   document.querySelectorAll<HTMLButtonElement>('[data-member]').forEach(button => button.onclick = () => send({ type: button.dataset.active === 'true' ? 'revoke' : 'readmit', network: active.id, steam_id: button.dataset.member }));
@@ -257,56 +272,59 @@ function member(active: Network, peer: Peer, owner: boolean, connected: boolean)
   const here = online(peer);
   const name = peer.name || peer.steam_id;
   const role: string[] = [];
-  if (peer.steam_id === active.owner) role.push('ВЛАДЕЛЕЦ');
-  else if (peer.may_invite) role.push('МОЖЕТ ПРИГЛАШАТЬ');
-  if (peer.steam_id === state.steam_id) role.push('ВЫ');
+  if (peer.steam_id === active.owner) role.push(h('member.owner'));
+  else if (peer.may_invite) role.push(h('member.can_invite'));
+  if (peer.steam_id === state.steam_id) role.push(h('member.you'));
   const lit = peer.ping_ms == null ? 4 : peer.ping_ms < 40 ? 4 : peer.ping_ms < 80 ? 3 : 2;
   const manage = owner && peer.steam_id !== active.owner;
   const removable = manage || (peer.may_kick && peer.active);
   return `<div class="member ${hueClass(name)} ${here ? '' : 'off'}" id="peer-${active.id}-${peer.steam_id}" data-q="${here ? quality(peer.ping_ms) : 'none'}">
     <div class="member-face"><span class="avatar" aria-hidden="true">${face(peer.steam_id, name)}</span><span class="member-dot ${here ? escape(peer.state) : ''}" aria-hidden="true"></span></div>
     <div class="member-id"><div class="member-name"><strong>${escape(name)}</strong>${role.length ? `<span class="role ${peer.steam_id === active.owner ? 'owner' : ''}">${role.join(' · ')}</span>` : ''}</div><code>${escape(peer.ip)}</code></div>
-    ${manage ? `<div class="member-perms"><label class="chip"><input type="checkbox" data-permission="invite" data-peer="${peer.steam_id}" aria-label="Приглашать: ${escape(name)}" ${peer.can_invite ? 'checked' : ''} ${connected ? '' : 'disabled'} />Приглашать</label><label class="chip"><input type="checkbox" data-permission="kick" data-peer="${peer.steam_id}" aria-label="Исключать: ${escape(name)}" ${peer.can_kick ? 'checked' : ''} ${connected ? '' : 'disabled'} />Исключать</label></div>` : ''}
+    ${manage ? `<div class="member-perms"><label class="chip"><input type="checkbox" data-permission="invite" data-peer="${peer.steam_id}" aria-label="${h('member.invite_aria', { name: escape(name) })}" ${peer.can_invite ? 'checked' : ''} ${connected ? '' : 'disabled'} />${h('member.invite')}</label><label class="chip"><input type="checkbox" data-permission="kick" data-peer="${peer.steam_id}" aria-label="${h('member.kick_aria', { name: escape(name) })}" ${peer.can_kick ? 'checked' : ''} ${connected ? '' : 'disabled'} />${h('member.kick')}</label></div>` : ''}
     ${here
-      ? `<div class="bars" role="img" aria-label="${escape(labels[peer.state] || peer.state)}">${[0, 1, 2, 3].map(i => `<i class="${i < lit ? 'on' : ''}"></i>`).join('')}</div><div class="member-ping">${peer.ping_ms == null ? '—' : `${peer.ping_ms} мс`}</div>`
-      : `<span class="member-state">${escape(peer.active ? labels[peer.state] || peer.state : 'Доступ отозван')}</span>`}
-    ${removable ? `<button class="text-button danger" data-member="${peer.steam_id}" data-active="${peer.active}" ${connected ? '' : 'disabled'}>${peer.active ? 'Удалить' : 'Вернуть'}</button>` : ''}
+      ? `<div class="bars" role="img" aria-label="${escape(peerLabel(peer.state))}">${[0, 1, 2, 3].map(i => `<i class="${i < lit ? 'on' : ''}"></i>`).join('')}</div><div class="member-ping">${peer.ping_ms == null ? '—' : `${peer.ping_ms} ${h('common.ms')}`}</div>`
+      : `<span class="member-state">${escape(peer.active ? peerLabel(peer.state) : t('peer.removed'))}</span>`}
+    ${removable ? `<button class="text-button danger" data-member="${peer.steam_id}" data-active="${peer.active}" ${connected ? '' : 'disabled'}>${h(peer.active ? 'member.revoke' : 'member.readmit')}</button>` : ''}
   </div>`;
 }
 async function copyAddress(ip: string) {
-  try { await navigator.clipboard.writeText(ip); } catch { notice(`Адрес не скопирован: ${ip}`); return; }
+  try { await navigator.clipboard.writeText(ip); } catch { notice(t('notice.copy_failed', { ip })); return; }
   copied = 1; render();
   setTimeout(() => { copied = 0; render(); }, 1600);
 }
 
 // Hiding the game is both the second first-run step and its own entry in
-// Settings, so the instruction exists once.
+// Settings, so the instruction exists once. The keys ride along as `data-i18n`
+// so the copy in the static Steam-help dialog follows a language switch too.
 function hideStep(number: number) {
-  return `<section class="step"><span class="step-num">${number}</span><div class="step-body"><h3>Скрыть игру в библиотеке</h3><p>Иначе друзья в Steam будут видеть, что вы «играете» в неё. Библиотека → правый клик по игре → «Управление» → «Сделать приватной».</p><img class="step-shot" src="/steam/library.png" alt="Контекстное меню игры в библиотеке Steam" loading="lazy" /></div></section>`;
+  return `<section class="step"><span class="step-num">${number}</span><div class="step-body"><h3 data-i18n="hide.title">${h('hide.title')}</h3><p data-i18n="hide.text">${h('hide.text')}</p><img class="step-shot" src="/steam/library.png" alt="${h('hide.image_alt')}" data-i18n-alt="hide.image_alt" loading="lazy" /></div></section>`;
 }
 // The library step is a prerequisite, not advice: without a license for the
 // AppID the client connects under, Steam refuses the connection outright and
 // every other diagnostic still looks clean. So the app opens on it.
 function welcomeHTML() {
   const id = steamApp?.app_id;
-  const known = id === 324810 ? ' — бесплатная игра <b>TOXIKK</b>' : '';
+  const known = id === 324810 ? h('welcome.known_game', { game: '<b>TOXIKK</b>' }) : '';
   const done = steamApp?.in_library === true;
   const status = done
-    ? '<p class="step-state ok">Приложение уже в библиотеке — шаг выполнен.</p>'
+    ? `<p class="step-state ok">${h('welcome.in_library')}</p>`
     : steamApp?.in_library === false
-      ? '<p class="step-state warn">В библиотеке пока не видно.</p>'
-      : '<p class="step-state">Проверяем библиотеку…</p>';
+      ? `<p class="step-state warn">${h('welcome.not_in_library')}</p>`
+      : `<p class="step-state">${h('welcome.checking')}</p>`;
   // Hidden once the license is there: the same deep link would launch the
   // game for somebody who also installed it.
-  const add = done ? '' : '<button class="button primary" id="welcome-add">Добавить в Steam</button>';
-  const note = done ? '' : '<p class="hint">Steam выдаст лицензию и предложит загрузку — её можно отменить, приложение останется в библиотеке.</p>';
-  return `<div class="dialog-heading"><h2>Настройка FreeC Tier</h2></div>
-    <p>Связь между компьютерами идёт через Steam, поэтому клиент подключается под идентификатором игры. Два шага — и возвращаться к этому не придётся.</p>
+  const add = done ? '' : `<button class="button primary" id="welcome-add">${h('welcome.add')}</button>`;
+  const note = done ? '' : `<p class="hint">${h('welcome.add_note')}</p>`;
+  // The language menu sits in the heading: the first thing a newcomer reads is
+  // this dialog, so it is where a wrong guess about their language gets fixed.
+  return `<div class="dialog-heading"><h2>${h('welcome.title')}</h2>${languagePicker('welcome-language')}</div>
+    <p>${h('welcome.intro')}</p>
     <div class="steam-help">
-      <section class="step"><span class="step-num">1</span><div class="step-body"><h3>Добавить приложение в библиотеку Steam</h3><p>FreeC Tier подключается под AppID <code>${id ?? '…'}</code>${known}. Лицензия бесплатная, но Steam выдаёт её только по запросу. Без неё клиент Steam отказывает в соединении, а по другим признакам причину не видно.</p><div class="step-actions">${add}<button class="text-button" id="welcome-store">Открыть страницу в магазине</button></div>${note}${status}</div></section>
+      <section class="step"><span class="step-num">1</span><div class="step-body"><h3>${h('welcome.step1_title')}</h3><p>${h('welcome.step1_text', { app_id: `<code>${id ?? '…'}</code>`, game: known })}</p><div class="step-actions">${add}<button class="text-button" id="welcome-store">${h('welcome.store')}</button></div>${note}${status}</div></section>
       ${hideStep(2)}
     </div>
-    <div class="dialog-actions"><button class="button" id="welcome-later">Позже</button><button class="button primary" id="welcome-done">Готово</button></div>`;
+    <div class="dialog-actions"><button class="button" id="welcome-later">${h('welcome.later')}</button><button class="button primary" id="welcome-done">${h('welcome.done')}</button></div>`;
 }
 function renderWelcome() {
   const dialog = document.querySelector<HTMLDialogElement>('#welcome-dialog')!;
@@ -321,6 +339,7 @@ function renderWelcome() {
   document.querySelector<HTMLButtonElement>('#welcome-store')!.onclick = toSteam(true);
   document.querySelector<HTMLButtonElement>('#welcome-later')!.onclick = () => closeWelcome(false);
   document.querySelector<HTMLButtonElement>('#welcome-done')!.onclick = () => closeWelcome(true);
+  bindLanguagePicker(dialog.querySelector('#welcome-language'), chooseLanguage);
   dialog.querySelectorAll<HTMLImageElement>('.step-shot').forEach(image => image.addEventListener('error', () => image.classList.add('missing')));
 }
 async function refreshSteamApp() {
@@ -346,8 +365,12 @@ function closeWelcome(done: boolean) {
 function openPassword(id: string, editing: boolean) {
   const dialog = document.querySelector<HTMLDialogElement>('#password-dialog')!;
   dialog.dataset.network = id; dialog.dataset.editing = String(editing);
-  document.querySelector('#password-title')!.textContent = editing ? 'Изменить пароль' : 'Вход в сеть';
-  document.querySelector('#password-hint')!.textContent = editing ? 'Пустое поле удалит пароль. Уже принятые участники сохранят доступ.' : 'Пароль проверяется автоматически. Владелец может быть офлайн.';
+  const title = document.querySelector<HTMLElement>('#password-title')!;
+  title.dataset.i18n = editing ? 'password.change_title' : 'password.enter_title';
+  title.textContent = t(title.dataset.i18n);
+  const hint = document.querySelector<HTMLElement>('#password-hint')!;
+  hint.dataset.i18n = editing ? 'password.change_hint' : 'password.enter_hint';
+  hint.textContent = t(hint.dataset.i18n);
   document.querySelector<HTMLInputElement>('#password-input')!.value = '';
   dialog.showModal();
 }
@@ -357,7 +380,7 @@ function renderJoinsBar() {
   const joins = page === 'discover' ? [] : state.joins || [];
   bar.hidden = !joins.length;
   if (!joins.length) return;
-  bar.innerHTML = joins.map(j => `<div class="join-chip"><span>${escape(j.name)}</span><small>${j.password ? 'Требуется пароль' : 'Подключение…'}</small>${j.password ? `<button class="button" data-password="${j.id}">Пароль</button>` : ''}<button class="text-button" data-cancel-join="${j.id}">Отмена</button></div>`).join('');
+  bar.innerHTML = joins.map(j => `<div class="join-chip"><span>${escape(j.name)}</span><small>${h(j.password ? 'join.password_required' : 'peer.connecting')}</small>${j.password ? `<button class="button" data-password="${j.id}">${h('password.label')}</button>` : ''}<button class="text-button" data-cancel-join="${j.id}">${h('common.cancel')}</button></div>`).join('');
   document.querySelectorAll<HTMLButtonElement>('[data-password]').forEach(b => b.onclick = () => openPassword(b.dataset.password!, false));
   document.querySelectorAll<HTMLButtonElement>('[data-cancel-join]').forEach(b => b.onclick = () => { void send({ type: 'cancel_join', network: b.dataset.cancelJoin }); });
 }
@@ -367,27 +390,27 @@ function renderHeaderUpdate() {
   if (!updateVersion) { chip.hidden = true; return; }
   chip.hidden = false;
   chip.disabled = updating;
-  chip.textContent = updating ? 'Обновляем…' : `Обновить до ${updateVersion}`;
+  chip.textContent = updating ? t('update.updating') : t('update.to', { version: updateVersion });
   chip.onclick = () => { void installUpdate(); };
 }
 async function installUpdate() {
-  updating = true; updateMessage = 'Загрузка и проверка подписи.';
+  updating = true; updateStatus = { key: 'update.downloading' };
   renderHeaderUpdate();
   if (page === 'settings') renderSettings();
-  try { await invoke('install_update'); } catch (error) { updateMessage = `Обновление не установлено: ${String(error)}`; notice(updateMessage); }
+  try { await invoke('install_update'); } catch (error) { updateStatus = { key: 'update.failed', params: { error: String(error) } }; notice(t(updateStatus.key, updateStatus.params)); }
   finally { updating = false; updateVersion = null; renderHeaderUpdate(); if (page === 'settings') renderSettings(); }
 }
 function renderDiscovery() {
   const joins = state.joins || [];
   const query = discoverQuery.trim().toLowerCase();
   const found = (state.public_networks || []).filter(n => !query || n.name.toLowerCase().includes(query));
-  heading('Публичные сети', `Найдено ${found.length}`);
+  heading(t('discover.title'), t('discover.found', { count: found.length }));
   contentHTML(`<section class="page" id="discovery-page">
-    <div class="page-head"><div><h1>Публичные сети</h1><p class="page-sub">Открытые сети, которые сейчас видит Steam</p></div><div class="page-actions"><input id="discover-search" class="search" placeholder="Поиск по названию" aria-label="Поиск по названию" autocomplete="off" /><button class="button" id="refresh-public" ${state.steam === 'online' ? '' : 'disabled'}>Обновить</button></div></div>
-    ${joins.map(j => `<div class="card" id="pending-${j.id}"><div class="row"><span class="row-label">${escape(j.name)}<small>${j.password ? 'Требуется пароль' : 'Подключение…'}</small></span><div class="row-actions">${j.password ? `<button class="button primary" data-password="${j.id}">Ввести пароль</button>` : ''}<button class="text-button" data-cancel-join="${j.id}">Отмена</button></div></div></div>`).join('')}
+    <div class="page-head"><div><h1>${h('discover.title')}</h1><p class="page-sub">${h('discover.sub')}</p></div><div class="page-actions"><input id="discover-search" class="search" placeholder="${h('discover.search')}" aria-label="${h('discover.search')}" autocomplete="off" /><button class="button" id="refresh-public" ${state.steam === 'online' ? '' : 'disabled'}>${h('discover.refresh')}</button></div></div>
+    ${joins.map(j => `<div class="card" id="pending-${j.id}"><div class="row"><span class="row-label">${escape(j.name)}<small>${h(j.password ? 'join.password_required' : 'peer.connecting')}</small></span><div class="row-actions">${j.password ? `<button class="button primary" data-password="${j.id}">${h('join.enter_password')}</button>` : ''}<button class="text-button" data-cancel-join="${j.id}">${h('common.cancel')}</button></div></div></div>`).join('')}
     ${found.length
-      ? `<div class="discover-grid">${found.map(n => `<div class="pub-card ${hueClass(n.name)}"><div class="pub-head"><span class="avatar" aria-hidden="true">${initials(n.name)}</span><div class="pub-id"><b>${escape(n.name)}</b><small>Публичная сеть</small></div></div><button class="button primary" data-lobby="${escape(n.lobby)}">Войти</button></div>`).join('')}</div>`
-      : `<div class="card"><p class="hint">${query ? 'Ничего не найдено по этому запросу.' : 'Сети не найдены. Нажмите «Обновить», чтобы повторить поиск.'}</p></div>`}
+      ? `<div class="discover-grid">${found.map(n => `<div class="pub-card ${hueClass(n.name)}"><div class="pub-head"><span class="avatar" aria-hidden="true">${initials(n.name)}</span><div class="pub-id"><b>${escape(n.name)}</b><small>${h('discover.public_network')}</small></div></div><button class="button primary" data-lobby="${escape(n.lobby)}">${h('discover.join')}</button></div>`).join('')}</div>`
+      : `<div class="card"><p class="hint">${h(query ? 'discover.nothing_found' : 'discover.none')}</p></div>`}
     </section>`);
   document.querySelector<HTMLButtonElement>('#refresh-public')!.onclick = () => { void send({ type: 'discover' }); };
   document.querySelector<HTMLInputElement>('#discover-search')!.oninput = event => { discoverQuery = (event.target as HTMLInputElement).value; renderDiscovery(); };
@@ -397,30 +420,33 @@ function renderDiscovery() {
 }
 
 function renderDiagnostics() {
-  heading('Диагностика', 'Состояние клиента');
-  contentHTML(`<section class="page narrow" id="diagnostic-page"><button id="back-settings" class="text-button back">← Настройки</button><div class="page-head"><div><h1>Диагностика</h1><p class="page-sub">Состояние клиента и события</p></div></div><div class="panel"><dl class="dl"><dt>SteamID</dt><dd><code>${escape(state.steam_id || 'Не получен')}</code></dd><dt>Steam Relay</dt><dd>${escape(state.relay)}</dd><dt>Транспорт</dt><dd>Steam P2P · ICE отключён</dd><dt>Адаптер</dt><dd>Wintun · IPv4 · MTU 1280</dd><dt>Среда</dt><dd>${isTauri() ? 'Desktop-клиент' : 'Браузерный просмотр — Steam недоступен'}</dd></dl></div><p class="counters" id="counters"></p>${state.networks.map(n => `<details class="net" id="info-${n.id}"><summary>${escape(n.name)}</summary><dl class="dl"><dt>Network ID</dt><dd><code>${n.id}</code></dd><dt>Подсеть</dt><dd>${escape(n.subnet)}</dd><dt>Версия</dt><dd>${n.revision}</dd><dt>Lobby ID</dt><dd><code>${n.lobby || '—'}</code></dd></dl></details>`).join('')}<div class="section-head"><h2>Журнал событий</h2></div><div class="event-log" id="event-log"></div><div class="page-actions"><button id="join" class="button">Войти по Steam Lobby ID</button></div></section>`);
+  heading(t('diagnostics.title'), t('diagnostics.sub'));
+  contentHTML(`<section class="page narrow" id="diagnostic-page"><button id="back-settings" class="text-button back">← ${h('settings.title')}</button><div class="page-head"><div><h1>${h('diagnostics.title')}</h1><p class="page-sub">${h('diagnostics.page_sub')}</p></div></div><div class="panel"><dl class="dl"><dt>SteamID</dt><dd><code>${state.steam_id ? escape(state.steam_id) : h('diagnostics.not_received')}</code></dd><dt>Steam Relay</dt><dd>${escape(state.relay)}</dd><dt>${h('diagnostics.transport')}</dt><dd>${h('diagnostics.transport_value')}</dd><dt>${h('diagnostics.adapter')}</dt><dd>Wintun · IPv4 · MTU ${mtuValue()}</dd><dt>${h('diagnostics.environment')}</dt><dd>${h(isTauri() ? 'diagnostics.desktop' : 'diagnostics.browser')}</dd></dl></div><p class="counters" id="counters"></p>${state.networks.map(n => `<details class="net" id="info-${n.id}"><summary>${escape(n.name)}</summary><dl class="dl"><dt>Network ID</dt><dd><code>${n.id}</code></dd><dt>${h('diagnostics.subnet')}</dt><dd>${escape(n.subnet)}</dd><dt>${h('diagnostics.revision')}</dt><dd>${n.revision}</dd><dt>Lobby ID</dt><dd><code>${n.lobby || '—'}</code></dd></dl></details>`).join('')}<div class="section-head"><h2>${h('diagnostics.events')}</h2></div><div class="event-log" id="event-log"></div><div class="page-actions"><button id="join" class="button">${h('diagnostics.join_lobby')}</button></div></section>`);
   document.querySelector<HTMLButtonElement>('#back-settings')!.onclick = () => { page = 'settings'; render(); };
   document.querySelector<HTMLButtonElement>('#join')!.onclick = () => document.querySelector<HTMLDialogElement>('#join-dialog')!.showModal();
   updateDynamic();
 }
 function updateDynamic() {
   const counters = document.querySelector('#counters');
-  if (counters) counters.textContent = `Отправлено ${state.sent} · Получено ${state.received} · Отклонено ${state.dropped}`;
+  if (counters) counters.textContent = t('diagnostics.counters', { sent: state.sent, received: state.received, dropped: state.dropped });
   const sent = document.querySelector('#traffic-sent');
   if (sent) { sent.textContent = String(state.sent); document.querySelector('#traffic-received')!.textContent = String(state.received); }
   const log = document.querySelector<HTMLElement>('#event-log');
-  if (log) patch(log, state.events.length ? state.events.slice().reverse().map(e => `<p>${escape(e)}</p>`).join('') : '<p>Событий пока нет.</p>');
+  if (log) patch(log, state.events.length ? state.events.slice().reverse().map(e => `<p>${escape(e)}</p>`).join('') : `<p>${h('diagnostics.no_events')}</p>`);
 }
 function renderSettings() {
-  heading('Настройки', appLabel());
-  contentHTML(`<section class="page narrow" id="settings-page"><div class="page-head"><div><h1>Настройки</h1><p class="page-sub">Поведение клиента, служба и обновления</p></div></div>
-    <div class="card"><div class="row"><span class="row-label">Тема</span><div class="segmented" role="group" aria-label="Тема"><button id="theme-dark" class="seg ${preferences.theme === 'dark' ? 'active' : ''}" aria-pressed="${preferences.theme === 'dark'}">Тёмная</button><button id="theme-light" class="seg ${preferences.theme === 'light' ? 'active' : ''}" aria-pressed="${preferences.theme === 'light'}">Светлая</button><button id="theme-custom" class="seg ${preferences.theme === 'custom' ? 'active' : ''}" aria-pressed="${preferences.theme === 'custom'}">Своя</button></div></div>${preferences.theme === 'custom' ? '' : `<div class="row"><span class="row-label">Акцентный цвет<small>Главный цвет кнопок и выделений</small></span><div class="swatches">${accentSwatches()}</div></div>`}<label class="row"><span class="row-label">Сворачивать в трей</span><input id="minimize-tray" type="checkbox" class="switch" ${preferences.minimize_to_tray ? 'checked' : ''} /></label><label class="row"><span class="row-label">Запускать при входе в Windows</span><input id="autostart" type="checkbox" class="switch" ${preferences.autostart ? "checked" : ""} /></label><label class="row"><span class="row-label">Запускать в трее<small>Окно не появится при входе в Windows — только значок рядом с часами</small></span><input id="start-tray" type="checkbox" class="switch" ${preferences.start_in_tray ? 'checked' : ''} ${preferences.autostart ? '' : 'disabled'} /></label></div>
-    ${preferences.theme === 'custom' ? `<div class="card" id="theme-editor">${THEME_GROUPS.map(([title, tokens]) => `<h3 class="editor-title">${escape(title)}</h3>${tokens.map(token => `<label class="row color-row"><span class="row-label">${escape(THEME_LABELS[token] ?? token)}</span><input type="color" class="color-input" data-token="${token}" value="${escape(preferences.custom_colors?.[token] ?? '#000000')}" aria-label="${escape(THEME_LABELS[token] ?? token)}" /></label>`).join('')}`).join('')}<div class="row"><span class="row-label muted">Изменения применяются сразу.</span><button class="button" id="theme-reset">Сбросить</button></div></div>` : ''}
-    <h2 class="group-title">Сеть</h2><div class="card"><div class="row"><span class="row-label">MTU виртуального адаптера<small>${escape(mtuHint())}</small></span><div class="segmented" role="group" aria-label="MTU">${mtuSegments()}</div></div>${mtuIsCustom() ? `<label class="row"><span class="row-label">Своё значение<small>От ${MTU_MIN} до ${MTU_MAX} байт</small></span><input id="mtu-input" class="number-input" type="number" inputmode="numeric" min="${MTU_MIN}" max="${MTU_MAX}" value="${mtuValue()}" aria-label="Своё значение MTU" /></label>` : ''}<div class="row"><span class="row-label muted">Применяется сразу, включая уже запущенные сети. Игру лучше перезапустить.</span></div></div>
-    <h2 class="group-title">Служба</h2><div class="card"><div class="row"><span class="row-label">Служба FreeC Tier<small id="service-status">Проверяем…</small></span><div class="row-actions"><button class="button" id="service-install">Переустановить</button><button class="button" id="service-uninstall">Удалить</button></div></div></div>
-    <h2 class="group-title">Обновления</h2><div class="card"><label class="row"><span class="row-label">Проверять при запуске</span><input id="auto-update" type="checkbox" class="switch" ${preferences.check_updates ? 'checked' : ''} /></label><div class="row"><span class="row-label muted" id="update-message" role="status">${escape(updateMessage)}</span><div class="row-actions"><button class="button" id="check-update" ${updating ? 'disabled' : ''}>${updating ? 'Проверяем…' : 'Проверить'}</button>${updateVersion ? `<button class="button primary" id="install-update" ${updating ? 'disabled' : ''}>Установить ${escape(updateVersion)}</button>` : ''}</div></div></div>
-    <h2 class="group-title">Steam</h2><div class="card"><button class="row row-button" id="steam-setup"><span class="row-label">Настройка Steam<small>Приложение в библиотеке и его видимость</small></span><span class="chev" aria-hidden="true">→</span></button><button class="row row-button" id="steam-help"><span class="row-label">Скрыть статус «играет»</span><span class="chev" aria-hidden="true">→</span></button></div>
-    <h2 class="group-title">Дополнительно</h2><div class="card"><button class="row row-button" id="diagnostics"><span class="row-label">Диагностика</span><span class="chev" aria-hidden="true">→</span></button><div class="row"><span class="row-label">Завершение работы</span><button class="button" id="quit">Выйти</button></div></div></section>`);
+  heading(t('settings.title'), appLabel());
+  const theme = (name: string, key: string) => `<button id="theme-${name}" class="seg ${preferences.theme === name ? 'active' : ''}" aria-pressed="${preferences.theme === name}">${h(key)}</button>`;
+  const toggle = (id: string, key: string, checked: boolean | undefined, extra = '', hint?: string) => `<label class="row"><span class="row-label">${h(key)}${hint ? `<small>${h(hint)}</small>` : ''}</span><input id="${id}" type="checkbox" class="switch" ${checked ? 'checked' : ''} ${extra} /></label>`;
+  contentHTML(`<section class="page narrow" id="settings-page"><div class="page-head"><div><h1>${h('settings.title')}</h1><p class="page-sub">${h('settings.sub')}</p></div></div>
+    <div class="card"><div class="row"><span class="row-label">${h('language.label')}<small>${h('language.hint')}</small></span>${languagePicker('settings-language')}</div><div class="row"><span class="row-label">${h('settings.theme')}</span><div class="segmented" role="group" aria-label="${h('settings.theme')}">${theme('dark', 'theme.dark')}${theme('light', 'theme.light')}${theme('custom', 'theme.custom')}</div></div>${preferences.theme === 'custom' ? '' : `<div class="row"><span class="row-label">${h('settings.accent')}<small>${h('settings.accent_hint')}</small></span><div class="swatches">${accentSwatches()}</div></div>`}${toggle('minimize-tray', 'settings.minimize_tray', preferences.minimize_to_tray)}${toggle('autostart', 'settings.autostart', preferences.autostart)}${toggle('start-tray', 'settings.start_tray', preferences.start_in_tray, preferences.autostart ? '' : 'disabled', 'settings.start_tray_hint')}</div>
+    ${preferences.theme === 'custom' ? `<div class="card" id="theme-editor">${THEME_GROUPS.map(([title, tokens]) => `<h3 class="editor-title">${h(title)}</h3>${tokens.map(token => `<label class="row color-row"><span class="row-label">${escape(tokenLabel(token))}</span><input type="color" class="color-input" data-token="${token}" value="${escape(preferences.custom_colors?.[token] ?? '#000000')}" aria-label="${escape(tokenLabel(token))}" /></label>`).join('')}`).join('')}<div class="row"><span class="row-label muted">${h('theme.applied')}</span><button class="button" id="theme-reset">${h('theme.reset')}</button></div></div>` : ''}
+    <h2 class="group-title">${h('settings.network')}</h2><div class="card"><div class="row"><span class="row-label">${h('mtu.title')}<small>${escape(mtuHint())}</small></span><div class="segmented" role="group" aria-label="MTU">${mtuSegments()}</div></div>${mtuIsCustom() ? `<label class="row"><span class="row-label">${h('mtu.custom_value')}<small>${h('mtu.range', { min: MTU_MIN, max: MTU_MAX })}</small></span><input id="mtu-input" class="number-input" type="number" inputmode="numeric" min="${MTU_MIN}" max="${MTU_MAX}" value="${mtuValue()}" aria-label="${h('mtu.custom_aria')}" /></label>` : ''}<div class="row"><span class="row-label muted">${h('mtu.applies')}</span></div></div>
+    <h2 class="group-title">${h('settings.service')}</h2><div class="card"><div class="row"><span class="row-label">${h('service.name')}<small id="service-status">${h('update.checking')}</small></span><div class="row-actions"><button class="button" id="service-install">${h('service.reinstall')}</button><button class="button" id="service-uninstall">${h('service.uninstall')}</button></div></div></div>
+    <h2 class="group-title">${h('settings.updates')}</h2><div class="card">${toggle('auto-update', 'settings.check_updates', preferences.check_updates, '', 'settings.check_updates_hint')}<div class="row"><span class="row-label muted" id="update-message" role="status">${h(updateStatus.key, updateStatus.params && Object.fromEntries(Object.entries(updateStatus.params).map(([k, v]) => [k, escape(v)])))}</span><div class="row-actions"><button class="button" id="check-update" ${updating ? 'disabled' : ''}>${h(updating ? 'update.checking' : 'update.check')}</button>${updateVersion ? `<button class="button primary" id="install-update" ${updating ? 'disabled' : ''}>${h('update.install', { version: escape(updateVersion) })}</button>` : ''}</div></div></div>
+    <h2 class="group-title">${h('settings.steam')}</h2><div class="card"><button class="row row-button" id="steam-setup"><span class="row-label">${h('settings.steam_setup')}<small>${h('settings.steam_setup_hint')}</small></span><span class="chev" aria-hidden="true">→</span></button><button class="row row-button" id="steam-help"><span class="row-label">${h('settings.steam_hide')}</span><span class="chev" aria-hidden="true">→</span></button></div>
+    <h2 class="group-title">${h('settings.more')}</h2><div class="card"><button class="row row-button" id="diagnostics"><span class="row-label">${h('diagnostics.title')}</span><span class="chev" aria-hidden="true">→</span></button><div class="row"><span class="row-label">${h('settings.quit_label')}</span><button class="button" id="quit">${h('settings.quit')}</button></div></div></section>`);
+  bindLanguagePicker(document.querySelector('#settings-language'), chooseLanguage);
   document.querySelector<HTMLButtonElement>('#theme-dark')!.onclick = () => setTheme('dark');
   document.querySelector<HTMLButtonElement>('#theme-light')!.onclick = () => setTheme('light');
   document.querySelector<HTMLButtonElement>('#theme-custom')!.onclick = () => setTheme('custom');
@@ -459,7 +485,7 @@ function renderSettings() {
     try {
       const status = await invoke<{ installed: boolean; running: boolean }>('service_status');
       const label = document.querySelector('#service-status');
-      if (label) label.textContent = status.running ? 'Установлена и запущена' : status.installed ? 'Установлена, но не запущена' : 'Не установлена';
+      if (label) label.textContent = t(status.running ? 'service.running' : status.installed ? 'service.stopped' : 'service.missing');
     } catch { /* service missing from this build */ }
   }
   void refreshServiceStatus();
@@ -510,11 +536,12 @@ function mtuSegments() {
     const active = !custom && preset.value === mtuValue();
     return `<button class="seg ${active ? 'active' : ''}" data-mtu="${preset.value}" aria-pressed="${active}">${preset.value}</button>`;
   }).join('');
-  return `${presets}<button class="seg ${custom ? 'active' : ''}" data-mtu="custom" aria-pressed="${custom}">Своё</button>`;
+  return `${presets}<button class="seg ${custom ? 'active' : ''}" data-mtu="custom" aria-pressed="${custom}">${h('mtu.custom')}</button>`;
 }
 function mtuHint() {
-  if (mtuIsCustom()) return `Своё значение: ${mtuValue()} байт. Меняйте, только если игра не работает на пресетах.`;
-  return MTU_PRESETS.find(preset => preset.value === mtuValue())?.hint ?? '';
+  if (mtuIsCustom()) return t('mtu.custom_hint', { value: mtuValue() });
+  const preset = MTU_PRESETS.find(entry => entry.value === mtuValue());
+  return preset ? t(preset.hint) : '';
 }
 // Swatch colors live in the stylesheet (`--accent-preset`, `--accent-slot-N`)
 // and are read back here only to store the pick — a `style` attribute would be
@@ -527,7 +554,7 @@ function accentSwatches() {
     const active = color.toLowerCase() === current;
     // Slot 0 stores an empty value — «follow the theme» — so switching
     // dark ↔ light keeps each preset's own accent instead of pinning one.
-    return `<button class="swatch ${active ? 'active' : ''}" data-slot="${slot}" data-accent="${slot ? escape(color) : ''}" aria-label="Акцент: ${escape(ACCENT_LABELS[slot])}" aria-pressed="${active}"></button>`;
+    return `<button class="swatch ${active ? 'active' : ''}" data-slot="${slot}" data-accent="${slot ? escape(color) : ''}" aria-label="${h('accent.aria', { name: h(ACCENT_LABELS[slot]) })}" aria-pressed="${active}"></button>`;
   }).join('');
 }
 function setTheme(theme: string) {
@@ -548,7 +575,7 @@ function setTheme(theme: string) {
   void savePreferences(preferences);
 }
 async function desktop(command: string, args?: Record<string, unknown>) {
-  if (!isTauri()) { notice('Это браузерный просмотр. Настройки и выход доступны в desktop-клиенте.'); return false; }
+  if (!isTauri()) { notice(t('notice.browser_settings')); return false; }
   try { await invoke(command, args); return true; } catch (error) { notice(String(error)); return false; }
 }
 async function savePreferences(next: Settings) {
@@ -560,19 +587,19 @@ async function savePreferences(next: Settings) {
 // the next one is five minutes away.
 let lastUpdateCheck = 0;
 async function checkUpdate(quiet = false) {
-  if (!isTauri()) { if (!quiet) notice('Проверка обновлений доступна в desktop-клиенте.'); return; }
+  if (!isTauri()) { if (!quiet) notice(t('notice.browser_updates')); return; }
   if (updating) return;
   lastUpdateCheck = Date.now();
   updating = true;
-  if (!quiet) { updateMessage = 'Проверяем…'; updateVersion = null; }
+  if (!quiet) { updateStatus = { key: 'update.checking' }; updateVersion = null; }
   if (page === 'settings') renderSettings();
   try {
     const result = await invoke<{ configured: boolean; version: string | null }>('check_update');
     const announced = result.version !== null && result.version !== updateVersion;
     updateVersion = result.version;
-    updateMessage = !result.configured ? 'Обновления не настроены в этой сборке.' : result.version ? `Доступна версия ${result.version}.` : 'Установлена актуальная версия.';
-    if (announced && page !== 'settings') notice(`Доступна версия ${result.version}.`);
-  } catch (error) { if (!quiet) updateMessage = `Не удалось проверить обновления: ${String(error)}`; }
+    updateStatus = !result.configured ? { key: 'update.not_configured' } : result.version ? { key: 'update.available', params: { version: result.version } } : { key: 'update.latest' };
+    if (announced && page !== 'settings') notice(t('update.available', { version: result.version! }));
+  } catch (error) { if (!quiet) updateStatus = { key: 'update.check_failed', params: { error: String(error) } }; }
   finally { updating = false; if (page === 'settings') renderSettings(); renderHeaderUpdate(); }
 }
 function openCreate() { setCreateAccess(false); (document.querySelector('#create-dialog') as HTMLDialogElement).showModal(); }
@@ -587,7 +614,7 @@ function setCreateAccess(publicAccess: boolean) {
 }
 function openInvite() {
   const active = network(); if (!active) return;
-  document.querySelector('#friend-list')!.innerHTML = `${state.friends.length ? state.friends.map(f => `<button class="friend-choice" data-friend="${f.steam_id}"><span>${escape(f.name)}</span><span>Пригласить</span></button>`).join('') : '<p class="muted">Список друзей пуст.</p>'}`;
+  document.querySelector('#friend-list')!.innerHTML = `${state.friends.length ? state.friends.map(f => `<button class="friend-choice" data-friend="${f.steam_id}"><span>${escape(f.name)}</span><span>${h('invite.action')}</span></button>`).join('') : `<p class="muted">${h('invite.no_friends')}</p>`}`;
   document.querySelectorAll<HTMLButtonElement>('[data-friend]').forEach(button => button.onclick = async () => { if (await send({ type: 'invite_friend', network: active.id, steam_id: button.dataset.friend })) (document.querySelector('#invite-dialog') as HTMLDialogElement).close(); });
   (document.querySelector('#invite-dialog') as HTMLDialogElement).showModal();
 }
@@ -642,7 +669,9 @@ async function refresh() {
     try {
       const next = await invoke<Snapshot>('snapshot');
       const serialized = JSON.stringify({ steam: next.steam, steam_id: next.steam_id, nickname: next.nickname, relay: next.relay, networks: next.networks, joins: next.joins, public_networks: next.public_networks });
-      if (next.events.length && next.events.at(-1) !== state.events.at(-1) && next.events.at(-1)!.startsWith('Ошибка:')) notice(next.events.at(-1)!);
+      // The engine counts its errors, so a new one is recognized whatever
+      // language its line was written in.
+      if ((next.errors ?? 0) > (state.errors ?? 0) && next.last_error) notice(next.last_error);
       state = next;
       if (serialized !== previous) {
         previous = serialized;
@@ -650,7 +679,7 @@ async function refresh() {
         render();
       }
       updateDynamic();
-    } catch (error) { notice(`Нет связи с ядром: ${String(error)}`); }
+    } catch (error) { notice(t('notice.core_unreachable', { error: String(error) })); }
   }
 }
 // A window in the tray renders nothing, so neither the snapshot clone nor the
@@ -671,12 +700,15 @@ if (isTauri()) void invoke<string>('version').then(value => { if (value) { setVe
 document.querySelector('#welcome-dialog')!.addEventListener('close', () => window.clearInterval(welcomePoll));
 if (isTauri()) void invoke<Settings>('settings').then(result => {
   if (result) { preferences = result; applyTheme(preferences.theme); }
+  // The engine settled the language on first run from the Windows region; the
+  // first frame went out on a guess, so correct it if they differ.
+  if (preferences.language && preferences.language !== language()) applyLanguage(preferences.language);
   if (page === 'settings') renderSettings();
   // The Steam library step gates every connection, so a client that has not
   // been through it opens on it instead of on an empty network list.
   if (!preferences.onboarded) openWelcome();
   if (preferences.check_updates) void checkUpdate();
-}).catch(error => notice(`Не удалось загрузить настройки: ${String(error)}`));
+}).catch(error => notice(t('notice.settings_failed', { error: String(error) })));
 void poll();
 // Periodic update check while the app runs. The setting is read at each tick,
 // so the switch takes effect without a restart. A hidden window's webview is

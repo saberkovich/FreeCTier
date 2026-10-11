@@ -1,0 +1,31 @@
+# Crowdin sync for the interface strings (https://crowdin.com).
+#
+# `locales/en.json` is the source: flat "section.name": "text" pairs, file
+# type "JSON" (key-value). Placeholders are `{name}` and must survive
+# translation unchanged — `every_locale_parses_and_matches_the_source` in
+# client/core/src/tests.rs rejects a file that renames or drops one.
+#
+# A translation downloaded into `locales/` ships with the next build without
+# code changes: Rust embeds every file there (client/core/build.rs), the window
+# discovers them through `import.meta.glob`, and the Vite `locale-flags` plugin
+# bundles the matching flag.
+#
+#   crowdin upload sources
+#   crowdin download
+#
+# Credentials come from the environment, never from this file.
+project_id_env: CROWDIN_PROJECT_ID
+api_token_env: CROWDIN_PERSONAL_TOKEN
+preserve_hierarchy: true
+
+files:
+  - source: /locales/en.json
+    translation: /locales/%two_letters_code%.json
+    type: json
+    # Languages whose two-letter code is ambiguous keep their region.
+    languages_mapping:
+      two_letters_code:
+        pt-BR: pt-BR
+        zh-CN: zh-CN
+        zh-TW: zh-TW
+        es-419: es-419

@@ -1,6 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use freec_runtime::{Command, Handle, Snapshot};
+use freec_runtime::{
+    i18n::{self, t, tf},
+    Command, Handle, Snapshot,
+};
 use serde::{Deserialize, Serialize};
 use std::{io::Write, sync::Mutex, time::Duration};
 use tauri::{
@@ -35,6 +38,9 @@ struct Settings {
     /// on the game: 1280 suits LAN engines, a lower one avoids Steam
     /// fragmenting a packet into two datagrams. Clamped in the engine.
     mtu: u32,
+    /// Interface language, a tag from `locales/` (`ru`, `en`). Empty until the
+    /// first launch fills it from the system — after that it is the user's.
+    language: String,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -48,8 +54,14 @@ impl Default for Settings {
             accent: String::new(),
             custom_colors: Default::default(),
             mtu: freec_runtime::MTU_DEFAULT,
+            language: String::new(),
         }
     }
+}
+/// Tray menu entries, kept so a language change can relabel them in place.
+struct Tray {
+    open: MenuItem<tauri::Wry>,
+    quit: MenuItem<tauri::Wry>,
 }
 struct Desktop {
     settings: Mutex<Settings>,
@@ -123,7 +135,7 @@ fn open_steam_app(state: tauri::State<'_, Desktop>, store: bool) -> Result<(), S
     #[cfg(not(windows))]
     {
         let _ = (app_id, store);
-        Err("Доступно только в Windows-клиенте".into())
+        Err(t("app.windows_only"))
     }
 }
 #[tauri::command]
@@ -135,9 +147,15 @@ fn save_settings(
     app: tauri::AppHandle,
     state: tauri::State<'_, Desktop>,
     engine: tauri::State<'_, Handle>,
-    settings: Settings,
+    mut settings: Settings,
 ) -> Result<(), String> {
     let mut current = state.settings.lock().unwrap();
+    // Only shipped languages are stored: an unknown tag would otherwise come
+    // back on the next start and quietly render English.
+    settings.language = match i18n::resolve(&settings.language) {
+        Some(tag) => tag.to_owned(),
+        None => current.language.clone(),
+    };
     let save = || -> Result<(), Box<dyn std::error::Error>> {
         let dir = app.path().app_config_dir()?;
         std::fs::create_dir_all(&dir)?;
@@ -152,6 +170,9 @@ fn save_settings(
     // apply it, which is cheap but not free.
     if settings.mtu != current.mtu {
         let _ = engine.send(Command::SetMtu { mtu: settings.mtu });
+    }
+    if settings.language != current.language {
+        apply_language(&app, &settings.language);
     }
     *current = settings;
     Ok(())
@@ -310,7 +331,7 @@ async fn install_update(state: tauri::State<'_, Desktop>) -> Result<(), String> 
         .lock()
         .unwrap()
         .take()
-        .ok_or("Сначала проверьте обновления")?;
+        .ok_or_else(|| t("update.check_first"))?;
     update
         .download_and_install(|_, _| {}, || {})
         .await
@@ -357,7 +378,7 @@ fn open_with_verb(target: &str, verb: &str, arguments: &str) -> Result<(), Strin
         )
     };
     if launched as usize <= 32 {
-        return Err(format!("Не удалось открыть: {target}"));
+        return Err(tf("app.open_failed", &[("target", &target)]));
     }
     Ok(())
 }
@@ -465,7 +486,7 @@ fn show_startup_error(message: &str) {
         ) -> i32;
     }
     let text: Vec<u16> = message.encode_utf16().chain(Some(0)).collect();
-    let caption: Vec<u16> = "FreeC Tier — ошибка запуска"
+    let caption: Vec<u16> = t("startup.error_caption")
         .encode_utf16()
         .chain(Some(0))
         .collect();
@@ -492,8 +513,11 @@ fn ensure_webview2() {
         })
         .filter(|path| path.is_file());
     if let Some(path) = bootstrapper {
-        let question: Vec<u16> = "Для интерфейса FreeC Tier нужен компонент Microsoft WebView2 Runtime — в обычных Windows 10/11 он уже есть, но на этой системе его не нашлось.\n\nУстановить его сейчас? Понадобится интернет (около 2 МБ).".encode_utf16().chain(Some(0)).collect();
-        let caption: Vec<u16> = "FreeC Tier — установка WebView2"
+        let question: Vec<u16> = t("webview2.question")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let caption: Vec<u16> = t("webview2.caption")
             .encode_utf16()
             .chain(Some(0))
             .collect();
@@ -530,11 +554,91 @@ fn ensure_webview2() {
             }
         }
     }
-    show_startup_error(
-        "Не удалось установить WebView2 Runtime.\n\nУстановите его вручную с официальной страницы Microsoft и запустите FreeC Tier снова. Сейчас страница загрузки откроется.",
-    );
+    show_startup_error(&t("webview2.failed"));
     let _ = open_url("https://developer.microsoft.com/microsoft-edge/webview2/");
     force_exit();
+}
+
+/// Switches the interface language of everything Rust renders: the tray now,
+/// engine events from the next line on. The window switches itself.
+fn apply_language(app: &tauri::AppHandle, language: &str) {
+    i18n::set_language(language);
+    if let Some(tray) = app.try_state::<Tray>() {
+        let _ = tray.open.set_text(t("tray.open"));
+        let _ = tray.quit.set_text(t("tray.quit"));
+    }
+    if let Some(icon) = app.tray_by_id("main") {
+        let _ = icon.set_tooltip(Some(t("tray.tooltip")));
+    }
+}
+
+/// The settings file read without Tauri, for the moments before it runs.
+/// Same location as `app_config_dir()`: `%APPDATA%\<identifier>`.
+fn stored_settings() -> Option<Settings> {
+    let path = std::path::PathBuf::from(std::env::var_os("APPDATA")?)
+        .join("app.freectier.desktop")
+        .join("settings.json");
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
+/// First-run language from what Windows knows about the user: the display
+/// language, the home location and the regional format. The policy itself —
+/// which countries get Russian — lives in `i18n::pick_language`.
+fn system_language() -> &'static str {
+    let (interface, regions) = system_locale();
+    let regions: Vec<&str> = regions.iter().map(String::as_str).collect();
+    i18n::pick_language(&interface, &regions)
+}
+
+#[cfg(windows)]
+fn system_locale() -> (String, Vec<String>) {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetUserDefaultUILanguage() -> u16;
+        fn LCIDToLocaleName(locale: u32, name: *mut u16, length: i32, flags: u32) -> i32;
+        fn GetUserDefaultLocaleName(name: *mut u16, length: i32) -> i32;
+        fn GetUserGeoID(class: u32) -> i32;
+        fn GetGeoInfoW(location: i32, kind: u32, data: *mut u16, length: i32, language: u16)
+            -> i32;
+    }
+    // LOCALE_NAME_MAX_LENGTH; the GEO_ISO2 answer is far shorter.
+    const NAME: usize = 85;
+    const GEOCLASS_NATION: u32 = 16;
+    const GEO_ISO2: u32 = 4;
+    const GEOID_NOT_AVAILABLE: i32 = -1;
+    let text = |buffer: &[u16], written: i32| {
+        let length = usize::try_from(written).unwrap_or(0).saturating_sub(1);
+        String::from_utf16_lossy(&buffer[..length.min(buffer.len())])
+    };
+    let mut buffer = [0u16; NAME];
+    // Every call writes at most `NAME` units into the buffer it is handed and
+    // returns the count including the terminator, or 0 on failure.
+    let interface = unsafe {
+        let written = LCIDToLocaleName(
+            u32::from(GetUserDefaultUILanguage()),
+            buffer.as_mut_ptr(),
+            NAME as i32,
+            0,
+        );
+        text(&buffer, written)
+    };
+    let mut regions = Vec::new();
+    unsafe {
+        let geo = GetUserGeoID(GEOCLASS_NATION);
+        if geo != GEOID_NOT_AVAILABLE {
+            let written = GetGeoInfoW(geo, GEO_ISO2, buffer.as_mut_ptr(), NAME as i32, 0);
+            regions.push(text(&buffer, written));
+        }
+        let written = GetUserDefaultLocaleName(buffer.as_mut_ptr(), NAME as i32);
+        if let Some(region) = text(&buffer, written).rsplit('-').next() {
+            regions.push(region.to_owned());
+        }
+    }
+    (interface, regions)
+}
+#[cfg(not(windows))]
+fn system_locale() -> (String, Vec<String>) {
+    (std::env::var("LANG").unwrap_or_default(), Vec::new())
 }
 
 #[cfg(windows)]
@@ -547,6 +651,12 @@ fn demote_marker() -> Option<std::path::PathBuf> {
 }
 
 fn main() {
+    // Before anything can show text: the WebView2 prompt and the crash dialog
+    // run long before Tauri could hand out the settings path.
+    let stored = stored_settings()
+        .map(|settings| settings.language)
+        .filter(|language| i18n::resolve(language).is_some());
+    i18n::set_language(stored.as_deref().unwrap_or_else(|| system_language()));
     #[cfg(windows)]
     {
         // Steam refuses API connections from differently-elevated processes,
@@ -607,9 +717,9 @@ fn main() {
             );
         }
         #[cfg(windows)]
-        show_startup_error(&format!(
-            "Ошибка FreeC Tier:\n{info}\n\nЛог: {}",
-            log_path.display()
+        show_startup_error(&tf(
+            "startup.crash",
+            &[("info", &info), ("log", &log_path.display())],
         ));
     }));
     let builder = tauri::Builder::default();
@@ -630,12 +740,23 @@ fn main() {
                 .unwrap_or(freec_runtime::DEFAULT_APP_ID);
             let root = std::env::var_os("FREECTIER_DATA_DIR").map(std::path::PathBuf::from);
             let engine = freec_runtime::start(root, app_id)?;
-            let path = app.path().app_config_dir()?.join("settings.json");
-            let settings: Settings = if path.exists() {
-                serde_json::from_slice(&std::fs::read(path)?)?
+            let dir = app.path().app_config_dir()?;
+            let path = dir.join("settings.json");
+            let mut settings: Settings = if path.exists() {
+                serde_json::from_slice(&std::fs::read(&path)?)?
             } else {
                 Settings::default()
             };
+            // First launch: take the system's language once and keep it, so
+            // a later change of Windows region does not flip the interface
+            // under somebody who already got used to it.
+            if i18n::resolve(&settings.language).is_none() {
+                settings.language = system_language().to_owned();
+                if std::fs::create_dir_all(&dir).is_ok() {
+                    let _ = std::fs::write(&path, serde_json::to_vec(&settings)?);
+                }
+            }
+            i18n::set_language(&settings.language);
             // The adapter MTU lives in the service, so the stored value has to
             // be handed over before the first network comes up. The worker
             // takes it without Steam being ready.
@@ -646,9 +767,10 @@ fn main() {
                 update: Mutex::new(None),
                 app_id,
             });
-            let open = MenuItem::with_id(app, "open", "Открыть FreeC Tier", true, None::<&str>)?;
-            let exit = MenuItem::with_id(app, "quit", "Выйти", true, None::<&str>)?;
+            let open = MenuItem::with_id(app, "open", t("tray.open"), true, None::<&str>)?;
+            let exit = MenuItem::with_id(app, "quit", t("tray.quit"), true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&open, &exit])?;
+            app.manage(Tray { open, quit: exit });
             let mut pixels = Vec::with_capacity(32 * 32 * 4);
             for y in 0..32 {
                 for x in 0..32 {
@@ -665,7 +787,7 @@ fn main() {
             TrayIconBuilder::with_id("main")
                 .icon(tauri::image::Image::new_owned(pixels, 32, 32))
                 .menu(&menu)
-                .tooltip("FreeC Tier — сети работают в фоне")
+                .tooltip(t("tray.tooltip"))
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "open" => show(app),

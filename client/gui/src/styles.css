@@ -480,3 +480,19 @@ dialog#steam-help-dialog, dialog#welcome-dialog { width: min(620px, calc(100vw -
   dialog[open] { animation: pop .14s ease-out; }
   @keyframes pop { from { opacity: .6; translate: 0 6px; } to { opacity: 1; translate: 0 0; } }
 }
+
+/* Language menu: flag and native name, opening a list of the others. Flags are
+   SVG images — Windows has no flag glyphs, the emoji render as two letters. */
+.lang-picker { position: relative; flex: 0 0 auto; }
+.lang-current { display: inline-flex; align-items: center; gap: 8px; height: 34px; padding: 0 10px 0 9px; border: 1px solid var(--line); border-radius: 11px; background: var(--bg); color: var(--text); font: 600 12px var(--ui); white-space: nowrap; }
+.lang-current:hover, .lang-current[aria-expanded="true"] { border-color: var(--accent); }
+.lang-chevron { color: var(--faint); transition: transform .15s ease; }
+.lang-current[aria-expanded="true"] .lang-chevron { transform: rotate(180deg); }
+.flag { display: block; width: 20px; height: 15px; flex: 0 0 auto; border-radius: 3px; object-fit: cover; box-shadow: 0 0 0 1px #ffffff1f; }
+.flag-code { display: grid; place-items: center; background: var(--surface-3); color: var(--muted); font: 700 8px var(--mono); }
+.lang-menu { position: absolute; top: calc(100% + 6px); right: 0; z-index: 20; min-width: 180px; max-height: 280px; overflow-y: auto; padding: 5px; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); box-shadow: 0 18px 50px #0000007a; }
+.lang-menu[hidden] { display: none; }
+.lang-option { display: flex; align-items: center; gap: 10px; width: 100%; padding: 9px 10px; border: 0; border-radius: 9px; background: none; color: var(--text); font: 500 13px var(--ui); text-align: left; }
+.lang-option:hover, .lang-option:focus-visible { background: var(--surface-3); outline: none; }
+.lang-option.active { color: var(--accent); font-weight: 600; }
+.lang-check { margin-left: auto; padding-left: 12px; }

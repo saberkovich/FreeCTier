@@ -319,25 +319,25 @@ fn backoff(attempt: u32, id: u64) -> Duration {
         + Duration::from_millis(id % 97)
 }
 
-/// Steam's end reason as one short Russian phrase for the event log. The point
+/// Steam's end reason as a catalog key (`peer_end.*`) for the event log. The point
 /// is to tell "their machine went away" apart from "our link to Steam broke",
 /// which is the first question when a session drops.
 fn reason(end: Option<NetConnectionEnd>) -> &'static str {
     match end {
         Some(NetConnectionEnd::App(_) | NetConnectionEnd::MiscPeerSentNoConnection) => {
-            "участник отключился"
+            "peer_end.left"
         }
-        Some(NetConnectionEnd::RemoteTimeout) => "нет ответа от участника",
-        Some(NetConnectionEnd::MiscTimeout) => "таймаут соединения",
-        Some(NetConnectionEnd::LocalOfflineMode) => "Steam в офлайн-режиме",
+        Some(NetConnectionEnd::RemoteTimeout) => "peer_end.no_answer",
+        Some(NetConnectionEnd::MiscTimeout) => "peer_end.timeout",
+        Some(NetConnectionEnd::LocalOfflineMode) => "peer_end.offline_mode",
         Some(
             NetConnectionEnd::LocalManyRelayConnectivity
             | NetConnectionEnd::MiscSteamConnectivity
             | NetConnectionEnd::LocalNetworkConfig,
-        ) => "нет связи с сетью Steam",
+        ) => "peer_end.no_steam",
         Some(NetConnectionEnd::MiscP2PRendezvous | NetConnectionEnd::MiscP2PNATFirewall) => {
-            "не удалось согласовать маршрут"
+            "peer_end.no_route"
         }
-        _ => "соединение потеряно",
+        _ => "peer_end.lost",
     }
 }
