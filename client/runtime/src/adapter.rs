@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::net::Ipv4Addr;
 use std::os::windows::fs::OpenOptionsExt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -24,6 +24,12 @@ use uuid::Uuid;
 /// Per-network inbound queue depth. Overflow drops packets, mirroring Wintun
 /// ring backpressure on the service side.
 const QUEUE_DEPTH: usize = 1024;
+/// Packets allowed to wait for the service before new ones are dropped. An
+/// unbounded queue in front of a pipe only converts a short stall into minutes
+/// of stale traffic and unbounded memory; a game is better served by a drop.
+const OUTBOUND_DEPTH: usize = 2048;
+/// Soft cap on how much the writer coalesces into a single pipe write.
+const WRITE_BATCH: usize = 32 * 1024;
 /// How long `open` waits for the service connection and the open ack.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 /// FILE_FLAG_OVERLAPPED.
@@ -53,7 +59,10 @@ fn client_log(message: &str) {
 
 enum WriterMessage {
     Pipe(PipeIo),
+    /// Control frame (open/close): never dropped.
     Frame(Vec<u8>),
+    /// Packet frame: counted against `OUTBOUND_DEPTH` and droppable.
+    Packet(Vec<u8>),
 }
 
 /// Overlapped I/O wrapper over one connected client pipe handle. The
@@ -180,9 +189,18 @@ impl PipeIo {
     }
 
     fn write_frame(&mut self, frame: &[u8]) -> io::Result<()> {
-        self.write_all(&(frame.len() as u32).to_le_bytes())?;
-        self.write_all(frame)
+        let mut out = Vec::with_capacity(4 + frame.len());
+        push_frame(&mut out, frame);
+        self.write_all(&out)
     }
+}
+
+/// Length-prefix a frame into a shared buffer. One `WriteFile` per batch
+/// instead of two per frame: the syscall costs far more than the copy, and on
+/// the packet path that difference is measurable latency.
+fn push_frame(out: &mut Vec<u8>, frame: &[u8]) {
+    out.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+    out.extend_from_slice(frame);
 }
 
 impl Drop for PipeIo {
@@ -225,6 +243,8 @@ struct PipeClient {
     /// Correlates OpenAdapter requests with their acks.
     pending_opens: Mutex<BTreeMap<Uuid, Sender<Result<(), String>>>>,
     connected: AtomicBool,
+    /// Packet frames queued for the writer thread but not yet written.
+    pending: Arc<AtomicUsize>,
     /// Last connect failure, human-readable; surfaced into the event log by
     /// the engine so the user sees WHY the service is unreachable.
     issue: Mutex<Option<String>>,
@@ -236,6 +256,20 @@ unsafe impl Sync for PipeClient {}
 impl PipeClient {
     fn send(&self, frame: Vec<u8>) -> bool {
         self.outbound.send(WriterMessage::Frame(frame)).is_ok()
+    }
+
+    /// Queue a packet, or report back that the writer is too far behind to
+    /// take it. Control frames use [`Self::send`] and are never dropped.
+    fn send_packet(&self, frame: Vec<u8>) -> bool {
+        if self.pending.load(Ordering::Relaxed) >= OUTBOUND_DEPTH {
+            return false;
+        }
+        self.pending.fetch_add(1, Ordering::Relaxed);
+        if self.outbound.send(WriterMessage::Packet(frame)).is_err() {
+            self.pending.fetch_sub(1, Ordering::Relaxed);
+            return false;
+        }
+        true
     }
 
     fn wait_connected(&self, timeout: Duration) -> bool {
@@ -291,6 +325,41 @@ impl PipeClient {
 
 static PIPE: OnceLock<Arc<PipeClient>> = OnceLock::new();
 
+/// Interface MTU the user selected, sent with every `OpenAdapter` — so the
+/// reconnect replay re-applies it with no extra bookkeeping. Module-level and
+/// not a `PipeClient` field, so storing the setting at startup does not have
+/// to spawn the pipe threads.
+static MTU: AtomicU32 = AtomicU32::new(freec_core::packet::MTU_DEFAULT);
+
+/// Select the interface MTU. It is remembered for every later open and
+/// re-sent for the networks already running, so a change applies at once
+/// instead of at the next connect: the service treats a repeated
+/// `OpenAdapter` as idempotent and only re-configures the interface.
+pub fn set_mtu(mtu: u32) {
+    let mtu = freec_core::packet::clamp_mtu(mtu);
+    if MTU.swap(mtu, Ordering::SeqCst) == mtu {
+        return;
+    }
+    let Some(client) = PIPE.get() else {
+        return; // no pipe yet: the value ships with the first open
+    };
+    for (network, local_ip) in client.live.lock().unwrap().clone() {
+        if let Ok(frame) = open_frame(network, local_ip) {
+            let _ = client.send(frame);
+        }
+    }
+}
+
+/// The `OpenAdapter` frame for a network, always carrying the current MTU.
+fn open_frame(network: Uuid, local_ip: Ipv4Addr) -> io::Result<Vec<u8>> {
+    freec_ipc::encode_frame(&freec_ipc::ClientMessage::OpenAdapter {
+        network,
+        local_ip,
+        // Clamped on store, so the cast cannot truncate.
+        mtu: Some(MTU.load(Ordering::SeqCst) as u16),
+    })
+}
+
 /// The current connect issue for the engine's event log, if the pipe is
 /// not connected; None once the handshake completes.
 pub fn current_issue() -> Option<String> {
@@ -301,26 +370,35 @@ pub fn current_issue() -> Option<String> {
 fn client() -> Arc<PipeClient> {
     Arc::clone(PIPE.get_or_init(|| {
         let (outbound, outbound_rx) = std::sync::mpsc::channel();
+        let pending = Arc::new(AtomicUsize::new(0));
+        let writer_pending = Arc::clone(&pending);
         let client = Arc::new(PipeClient {
             outbound,
             queues: Mutex::new(BTreeMap::new()),
             live: Mutex::new(BTreeMap::new()),
             pending_opens: Mutex::new(BTreeMap::new()),
             connected: AtomicBool::new(false),
+            pending,
             issue: Mutex::new(None),
         });
         {
             let client = Arc::clone(&client);
             std::thread::Builder::new()
                 .name("freec-pipe-reader".into())
-                .spawn(move || pipe_reader(client))
+                .spawn(move || {
+                    crate::wake::prioritize();
+                    pipe_reader(client)
+                })
                 .expect("spawn pipe reader");
         }
         {
             let outbound_rx = outbound_rx;
             std::thread::Builder::new()
                 .name("freec-pipe-writer".into())
-                .spawn(move || pipe_writer(outbound_rx))
+                .spawn(move || {
+                    crate::wake::prioritize();
+                    pipe_writer(outbound_rx, writer_pending)
+                })
                 .expect("spawn pipe writer");
         }
         client
@@ -338,25 +416,48 @@ fn describe_connect_error(error: &io::Error) -> String {
     }
 }
 
-fn pipe_writer(outbound_rx: Receiver<WriterMessage>) {
+fn pipe_writer(outbound_rx: Receiver<WriterMessage>, pending: Arc<AtomicUsize>) {
     let mut io: Option<PipeIo> = None;
     let mut broken = true;
+    let mut batch: Vec<u8> = Vec::with_capacity(WRITE_BATCH + freec_ipc::MAX_FRAME);
     loop {
-        match outbound_rx.recv() {
-            Ok(WriterMessage::Pipe(next)) => {
-                io = Some(next);
-                broken = false;
-            }
-            Ok(WriterMessage::Frame(frame)) => {
-                if broken {
-                    continue; // frames while disconnected are dropped
+        let first = match outbound_rx.recv() {
+            Ok(message) => message,
+            Err(_) => break,
+        };
+        batch.clear();
+        let mut queued = Some(first);
+        let mut handover = None;
+        // Everything already queued joins one write. A pipe handover ends the
+        // batch: frames produced for the old connection must not be flushed
+        // into the new one.
+        while let Some(message) = queued.take() {
+            match message {
+                WriterMessage::Pipe(next) => {
+                    handover = Some(next);
+                    break;
                 }
-                let Some(handle) = io.as_mut() else { continue };
-                if freec_ipc::write_frame(handle, &frame).is_err() {
+                WriterMessage::Frame(frame) => push_frame(&mut batch, &frame),
+                WriterMessage::Packet(frame) => {
+                    pending.fetch_sub(1, Ordering::Relaxed);
+                    push_frame(&mut batch, &frame);
+                }
+            }
+            if batch.len() < WRITE_BATCH {
+                queued = outbound_rx.try_recv().ok();
+            }
+        }
+        // Frames produced while disconnected are dropped.
+        if !broken && !batch.is_empty() {
+            if let Some(handle) = io.as_mut() {
+                if handle.write_all(&batch).is_err() {
                     broken = true;
                 }
             }
-            Err(_) => break,
+        }
+        if let Some(next) = handover {
+            io = Some(next);
+            broken = false;
         }
     }
 }
@@ -411,10 +512,7 @@ fn pipe_reader(client: Arc<PipeClient>) {
         client_log("writer pipe handed over");
         let _ = client.outbound.send(WriterMessage::Pipe(writer_io));
         for (network, local_ip) in client.live.lock().unwrap().clone() {
-            if let Ok(frame) = freec_ipc::encode_frame(&freec_ipc::ClientMessage::OpenAdapter {
-                network,
-                local_ip,
-            }) {
+            if let Ok(frame) = open_frame(network, local_ip) {
                 let _ = client.send(frame);
             }
         }
@@ -426,6 +524,10 @@ fn pipe_reader(client: Arc<PipeClient>) {
                     if let Some(queue) = client.queues.lock().unwrap().get(&network) {
                         let _ = queue.try_send(packet);
                     }
+                    // The engine is blocked on its pacing wait; wake it now so
+                    // the packet leaves for its peer in microseconds instead of
+                    // waiting out the rest of the period.
+                    crate::wake::signal();
                 }
                 Ok(freec_ipc::ServiceMessage::AdapterOpened { network }) => {
                     client_log(&format!("open ack ok for {network}"));
@@ -456,8 +558,7 @@ fn open_service_adapter(network: Uuid, local_ip: Ipv4Addr) -> Result<Receiver<Ve
     let inbound = client.register_queue(network);
     client.live.lock().unwrap().insert(network, local_ip);
     let waiter = client.open_waiter(network);
-    let frame =
-        freec_ipc::encode_frame(&freec_ipc::ClientMessage::OpenAdapter { network, local_ip })?;
+    let frame = open_frame(network, local_ip)?;
     client_log(&format!("open sent for {network}, waiting ack"));
     if !client.send(frame) {
         client.drop_queue(&network);
@@ -494,7 +595,7 @@ fn open_service_adapter(network: Uuid, local_ip: Ipv4Addr) -> Result<Receiver<Ve
 
 pub struct Adapter {
     network: Uuid,
-    outbound: Sender<WriterMessage>,
+    client: Arc<PipeClient>,
     inbound: Receiver<Vec<u8>>,
 }
 
@@ -505,7 +606,7 @@ impl Adapter {
         let inbound = open_service_adapter(network.id, local_ip)?;
         Ok(Self {
             network: network.id,
-            outbound: client.outbound.clone(),
+            client,
             inbound,
         })
     }
@@ -525,21 +626,22 @@ impl Adapter {
             network: self.network,
             packet: bytes.to_vec(),
         })?;
-        self.outbound
-            .send(WriterMessage::Frame(frame))
-            .map_err(|_| anyhow::anyhow!("Служба FreeC Tier недоступна"))
+        anyhow::ensure!(
+            self.client.send_packet(frame),
+            "Служба FreeC Tier не успевает принимать пакеты"
+        );
+        Ok(())
     }
 }
 
 impl Drop for Adapter {
     fn drop(&mut self) {
-        let client = client();
-        client.drop_queue(&self.network);
-        client.live.lock().unwrap().remove(&self.network);
+        self.client.drop_queue(&self.network);
+        self.client.live.lock().unwrap().remove(&self.network);
         if let Ok(frame) = freec_ipc::encode_frame(&freec_ipc::ClientMessage::CloseAdapter {
             network: self.network,
         }) {
-            let _ = client.send(frame);
+            let _ = self.client.send(frame);
         }
     }
 }

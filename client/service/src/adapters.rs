@@ -12,14 +12,10 @@ use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
 use uuid::Uuid;
-
-/// Mirrors `freec_core::packet::MTU`; kept in sync by tests in freec-core.
-const MTU: u32 = 1280;
 
 /// The single shared adapter, created once per service lifetime and reused
 /// across clients and networks.
@@ -46,12 +42,21 @@ pub struct Adapters {
     /// swapped snapshot.
     routes: Arc<Mutex<Arc<BTreeMap<u8, Uuid>>>>,
     /// Where the reader delivers frames; None while no client is attached.
-    dest: Arc<Mutex<Option<Sender<Vec<u8>>>>>,
+    dest: Arc<Mutex<Option<SyncSender<Vec<u8>>>>>,
     stop_flag: Arc<AtomicBool>,
+    /// Raw handle of the service stop event, so the reader can block on the
+    /// adapter ring and still shut down immediately.
+    stop_event: isize,
+    /// Interface MTU to apply, as last requested by the client; the default
+    /// stands until a client that knows the setting asks for something else.
+    mtu: u32,
+    /// MTU currently set on the interface, so a changed setting is re-applied
+    /// to the live adapter instead of waiting for a service restart.
+    applied: Option<u32>,
 }
 
 impl Adapters {
-    pub fn new(stop_flag: Arc<AtomicBool>) -> Self {
+    pub fn new(stop_flag: Arc<AtomicBool>, stop_event: isize) -> Self {
         Self {
             api: Api::default(),
             active: None,
@@ -59,6 +64,9 @@ impl Adapters {
             routes: Arc::new(Mutex::new(Arc::new(BTreeMap::new()))),
             dest: Arc::new(Mutex::new(None)),
             stop_flag,
+            stop_event,
+            mtu: freec_core::packet::MTU_DEFAULT,
+            applied: None,
         }
     }
 
@@ -67,7 +75,10 @@ impl Adapters {
     /// wintun.dll, no adapter rights) defers to the first open attempt.
     pub fn prepare(&mut self) {
         match self.ensure_active() {
-            Ok(_) => self.sync_addresses(),
+            Ok(index) => {
+                self.apply_mtu(index);
+                self.sync_addresses();
+            }
             Err(error) => crate::log(&format!(
                 "adapter not created at start (deferred): {error:#}"
             )),
@@ -76,14 +87,20 @@ impl Adapters {
 
     /// Attach the current client's frame sink; packets read before an attach
     /// (or after a detach) are dropped.
-    pub fn attach(&self, sender: Sender<Vec<u8>>) {
+    pub fn attach(&self, sender: SyncSender<Vec<u8>>) {
         *self.dest.lock().unwrap() = Some(sender);
     }
 
     /// Open (or re-open) a network on the shared adapter: register its
-    /// address and publish its route. Idempotent for live networks.
-    pub fn open(&mut self, network: Uuid, local_ip: Ipv4Addr) -> Result<()> {
+    /// address and publish its route. Idempotent for live networks, which is
+    /// also how an MTU change arrives — the client re-sends `OpenAdapter` for
+    /// every live network instead of tearing anything down.
+    pub fn open(&mut self, network: Uuid, local_ip: Ipv4Addr, mtu: Option<u32>) -> Result<()> {
+        if let Some(mtu) = mtu {
+            self.mtu = freec_core::packet::clamp_mtu(mtu);
+        }
         let index = self.ensure_active()?;
+        self.apply_mtu(index);
         self.networks.insert(network, local_ip);
         self.rebuild_routes();
         add_address(index, local_ip)?;
@@ -127,6 +144,25 @@ impl Adapters {
         Ok(())
     }
 
+    /// Push the configured MTU onto the interface, skipping the call when it
+    /// is already there (an MTU change re-opens every live network, so this
+    /// runs far more often than it changes anything). A failure is logged and
+    /// retried on the next open rather than failing the network: a tunnel with
+    /// the wrong MTU still carries traffic.
+    fn apply_mtu(&mut self, index: u32) {
+        let mtu = freec_core::packet::clamp_mtu(self.mtu);
+        if self.applied == Some(mtu) {
+            return;
+        }
+        match configure_interface(index, mtu) {
+            Ok(()) => {
+                self.applied = Some(mtu);
+                crate::log(&format!("interface MTU set to {mtu}"));
+            }
+            Err(error) => crate::log(&format!("cannot set interface MTU {mtu}: {error:#}")),
+        }
+    }
+
     fn rebuild_routes(&self) {
         let next: BTreeMap<u8, Uuid> = self
             .networks
@@ -167,6 +203,9 @@ impl Adapters {
             crate::log("reader finished; rebuilding the shared adapter session");
             self.active = None;
         }
+        // A freshly created NIC comes up with the stack's default MTU, so the
+        // configured value must be pushed again after every rebuild.
+        self.applied = None;
         let api = self.ensure_api()?;
         let adapter = match wintun::Adapter::open(api, "FreeC") {
             Ok(adapter) => adapter,
@@ -185,7 +224,6 @@ impl Adapters {
         let index = interface_index(unsafe {
             std::mem::transmute::<wintun::NET_LUID_LH, [u8; 8]>(adapter.get_luid())
         })?;
-        configure_interface(index)?;
         let session = Arc::new(adapter.start_session(wintun::MAX_RING_CAPACITY)?);
         crate::log(&format!("shared adapter ready, interface index {index}"));
         let reader = self.spawn_reader(Arc::clone(&session))?;
@@ -198,18 +236,44 @@ impl Adapters {
     }
 
     /// The persistent packet pump: adapter ring → tagged pipe frames.
+    ///
+    /// The wait is the whole point of this thread's design. Polling the ring
+    /// with `sleep(1ms)` costs up to 15.6 ms per packet — Windows rounds a
+    /// sleep up to the timer tick, and that delay lands on every single hop a
+    /// game packet makes. Wintun signals a read event instead, so blocking on
+    /// it together with the service stop event gives wake-up as soon as the
+    /// ring has data and still shuts down immediately.
     fn spawn_reader(&mut self, session: Arc<wintun::Session>) -> Result<JoinHandle<()>> {
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::Threading::{WaitForMultipleObjects, INFINITE};
         let routes = Arc::clone(&self.routes);
         let dest = Arc::clone(&self.dest);
         let stop_flag = Arc::clone(&self.stop_flag);
+        let stop_event = self.stop_event;
         std::thread::Builder::new()
             .name("freec-svc-adapter".into())
             .spawn(move || {
+                crate::prioritize();
+                let read_event = match session.get_read_wait_event() {
+                    Ok(event) => HANDLE(event as *mut _),
+                    Err(error) => {
+                        crate::log(&format!("adapter read event unavailable: {error}"));
+                        return;
+                    }
+                };
+                let waits = [read_event, HANDLE(stop_event as *mut _)];
                 while !stop_flag.load(Ordering::SeqCst) {
                     let bytes = match session.try_receive() {
                         Ok(Some(packet)) => packet.bytes().to_vec(),
                         Ok(None) => {
-                            std::thread::sleep(Duration::from_millis(1));
+                            // Auto-reset event: if it fires for a packet that
+                            // try_receive already took, the next wait simply
+                            // blocks again.
+                            let signalled =
+                                unsafe { WaitForMultipleObjects(&waits, false, INFINITE) };
+                            if signalled.0 != 0 {
+                                break; // stop requested, or the wait failed
+                            }
                             continue;
                         }
                         Err(_) => break, // ring closed: service stopping
@@ -226,11 +290,22 @@ impl Adapters {
                             });
                         match frame {
                             Ok(frame) => {
-                                if sender.send(frame).is_err() {
-                                    // Pipe closed: detach so later packets
-                                    // skip delivery instead of erroring.
-                                    dest.lock().unwrap().take();
-                                    break;
+                                use std::sync::mpsc::TrySendError;
+                                match sender.try_send(frame) {
+                                    Ok(()) => {}
+                                    // A full queue means the client is not
+                                    // keeping up. Dropping here is what a real
+                                    // NIC does with a full ring: queueing the
+                                    // packet instead would stall every other
+                                    // network behind it and deliver it far too
+                                    // late to be useful anyway.
+                                    Err(TrySendError::Full(_)) => {}
+                                    Err(TrySendError::Disconnected(_)) => {
+                                        // Pipe closed: detach so later packets
+                                        // skip delivery instead of erroring.
+                                        dest.lock().unwrap().take();
+                                        break;
+                                    }
                                 }
                             }
                             Err(_) => break,
@@ -308,10 +383,11 @@ fn interface_index(luid: [u8; 8]) -> Result<u32> {
     Ok(index)
 }
 
-/// Interface-level setup, done once per adapter: MTU. The stack reports
-/// SitePrefixLength 255 for IPv4 interfaces, which SetIpInterfaceEntry
-/// rejects unless normalized to zero.
-fn configure_interface(index: u32) -> Result<()> {
+/// Interface-level setup: the MTU the client asked for (a user setting, so it
+/// is clamped here too — the service never trusts a number off the pipe). The
+/// stack reports SitePrefixLength 255 for IPv4 interfaces, which
+/// SetIpInterfaceEntry rejects unless normalized to zero.
+fn configure_interface(index: u32, mtu: u32) -> Result<()> {
     use windows::Win32::NetworkManagement::IpHelper::{
         GetIpInterfaceEntry, SetIpInterfaceEntry, MIB_IPINTERFACE_ROW,
     };
@@ -325,7 +401,7 @@ fn configure_interface(index: u32) -> Result<()> {
         GetIpInterfaceEntry(&mut interface)
             .ok()
             .context("GetIpInterfaceEntry")?;
-        interface.NlMtu = MTU;
+        interface.NlMtu = freec_core::packet::clamp_mtu(mtu);
         interface.SitePrefixLength = 0;
         SetIpInterfaceEntry(&mut interface)
             .ok()

@@ -2,7 +2,37 @@ use crate::config::Network;
 use anyhow::{ensure, Context, Result};
 use std::net::Ipv4Addr;
 
-pub const MTU: usize = 1280;
+/// Largest IPv4 packet accepted off the tunnel, in either direction. The
+/// interface MTU is a user setting, so the accept bound is the top of its
+/// range and not the configured value: a peer may run with a larger MTU than
+/// ours, and its packets must still be delivered.
+pub const MTU: usize = MTU_MAX as usize;
+
+/// Default interface MTU. Games are the workload here, and a conservative
+/// tunnel MTU is a worse failure than an extra Steam fragment: engines that
+/// assume a LAN-sized link emit large discovery and state packets, and some
+/// refuse to work with a link below the IPv6 minimum of 1280.
+pub const MTU_DEFAULT: u32 = 1280;
+/// Lowest MTU the settings allow — the IPv4 minimum reassembly buffer.
+pub const MTU_MIN: u32 = 576;
+/// Highest MTU the settings allow — a plain Ethernet link.
+pub const MTU_MAX: u32 = 1500;
+/// Payload one Steam datagram carries (`MTU_DataSize`, 1200 by default).
+pub const STEAM_DATAGRAM: usize = 1200;
+/// Largest MTU whose packets, header included, still fit a single Steam
+/// datagram. Above it Steam splits a packet into fragments, and losing one
+/// fragment of an unreliable message loses the whole game packet — the trade
+/// against the compatibility of a LAN-sized link, which is why this is a
+/// preset and not the default. Guarded by
+/// `no_fragment_mtu_fits_one_steam_datagram`.
+pub const MTU_NO_FRAGMENT: u32 = 1152;
+
+/// Keep a configured MTU inside the supported range. Values come from the UI
+/// and from settings files written by older versions, so they are never
+/// trusted.
+pub fn clamp_mtu(value: u32) -> u32 {
+    value.clamp(MTU_MIN, MTU_MAX)
+}
 
 #[derive(Debug)]
 pub struct Packet<'a> {

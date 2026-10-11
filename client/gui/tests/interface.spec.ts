@@ -318,6 +318,39 @@ test('accent swatches recolor the app, persist and hand over to the custom edito
   await page.screenshot({ path: '../../.cache/screenshots/accent.png', fullPage: true });
 });
 
+test('MTU presets and a custom value persist through settings', async ({ page }) => {
+  await page.addInitScript(() => {
+    const fixture = { steam: 'online', steam_id: '2', nickname: 'Guest', relay: 'Ok', networks: [], friends: [], events: [], sent: 0, received: 0, dropped: 0 };
+    Object.assign(window, { isTauri: true, __TAURI_INTERNALS__: { invoke: async (command: string, args: unknown) => {
+      if (command === 'snapshot') return structuredClone(fixture);
+      if (command === 'settings') return { minimize_to_tray: true, check_updates: false, autostart: false, theme: 'dark', onboarded: true, mtu: 1280 };
+      if (command === 'version') return '0.2.0';
+      if (command === 'save_settings') Object.assign(window, { savedSettings: args });
+      if (command === 'service_status') return { installed: false, running: false };
+    } } });
+  });
+  const saved = async () => await page.evaluate(() => (window as unknown as {savedSettings?: {settings?: {mtu?: number}}}).savedSettings?.settings?.mtu);
+  await page.goto('/');
+  await page.locator('#settings').click();
+  // The stored value owns the segment, and the custom field stays closed.
+  await expect(page.getByRole('button', { name: '1280', exact: true })).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.locator('#mtu-input')).toHaveCount(0);
+  await page.getByRole('button', { name: '1152', exact: true }).click();
+  await expect.poll(saved).toBe(1152);
+  // «Своё» opens the field without saving anything on its own.
+  await page.getByRole('button', { name: 'Своё' }).click();
+  await expect(page.locator('#mtu-input')).toHaveValue('1152');
+  expect(await saved()).toBe(1152);
+  await page.locator('#mtu-input').fill('1400');
+  await page.locator('#mtu-input').blur();
+  await expect.poll(saved).toBe(1400);
+  // Out-of-range input is clamped before it reaches the engine.
+  await page.locator('#mtu-input').fill('9000');
+  await page.locator('#mtu-input').blur();
+  await expect.poll(saved).toBe(1500);
+  await page.screenshot({ path: '../../.cache/screenshots/mtu.png', fullPage: true });
+});
+
 test('custom theme seeds from the current theme, previews live and persists', async ({ page }) => {
   await page.addInitScript(() => {
     const fixture = { steam: 'online', steam_id: '2', nickname: 'Guest', relay: 'Ok', networks: [], friends: [], events: [], sent: 0, received: 0, dropped: 0 };

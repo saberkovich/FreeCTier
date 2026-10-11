@@ -7,7 +7,7 @@ type Peer = { steam_id: string; name: string; ip: string; active: boolean; state
 type Network = { id: string; name: string; subnet: string; owner: string; revision: number; adapter: boolean; lobby?: string; public: boolean; can_invite: boolean; password: boolean; members: Peer[] };
 type Snapshot = { steam: string; steam_id?: string; nickname?: string; relay: string; networks: Network[]; friends: { steam_id: string; name: string }[]; events: string[]; received: number; sent: number; dropped: number; joins?: { id: string; name: string; password: boolean }[]; public_networks?: { lobby: string; name: string }[] };
 type Command = { type: string; [key: string]: unknown };
-type Settings = { minimize_to_tray: boolean; check_updates: boolean; autostart?: boolean; start_in_tray?: boolean; theme: string; onboarded?: boolean; accent?: string; custom_colors?: Record<string, string> };
+type Settings = { minimize_to_tray: boolean; check_updates: boolean; autostart?: boolean; start_in_tray?: boolean; theme: string; onboarded?: boolean; accent?: string; custom_colors?: Record<string, string>; mtu?: number };
 type SteamAppState = { app_id: number; in_library: boolean | null };
 
 let state: Snapshot = { steam: 'waiting', relay: 'unknown', networks: [], friends: [], events: [], received: 0, sent: 0, dropped: 0 };
@@ -25,6 +25,19 @@ let discoverQuery = '';
 let copied = 0;
 let steamApp: SteamAppState | null = null;
 let welcomePoll = 0;
+// The «Своё» segment stays selected while the typed value happens to equal a
+// preset, so entering 1280 by hand does not snap the UI back to the preset.
+let mtuCustom = false;
+// Mirrors freec_core::packet — the engine clamps anyway, the UI only has to
+// keep the user inside the range while they type.
+const MTU_MIN = 576;
+const MTU_MAX = 1500;
+const MTU_DEFAULT = 1280;
+const MTU_PRESETS: { value: number; hint: string }[] = [
+  { value: 1280, hint: 'Рекомендуется: размер, который ожидают игры в локальной сети.' },
+  { value: 1152, hint: 'Пакет целиком помещается в одну посылку Steam — меньше потерь на плохом канале, но некоторые игры ждут размер побольше.' },
+  { value: 1500, hint: 'Как в обычной Ethernet-сети. Steam будет делить большие пакеты на части.' },
+];
 const app = document.querySelector<HTMLDivElement>('#app')!;
 app.innerHTML = `
   <nav class="rail" aria-label="Разделы">
@@ -403,6 +416,7 @@ function renderSettings() {
   contentHTML(`<section class="page narrow" id="settings-page"><div class="page-head"><div><h1>Настройки</h1><p class="page-sub">Поведение клиента, служба и обновления</p></div></div>
     <div class="card"><div class="row"><span class="row-label">Тема</span><div class="segmented" role="group" aria-label="Тема"><button id="theme-dark" class="seg ${preferences.theme === 'dark' ? 'active' : ''}" aria-pressed="${preferences.theme === 'dark'}">Тёмная</button><button id="theme-light" class="seg ${preferences.theme === 'light' ? 'active' : ''}" aria-pressed="${preferences.theme === 'light'}">Светлая</button><button id="theme-custom" class="seg ${preferences.theme === 'custom' ? 'active' : ''}" aria-pressed="${preferences.theme === 'custom'}">Своя</button></div></div>${preferences.theme === 'custom' ? '' : `<div class="row"><span class="row-label">Акцентный цвет<small>Главный цвет кнопок и выделений</small></span><div class="swatches">${accentSwatches()}</div></div>`}<label class="row"><span class="row-label">Сворачивать в трей</span><input id="minimize-tray" type="checkbox" class="switch" ${preferences.minimize_to_tray ? 'checked' : ''} /></label><label class="row"><span class="row-label">Запускать при входе в Windows</span><input id="autostart" type="checkbox" class="switch" ${preferences.autostart ? "checked" : ""} /></label><label class="row"><span class="row-label">Запускать в трее<small>Окно не появится при входе в Windows — только значок рядом с часами</small></span><input id="start-tray" type="checkbox" class="switch" ${preferences.start_in_tray ? 'checked' : ''} ${preferences.autostart ? '' : 'disabled'} /></label></div>
     ${preferences.theme === 'custom' ? `<div class="card" id="theme-editor">${THEME_GROUPS.map(([title, tokens]) => `<h3 class="editor-title">${escape(title)}</h3>${tokens.map(token => `<label class="row color-row"><span class="row-label">${escape(THEME_LABELS[token] ?? token)}</span><input type="color" class="color-input" data-token="${token}" value="${escape(preferences.custom_colors?.[token] ?? '#000000')}" aria-label="${escape(THEME_LABELS[token] ?? token)}" /></label>`).join('')}`).join('')}<div class="row"><span class="row-label muted">Изменения применяются сразу.</span><button class="button" id="theme-reset">Сбросить</button></div></div>` : ''}
+    <h2 class="group-title">Сеть</h2><div class="card"><div class="row"><span class="row-label">MTU виртуального адаптера<small>${escape(mtuHint())}</small></span><div class="segmented" role="group" aria-label="MTU">${mtuSegments()}</div></div>${mtuIsCustom() ? `<label class="row"><span class="row-label">Своё значение<small>От ${MTU_MIN} до ${MTU_MAX} байт</small></span><input id="mtu-input" class="number-input" type="number" inputmode="numeric" min="${MTU_MIN}" max="${MTU_MAX}" value="${mtuValue()}" aria-label="Своё значение MTU" /></label>` : ''}<div class="row"><span class="row-label muted">Применяется сразу, включая уже запущенные сети. Игру лучше перезапустить.</span></div></div>
     <h2 class="group-title">Служба</h2><div class="card"><div class="row"><span class="row-label">Служба FreeC Tier<small id="service-status">Проверяем…</small></span><div class="row-actions"><button class="button" id="service-install">Переустановить</button><button class="button" id="service-uninstall">Удалить</button></div></div></div>
     <h2 class="group-title">Обновления</h2><div class="card"><label class="row"><span class="row-label">Проверять при запуске</span><input id="auto-update" type="checkbox" class="switch" ${preferences.check_updates ? 'checked' : ''} /></label><div class="row"><span class="row-label muted" id="update-message" role="status">${escape(updateMessage)}</span><div class="row-actions"><button class="button" id="check-update" ${updating ? 'disabled' : ''}>${updating ? 'Проверяем…' : 'Проверить'}</button>${updateVersion ? `<button class="button primary" id="install-update" ${updating ? 'disabled' : ''}>Установить ${escape(updateVersion)}</button>` : ''}</div></div></div>
     <h2 class="group-title">Steam</h2><div class="card"><button class="row row-button" id="steam-setup"><span class="row-label">Настройка Steam<small>Приложение в библиотеке и его видимость</small></span><span class="chev" aria-hidden="true">→</span></button><button class="row row-button" id="steam-help"><span class="row-label">Скрыть статус «играет»</span><span class="chev" aria-hidden="true">→</span></button></div>
@@ -426,6 +440,20 @@ function renderSettings() {
     void savePreferences({ ...preferences, theme: 'dark', custom_colors: undefined });
   });
   document.querySelector<HTMLInputElement>('#minimize-tray')!.onchange = e => { void savePreferences({ ...preferences, minimize_to_tray: (e.target as HTMLInputElement).checked }); };
+  document.querySelectorAll<HTMLButtonElement>('[data-mtu]').forEach(button => button.onclick = () => {
+    const choice = button.dataset.mtu!;
+    if (choice === 'custom') { mtuCustom = true; renderSettings(); return; }
+    mtuCustom = false;
+    void savePreferences({ ...preferences, mtu: Number(choice) });
+  });
+  const mtuInput = document.querySelector<HTMLInputElement>('#mtu-input');
+  // On change, not on input: a half-typed «15» would otherwise be saved as 576
+  // and reconfigure every live adapter on the way to 1500.
+  if (mtuInput) mtuInput.onchange = () => {
+    const value = Math.min(MTU_MAX, Math.max(MTU_MIN, Math.round(Number(mtuInput.value) || MTU_DEFAULT)));
+    mtuInput.value = String(value);
+    void savePreferences({ ...preferences, mtu: value });
+  };
     async function refreshServiceStatus() {
     if (!isTauri()) return;
     try {
@@ -466,6 +494,27 @@ function renderSettings() {
   document.querySelector<HTMLButtonElement>('#check-update')!.onclick = () => { void checkUpdate(); };
   const install = document.querySelector<HTMLButtonElement>('#install-update');
   if (install) install.onclick = () => { void installUpdate(); };
+}
+function mtuValue() {
+  const stored = Number(preferences.mtu);
+  return Number.isFinite(stored) && stored > 0 ? Math.min(MTU_MAX, Math.max(MTU_MIN, Math.round(stored))) : MTU_DEFAULT;
+}
+// A value that is not one of the presets can only have come from the field, so
+// the custom row stays open across a re-render and after a restart.
+function mtuIsCustom() {
+  return mtuCustom || !MTU_PRESETS.some(preset => preset.value === mtuValue());
+}
+function mtuSegments() {
+  const custom = mtuIsCustom();
+  const presets = MTU_PRESETS.map(preset => {
+    const active = !custom && preset.value === mtuValue();
+    return `<button class="seg ${active ? 'active' : ''}" data-mtu="${preset.value}" aria-pressed="${active}">${preset.value}</button>`;
+  }).join('');
+  return `${presets}<button class="seg ${custom ? 'active' : ''}" data-mtu="custom" aria-pressed="${custom}">Своё</button>`;
+}
+function mtuHint() {
+  if (mtuIsCustom()) return `Своё значение: ${mtuValue()} байт. Меняйте, только если игра не работает на пресетах.`;
+  return MTU_PRESETS.find(preset => preset.value === mtuValue())?.hint ?? '';
 }
 // Swatch colors live in the stylesheet (`--accent-preset`, `--accent-slot-N`)
 // and are read back here only to store the pick — a `style` attribute would be

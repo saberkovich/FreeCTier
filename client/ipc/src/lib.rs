@@ -16,8 +16,9 @@ use uuid::Uuid;
 pub const PROTOCOL: u16 = 1;
 /// Named pipe both sides agree on.
 pub const PIPE_PATH: &str = "\\\\.\\pipe\\FreeCTierService";
-/// Packet payload is bounded by MTU (1280); the cap covers any frame the
-/// service accepts, including the largest adapter error text.
+/// Packet payload is bounded by the widest MTU the settings allow (1500); the
+/// cap covers any frame the service accepts, including the largest adapter
+/// error text.
 pub const MAX_FRAME: usize = 64 * 1024;
 
 fn invalid(what: &str) -> io::Error {
@@ -29,9 +30,22 @@ fn invalid(what: &str) -> io::Error {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientMessage {
     Hello,
-    OpenAdapter { network: Uuid, local_ip: Ipv4Addr },
-    CloseAdapter { network: Uuid },
-    Packet { network: Uuid, packet: Vec<u8> },
+    OpenAdapter {
+        network: Uuid,
+        local_ip: Ipv4Addr,
+        /// Interface MTU the client wants, appended after the address. `None`
+        /// means the sender predates the setting — the body simply ends at the
+        /// address, which is why this extends the message without a protocol
+        /// bump, in either direction — and the service keeps its default.
+        mtu: Option<u16>,
+    },
+    CloseAdapter {
+        network: Uuid,
+    },
+    Packet {
+        network: Uuid,
+        packet: Vec<u8>,
+    },
 }
 
 /// Service → UI process. Delivers inbound IPv4 packets and acknowledges
@@ -99,9 +113,16 @@ fn encode_client(message: &ClientMessage) -> io::Result<(u8, Vec<u8>)> {
             body.extend_from_slice(&PROTOCOL.to_le_bytes());
             1
         }
-        ClientMessage::OpenAdapter { network, local_ip } => {
+        ClientMessage::OpenAdapter {
+            network,
+            local_ip,
+            mtu,
+        } => {
             put_uuid(&mut body, *network);
             body.extend_from_slice(&local_ip.octets());
+            if let Some(mtu) = mtu {
+                body.extend_from_slice(&mtu.to_le_bytes());
+            }
             2
         }
         ClientMessage::CloseAdapter { network } => {
@@ -183,6 +204,11 @@ fn decode_client(frame: &[u8]) -> io::Result<ClientMessage> {
                 *body.get(18).ok_or_else(|| invalid("truncated local ip"))?,
                 *body.get(19).ok_or_else(|| invalid("truncated local ip"))?,
             ),
+            // Optional tail: a client that predates the MTU setting stops at
+            // the address and leaves the service on its default.
+            mtu: body
+                .get(20..22)
+                .map(|bytes| u16::from_le_bytes(bytes.try_into().expect("2-byte slice"))),
         },
         3 => ClientMessage::CloseAdapter {
             network: get_uuid(body, 0)?,
@@ -254,8 +280,12 @@ pub fn decode_service_frame(frame: &[u8]) -> io::Result<ServiceMessage> {
 
 /// Blocking framed write; the caller treats a short write as a broken pipe.
 pub fn write_frame<W: io::Write>(stream: &mut W, frame: &[u8]) -> io::Result<()> {
-    stream.write_all(&(frame.len() as u32).to_le_bytes())?;
-    stream.write_all(frame)
+    // One write per frame: the transports behind this are unbuffered pipes,
+    // where a second syscall costs more than copying the payload once.
+    let mut out = Vec::with_capacity(4 + frame.len());
+    out.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+    out.extend_from_slice(frame);
+    stream.write_all(&out)
 }
 
 /// Blocking framed read; returns the frame without the length prefix.
@@ -294,6 +324,12 @@ mod codec {
         roundtrip_client(ClientMessage::OpenAdapter {
             network: NETWORK,
             local_ip: LOCAL_IP,
+            mtu: Some(1280),
+        });
+        roundtrip_client(ClientMessage::OpenAdapter {
+            network: NETWORK,
+            local_ip: LOCAL_IP,
+            mtu: None,
         });
         roundtrip_client(ClientMessage::CloseAdapter { network: NETWORK });
         roundtrip_client(ClientMessage::Packet {
