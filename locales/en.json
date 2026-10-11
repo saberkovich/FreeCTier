@@ -104,6 +104,10 @@
   "delete.owner": "“{name}” will be removed from this computer. As the owner, you lose control of the network unless you keep its configuration.",
   "delete.member": "“{name}” will be removed from this computer.",
 
+  "rename.title": "Rename network",
+  "rename.aria": "Rename",
+  "rename.submit": "Save",
+
   "password.title": "Network password",
   "password.label": "Password",
   "password.continue": "Continue",

@@ -36,6 +36,12 @@ fn is_private(access: &Access) -> bool {
     *access == Access::Private
 }
 
+/// The shared name rule: `Network::new`, `validate` and renames must agree on
+/// what a network may be called.
+fn valid_name(name: &str) -> bool {
+    !name.trim().is_empty() && name.len() <= 128 && !name.chars().any(char::is_control)
+}
+
 fn default_true() -> bool {
     true
 }
@@ -141,12 +147,7 @@ impl Network {
             matches!(self.schema, 1 | 2) && self.revision > 0,
             "Unsupported configuration version"
         );
-        ensure!(
-            !self.name.trim().is_empty()
-                && self.name.len() <= 128
-                && !self.name.chars().any(char::is_control),
-            "Invalid network name"
-        );
+        ensure!(valid_name(&self.name), "Invalid network name");
         ensure!(self.owner.parse::<u64>()? > 0, "Invalid owner SteamID");
         let octets = self.subnet.octets();
         ensure!(
@@ -237,6 +238,17 @@ impl Network {
                 .members
                 .iter()
                 .any(|m| m.active && m.steam_id == steam_id && m.can_invite)
+    }
+
+    pub fn set_name(&mut self, actor: &str, name: String) -> Result<()> {
+        ensure!(actor == self.owner, "Only owner can rename the network");
+        let name = name.trim().to_owned();
+        ensure!(valid_name(&name), "Invalid network name");
+        if self.name != name {
+            self.name = name;
+            self.revision += 1;
+        }
+        Ok(())
     }
 
     pub fn set_access(&mut self, actor: &str, access: Access) -> Result<()> {

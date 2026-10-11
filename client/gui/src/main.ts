@@ -64,6 +64,7 @@ app.innerHTML = `
   <dialog id="join-dialog"><form id="join-form"><div class="dialog-heading"><h2 data-i18n="join.title"></h2><button class="icon-button close" type="button" data-i18n-aria-label="common.close">×</button></div><label for="lobby-id" data-i18n="join.lobby_id"></label><input id="lobby-id" name="lobby" required inputmode="numeric" pattern="[0-9]{1,20}" data-i18n-placeholder="join.lobby_placeholder" /><div class="dialog-actions"><button type="button" class="button close" data-i18n="common.cancel"></button><button class="button primary" type="submit" data-i18n="join.submit"></button></div></form></dialog>
   <dialog id="invite-dialog"><div class="dialog-heading"><h2 data-i18n="invite.title"></h2><button class="icon-button close" data-i18n-aria-label="common.close">×</button></div><div id="friend-list"></div><button id="overlay" class="button" data-i18n="invite.overlay"></button></dialog>
   <dialog id="delete-dialog"><form id="delete-form"><div class="dialog-heading"><h2 data-i18n="delete.title"></h2><button class="icon-button close" type="button" data-i18n-aria-label="common.close">×</button></div><p id="delete-description"></p><p data-i18n="delete.others_keep"></p><div class="dialog-actions"><button type="button" class="button close" data-i18n="common.cancel"></button><button class="button danger" type="submit" data-i18n="delete.submit"></button></div></form></dialog>
+  <dialog id="rename-dialog"><form id="rename-form"><div class="dialog-heading"><h2 data-i18n="rename.title"></h2><button class="icon-button close" type="button" data-i18n-aria-label="common.close">×</button></div><label for="rename-name" data-i18n="create.name"></label><input id="rename-name" name="name" maxlength="64" required data-i18n-placeholder="create.name_placeholder" autocomplete="off" /><div class="dialog-actions"><button type="button" class="button close" data-i18n="common.cancel"></button><button class="button primary" type="submit" data-i18n="rename.submit"></button></div></form></dialog>
   <dialog id="password-dialog"><form id="password-form"><div class="dialog-heading"><h2 id="password-title" data-i18n="password.title"></h2><button class="icon-button close" type="button" data-i18n-aria-label="common.close">×</button></div><label for="password-input" data-i18n="password.label"></label><input id="password-input" type="password" maxlength="128" autocomplete="current-password" /><p class="hint" id="password-hint"></p><div class="dialog-actions"><button class="button primary" type="submit" data-i18n="password.continue"></button></div></form></dialog>
   <dialog id="steam-help-dialog"><div class="dialog-heading"><h2 data-i18n="steam_help.title"></h2><button class="icon-button close" type="button" data-i18n-aria-label="common.close">×</button></div><p class="steam-help-note" data-i18n="steam_help.note"></p><div class="steam-help">${hideStep(1)}</div></dialog>
   <dialog id="welcome-dialog"></dialog>`;
@@ -214,7 +215,7 @@ function renderNetwork(active: Network, connected: boolean) {
     <section class="hero ${on ? 'on' : ''}">
       <div class="hero-power">${on ? '<span class="hero-ring" aria-hidden="true"></span>' : ''}<button id="toggle-adapter" class="power" aria-label="${power}" title="${power}" ${!connected || !local?.active ? 'disabled' : ''}><svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M12 3v8M6.3 6.3a8 8 0 1 0 11.4 0" /></svg></button></div>
       <div class="hero-body">
-        <div class="hero-name"><h1>${escape(active.name)}</h1><span class="tag">${h(active.public ? 'access.public' : 'access.private')}</span></div>
+        <div class="hero-name"><h1>${escape(active.name)}</h1>${owner ? `<button id="rename-network" class="icon-button" title="${h('rename.aria')}" aria-label="${h('rename.aria')}"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9" /><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" /></svg></button>` : ''}<span class="tag">${h(active.public ? 'access.public' : 'access.private')}</span></div>
         <p class="hero-status">${statusText}</p>
         <div class="hero-actions">${local?.active ? `<button id="copy-ip" class="ip-chip" title="${h('network.copy_ip')}"><span class="ip-label">${h('network.your_ip')}</span><code>${escape(local.ip)}</code><span class="ip-copy">${h(copied === 1 ? 'network.copied' : 'network.copy')}</span></button>` : ''}<button id="invite" class="button primary" ${!active.can_invite || !connected ? 'disabled' : ''}>${h('network.invite')}</button></div>
       </div>
@@ -262,6 +263,13 @@ function renderNetwork(active: Network, connected: boolean) {
     const dialog = document.querySelector<HTMLDialogElement>('#delete-dialog')!;
     dialog.dataset.network = active.id;
     document.querySelector('#delete-description')!.textContent = t(owner ? 'delete.owner' : 'delete.member', { name: active.name });
+    dialog.showModal();
+  };
+  const renameButton = document.querySelector<HTMLButtonElement>('#rename-network');
+  if (renameButton) renameButton.onclick = () => {
+    const dialog = document.querySelector<HTMLDialogElement>('#rename-dialog')!;
+    dialog.dataset.network = active.id;
+    document.querySelector<HTMLInputElement>('#rename-name')!.value = active.name;
     dialog.showModal();
   };
   document.querySelectorAll<HTMLButtonElement>('[data-member]').forEach(button => button.onclick = () => send({ type: button.dataset.active === 'true' ? 'revoke' : 'readmit', network: active.id, steam_id: button.dataset.member }));
@@ -645,6 +653,11 @@ document.querySelector<HTMLFormElement>('#join-form')!.onsubmit = async e => {
 document.querySelector<HTMLFormElement>('#delete-form')!.onsubmit = async e => {
   e.preventDefault(); const dialog = document.querySelector<HTMLDialogElement>('#delete-dialog')!;
   if (await send({ type: 'delete', network: dialog.dataset.network })) dialog.close();
+};
+document.querySelector<HTMLFormElement>('#rename-form')!.onsubmit = async e => {
+  e.preventDefault(); const dialog = document.querySelector<HTMLDialogElement>('#rename-dialog')!;
+  const input = document.querySelector<HTMLInputElement>('#rename-name')!;
+  if (await send({ type: 'rename', network: dialog.dataset.network, name: input.value.trim() })) dialog.close();
 };
 
 // Avatars arrive out of band: ask only for the members still missing one, and

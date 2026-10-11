@@ -572,6 +572,53 @@ mod policy {
         assert!(next.check_update(&signed).unwrap());
     }
 
+    /// A rename is an owner-only policy change: it must travel to members as an
+    /// accepted signed update, and anything the name rules reject must bounce
+    /// before the configuration is touched.
+    #[test]
+    fn owner_renames_are_signed_updates_and_member_names_are_rejected() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut network = Network::new("LAN".into(), 76561198000000001, 0, &key).unwrap();
+        let owner = network.owner.clone();
+        network.admit(&owner, 76561198000000002).unwrap();
+        let signed = SignedNetwork::sign(network.clone(), &key).unwrap();
+        // A member is never allowed to rename, even with invite rights.
+        assert!(network
+            .set_name("76561198000000002", "Usurped".into())
+            .is_err());
+        network
+            .set_name(&owner, "  Квест-комната  ".into())
+            .unwrap();
+        assert_eq!(network.name, "Квест-комната");
+        assert_eq!(network.revision, signed.network.revision + 1);
+        let renamed = SignedNetwork::sign(network.clone(), &key).unwrap();
+        assert!(renamed.check_update(&signed).unwrap());
+        // The identity fields stay pinned; only the label moved.
+        assert_eq!(renamed.network.id, signed.network.id);
+        assert_eq!(renamed.network.owner, signed.network.owner);
+        assert_eq!(renamed.network.subnet, signed.network.subnet);
+        // Same name again is a no-op and must not burn a revision.
+        let unchanged = renamed.network.clone();
+        let mut quiet = unchanged.clone();
+        quiet
+            .set_name(&owner, renamed.network.name.clone())
+            .unwrap();
+        assert_eq!(quiet.revision, renamed.network.revision);
+        for bad in [
+            "".to_owned(),
+            "   ".into(),
+            "\u{7}bell".into(),
+            "x".repeat(129),
+        ] {
+            let mut candidate = unchanged.clone();
+            assert!(
+                candidate.set_name(&owner, bad.clone()).is_err(),
+                "name {bad:?} must be rejected"
+            );
+            assert_eq!(candidate, unchanged, "a rejected rename must not mutate");
+        }
+    }
+
     #[test]
     fn storage_survives_restart_and_atomic_replacement() {
         use crate::storage::Store;
