@@ -5,6 +5,11 @@
   "nav.create": "Create network",
   "nav.public": "Public networks",
   "nav.settings": "Settings",
+  "window.controls": "Window",
+  "window.minimize": "Minimize",
+  "window.maximize": "Maximize",
+  "window.restore": "Restore down",
+  "window.close": "Close",
 
   "common.close": "Close",
   "common.cancel": "Cancel",

@@ -345,6 +345,60 @@ fn quit(app: tauri::AppHandle) {
 fn version(app: tauri::AppHandle) -> String {
     app.package_info().version.to_string()
 }
+/// Caption buttons of the custom title bar. Close and minimize take the same
+/// paths as the native ones did: `CloseRequested` and the minimized `Resized`
+/// put the window in the tray.
+#[tauri::command]
+fn window_control(window: tauri::WebviewWindow, action: String) -> Result<(), String> {
+    match action.as_str() {
+        "minimize" => window.minimize(),
+        "maximize" if window.is_maximized().unwrap_or(false) => window.unmaximize(),
+        "maximize" => window.maximize(),
+        "close" => window.close(),
+        other => return Err(format!("unknown window action {other}")),
+    }
+    .map_err(|e| e.to_string())
+}
+#[tauri::command]
+fn window_maximized(window: tauri::WebviewWindow) -> bool {
+    window.is_maximized().unwrap_or(false)
+}
+/// Paints the 1px frame DWM draws around the undecorated window in the theme's
+/// hairline color. Windows 11 only: Windows 10 rejects the attribute and keeps
+/// its own thin border, which costs nothing.
+#[tauri::command]
+fn window_border(window: tauri::WebviewWindow, color: [u8; 3]) {
+    #[cfg(windows)]
+    {
+        #[link(name = "dwmapi")]
+        unsafe extern "system" {
+            fn DwmSetWindowAttribute(
+                window: *mut std::ffi::c_void,
+                attribute: u32,
+                value: *const std::ffi::c_void,
+                size: u32,
+            ) -> i32;
+        }
+        const DWMWA_BORDER_COLOR: u32 = 34;
+        let Ok(hwnd) = window.hwnd() else {
+            return;
+        };
+        // COLORREF is 0x00BBGGRR.
+        let [r, g, b] = color;
+        let value = u32::from(r) | u32::from(g) << 8 | u32::from(b) << 16;
+        // The value outlives the synchronous call; a failure leaves the system border.
+        unsafe {
+            DwmSetWindowAttribute(
+                hwnd.0,
+                DWMWA_BORDER_COLOR,
+                std::ptr::from_ref(&value).cast(),
+                4,
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (window, color);
+}
 /// Open a URL or file path in the default handler. ShellExecuteW returns a
 /// value greater than 32 on success.
 #[cfg(windows)]
@@ -865,7 +919,10 @@ fn main() {
             check_update,
             install_update,
             quit,
-            version
+            version,
+            window_control,
+            window_maximized,
+            window_border
         ])
         .build(tauri::generate_context!())
         .expect("Cannot initialize FreeC Tier")

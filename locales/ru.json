@@ -5,6 +5,11 @@
   "nav.create": "Создать сеть",
   "nav.public": "Публичные сети",
   "nav.settings": "Настройки",
+  "window.controls": "Окно",
+  "window.minimize": "Свернуть",
+  "window.maximize": "Развернуть",
+  "window.restore": "Свернуть в окно",
+  "window.close": "Закрыть",
 
   "common.close": "Закрыть",
   "common.cancel": "Отмена",

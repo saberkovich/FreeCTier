@@ -17,6 +17,8 @@
       "height": 720,
       "minWidth": 720,
       "minHeight": 520,
+      "decorations": false,
+      "shadow": true,
       "visible": false,
       "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-extensions --disable-breakpad --disable-background-networking --js-flags=--max-old-space-size=96"
     }],

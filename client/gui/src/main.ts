@@ -41,6 +41,16 @@ const MTU_PRESETS: { value: number; hint: string }[] = [
   { value: 1500, hint: 'mtu.hint_1500' },
 ];
 const app = document.querySelector<HTMLDivElement>('#app')!;
+// The window has no native frame (`decorations: false`): the top bar is its
+// caption and these are its buttons. Glyphs follow the 10px Windows set.
+const WINDOW_CHROME = `<div class="window-chrome" id="window-chrome">
+    <div class="chrome-drag" data-tauri-drag-region aria-hidden="true"></div>
+    <div class="window-controls" role="group" data-i18n-aria-label="window.controls" data-tauri-drag-region>
+      <button class="window-button" id="window-minimize" data-i18n-title="window.minimize" data-i18n-aria-label="window.minimize"><svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" aria-hidden="true"><path d="M0 5.5h10" /></svg></button>
+      <button class="window-button" id="window-maximize" data-i18n-title="window.maximize" data-i18n-aria-label="window.maximize"><svg class="glyph-maximize" width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" aria-hidden="true"><rect x=".5" y=".5" width="9" height="9" rx="1.5" /></svg><svg class="glyph-restore" width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" aria-hidden="true"><path d="M2.5 2.5v-1a1 1 0 0 1 1-1h5a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1h-1" /><rect x=".5" y="2.5" width="7" height="7" rx="1" /></svg></button>
+      <button class="window-button close" id="window-close" data-i18n-title="window.close" data-i18n-aria-label="window.close"><svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-linecap="round" aria-hidden="true"><path d="M.75.75l8.5 8.5M9.25.75l-8.5 8.5" /></svg></button>
+    </div>
+  </div>`;
 setLanguage(initialLanguage());
 // Static markup carries catalog keys (`data-i18n*`) instead of text, so a
 // language switch refills it in place — dialogs stay open through a switch.
@@ -55,11 +65,12 @@ app.innerHTML = `
     <button class="rail-button cog" id="settings" data-i18n-title="nav.settings" data-i18n-aria-label="nav.settings"><span aria-hidden="true">⚙</span></button>
   </nav>
   <div class="main">
-    <header class="topbar"><div class="topbar-title" id="page-title">FreeC Tier</div><span class="topbar-sub" id="page-sub"></span><span class="topbar-grow"></span><button id="header-update" class="header-update" hidden></button><div id="session" role="status"></div></header>
+    <header class="topbar" data-tauri-drag-region="deep"><div class="topbar-title" id="page-title">FreeC Tier</div><span class="topbar-sub" id="page-sub"></span><span class="topbar-grow"></span><button id="header-update" class="header-update" hidden></button><div id="session" role="status"></div></header>
     <main id="content"></main>
   </div>
   <div id="notice" role="status" hidden></div>
   <div id="joins-bar" role="status" hidden></div>
+  ${isTauri() ? WINDOW_CHROME : ''}
   <dialog id="create-dialog"><form id="create-form"><div class="dialog-heading"><h2 data-i18n="create.title"></h2><button class="icon-button close" type="button" data-i18n-aria-label="common.close">×</button></div><p data-i18n="create.subnet_note"></p><label for="network-name" data-i18n="create.name"></label><input id="network-name" name="name" maxlength="64" required data-i18n-placeholder="create.name_placeholder" autocomplete="off" /><label data-i18n="access.label"></label><div class="segmented wide" role="group" data-i18n-aria-label="access.label"><button type="button" id="create-private" class="seg active" aria-pressed="true" data-i18n="access.private"></button><button type="button" id="create-public" class="seg" aria-pressed="false" data-i18n="access.public"></button></div><label id="create-password-label" hidden><span data-i18n="create.password"></span><input id="create-password" type="password" maxlength="128" autocomplete="new-password" /></label><p class="hint" data-i18n="create.hint"></p><div class="dialog-actions"><button type="button" class="button close" data-i18n="common.cancel"></button><button class="button primary" type="submit" data-i18n="create.submit"></button></div></form></dialog>
   <dialog id="join-dialog"><form id="join-form"><div class="dialog-heading"><h2 data-i18n="join.title"></h2><button class="icon-button close" type="button" data-i18n-aria-label="common.close">×</button></div><label for="lobby-id" data-i18n="join.lobby_id"></label><input id="lobby-id" name="lobby" required inputmode="numeric" pattern="[0-9]{1,20}" data-i18n-placeholder="join.lobby_placeholder" /><div class="dialog-actions"><button type="button" class="button close" data-i18n="common.cancel"></button><button class="button primary" type="submit" data-i18n="join.submit"></button></div></form></dialog>
   <dialog id="invite-dialog"><div class="dialog-heading"><h2 data-i18n="invite.title"></h2><button class="icon-button close" data-i18n-aria-label="common.close">×</button></div><div id="friend-list"></div><button id="overlay" class="button" data-i18n="invite.overlay"></button></dialog>
@@ -80,7 +91,7 @@ function patch(element: HTMLElement, html: string) {
     if (from.classList.contains('lang-picker') && from.querySelector('.lang-menu:not([hidden])')) return false;
     if (from.id === 'event-log' || from.id === 'counters') return false;
     return !from.isEqualNode(to);
-  } });
+  }, onBeforeNodeDiscarded: node => (node as Element).id !== 'window-chrome' });
 }
 function contentHTML(html: string) { patch(content, html); }
 function escape(value: string) { return value.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!)); }
@@ -116,6 +127,59 @@ function applyTheme(theme: string) {
   } else if (preferences.accent) {
     applyAccent(preferences.accent);
   }
+  paintWindowBorder();
+}
+// DWM draws the hairline around the frameless window; it takes the same color
+// as every other hairline in the app. A canvas resolves whatever CSS color the
+// token holds into the RGB the Win32 call needs.
+let colorProbe: CanvasRenderingContext2D | null = null;
+function paintWindowBorder() {
+  if (!isTauri()) return;
+  colorProbe ??= document.createElement('canvas').getContext('2d', { willReadFrequently: true });
+  if (!colorProbe) return;
+  colorProbe.clearRect(0, 0, 1, 1);
+  colorProbe.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--line').trim() || '#000';
+  colorProbe.fillRect(0, 0, 1, 1);
+  const [r, g, b] = colorProbe.getImageData(0, 0, 1, 1).data;
+  void invoke('window_border', { color: [r, g, b] }).catch(() => {});
+}
+function bindWindowChrome() {
+  const chrome = document.querySelector<HTMLElement>('#window-chrome');
+  if (!chrome) return;
+  const root = document.documentElement;
+  root.classList.add('framed');
+  const control = (id: string, action: string) => {
+    document.querySelector<HTMLButtonElement>(id)!.onclick = () => { void invoke('window_control', { action }).catch(error => notice(String(error))); };
+  };
+  control('#window-minimize', 'minimize');
+  control('#window-maximize', 'maximize');
+  control('#window-close', 'close');
+  // Maximizing always resizes the viewport, so the glyph follows the resize
+  // event — including Win+↑, Aero Snap and a double click on the caption.
+  const maximize = document.querySelector<HTMLButtonElement>('#window-maximize')!;
+  const syncMaximized = async () => {
+    let maximized = false;
+    try { maximized = (await invoke<boolean>('window_maximized')) === true; } catch { return; }
+    root.classList.toggle('maximized', maximized);
+    const key = maximized ? 'window.restore' : 'window.maximize';
+    maximize.dataset.i18nTitle = key; maximize.dataset.i18nAriaLabel = key;
+    maximize.title = t(key); maximize.setAttribute('aria-label', t(key));
+  };
+  window.addEventListener('resize', () => void syncMaximized());
+  void syncMaximized();
+  // Like the system caption, the buttons dim while another window is active.
+  window.addEventListener('blur', () => root.classList.add('inactive'));
+  window.addEventListener('focus', () => root.classList.remove('inactive'));
+  // A modal dialog makes everything outside it inert — the caption included,
+  // so the window could be neither moved nor closed while one is open. The
+  // controls ride inside whichever dialog is modal and come back after.
+  const seat = () => {
+    const modal = [...document.querySelectorAll('dialog')].reverse().find(dialog => dialog.matches(':modal'));
+    const host = modal ?? app;
+    if (chrome.parentElement !== host) host.append(chrome);
+    chrome.classList.toggle('over-modal', !!modal);
+  };
+  new MutationObserver(seat).observe(app, { subtree: true, attributeFilter: ['open'] });
 }
 // The swatch sets one color; the shades around it follow the active theme, so
 // one accent works on both the dark and the light surface.
@@ -704,6 +768,7 @@ async function poll() {
   setTimeout(poll, 1000);
 }
 document.addEventListener('visibilitychange', () => { if (!document.hidden) void refresh(); });
+bindWindowChrome();
 applyTheme(preferences.theme);
 render();
 // The webview's default context menu (back/reload/print/view source) has no

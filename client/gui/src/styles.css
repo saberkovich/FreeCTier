@@ -48,6 +48,11 @@
   --accent-slot-1: #8b5cf6;
   --accent-slot-2: #22c1d6;
   --accent-slot-3: #3ecf8e;
+  /* The close button keeps the system's red under every theme and accent:
+     it is a convention, not a brand color. */
+  --window-close: #c42b1c;
+  --titlebar-h: 60px;
+  --controls-w: 144px;
   --avatar-s: 66%;
   --avatar-l: 44%;
   --ring: color-mix(in oklab, var(--accent) 45%, transparent);
@@ -155,9 +160,40 @@ code { font-family: var(--mono); font-size: .86em; font-weight: 500; }
 /* ── Shell ────────────────────────────────────────────────────────────── */
 .main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .topbar {
-  height: 60px; flex: none; display: flex; align-items: center; gap: 14px; padding: 0 28px;
-  border-bottom: 1px solid var(--line-soft);
+  height: var(--titlebar-h); flex: none; display: flex; align-items: center; gap: 14px; padding: 0 28px;
+  border-bottom: 1px solid var(--line-soft); user-select: none;
 }
+.framed .topbar { padding-right: calc(var(--controls-w) + 4px); }
+
+/* ── Window caption ───────────────────────────────────────────────────── */
+/* The frame is ours (`decorations: false`): the top bar drags the window and
+   the caption buttons sit at its right end, shaped like the rest of the app's
+   icon buttons rather than flush Win32 rectangles. */
+.window-chrome { display: contents; }
+.chrome-drag { display: none; }
+.window-controls {
+  position: fixed; top: 0; right: 0; z-index: 25; width: var(--controls-w); height: var(--titlebar-h);
+  display: flex; align-items: center; justify-content: flex-end; gap: 2px; padding: 0 10px 0 12px;
+}
+.window-controls::before { content: ""; width: 1px; height: 22px; margin-right: auto; background: var(--line); }
+.window-button {
+  width: 38px; height: 32px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 10px;
+  background: transparent; color: var(--muted); transition: background-color .12s ease, color .12s ease;
+}
+.window-button:hover { background: var(--surface-3); color: var(--text); }
+.window-button:active { background: var(--line); }
+.window-button.close:hover { background: var(--window-close); color: #fff; }
+.window-button.close:active { background: color-mix(in oklab, var(--window-close) 82%, #000); color: #fff; }
+.window-button svg { display: block; }
+.window-button .glyph-restore, .maximized .window-button .glyph-maximize { display: none; }
+.maximized .window-button .glyph-restore { display: block; }
+.inactive .window-button:not(:hover) { color: var(--faint); }
+/* Inside a modal dialog (see `bindWindowChrome`): a transparent strip keeps
+   the caption draggable above the backdrop, painted under the dialog's own
+   content so it never steals a click from it. */
+.over-modal .chrome-drag { display: block; position: fixed; inset: 0 0 auto; height: var(--titlebar-h); z-index: -1; }
+.over-modal .window-controls { z-index: 1; }
+.over-modal .window-controls::before { visibility: hidden; }
 .topbar-title { font: 600 15px var(--display); letter-spacing: -.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 0 2 auto; }
 .topbar-sub { color: var(--faint); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 0 100 auto; }
 .topbar-grow { flex: 1 0 8px; }
@@ -464,7 +500,10 @@ dialog#steam-help-dialog, dialog#welcome-dialog { width: min(620px, calc(100vw -
   #network-list { flex-direction: row; }
   .rail-grow { flex: 1 0 0; min-height: 0; }
   .rail-pill { display: none; }
-  .topbar { height: auto; flex-wrap: wrap; gap: 8px 12px; padding: 12px 18px; }
+  /* The rail strip is the top edge now, so the caption buttons sit on it. */
+  :root { --titlebar-h: 68px; }
+  .framed .rail { padding-right: calc(var(--controls-w) + 4px); }
+  .topbar, .framed .topbar { height: auto; flex-wrap: wrap; gap: 8px 12px; padding: 12px 18px; }
   .topbar-sub { flex: 1 1 100%; }
   .account-name { display: none; }
   .page { padding: 20px 18px 40px; }
@@ -477,8 +516,10 @@ dialog#steam-help-dialog, dialog#welcome-dialog { width: min(620px, calc(100vw -
   .search { width: 100%; flex: 1 1 140px; }
 }
 @media (prefers-reduced-motion: no-preference) {
+  /* Offset through `top`, not `translate`: a transform would make the dialog
+     the containing block of the fixed caption buttons riding inside it. */
   dialog[open] { animation: pop .14s ease-out; }
-  @keyframes pop { from { opacity: .6; translate: 0 6px; } to { opacity: 1; translate: 0 0; } }
+  @keyframes pop { from { opacity: .6; top: 12px; } to { opacity: 1; top: 0; } }
 }
 
 /* Language menu: flag and native name, opening a list of the others. Flags are

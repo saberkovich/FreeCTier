@@ -289,6 +289,45 @@ test('first run opens on the Steam library step and follows the license live', a
   await expect(dialog).toBeVisible();
 });
 
+test('custom window caption drives the window and stays usable over modal dialogs', async ({ page }) => {
+  await page.addInitScript(() => {
+    const fixture = { steam: 'online', steam_id: '2', nickname: 'Guest', relay: 'Ok', networks: [], friends: [], events: [], sent: 0, received: 0, dropped: 0 };
+    const calls: unknown[] = [];
+    let maximized = false;
+    Object.assign(window, { calls, isTauri: true, __TAURI_INTERNALS__: { invoke: async (command: string, args: { action?: string; color?: number[] }) => {
+      if (command === 'snapshot') return structuredClone(fixture);
+      if (command === 'settings') return { minimize_to_tray: true, check_updates: false, autostart: false, theme: 'dark', onboarded: true };
+      if (command === 'window_maximized') return maximized;
+      if (command === 'window_border') Object.assign(window, { border: args.color });
+      if (command === 'window_control') {
+        calls.push(args.action);
+        if (args.action === 'maximize') { maximized = !maximized; window.dispatchEvent(new Event('resize')); }
+      }
+    } } });
+  });
+  await page.goto('/');
+  // The DWM hairline takes the theme's `--line` (#2a161d in the dark preset).
+  await expect.poll(() => page.evaluate(() => (window as unknown as { border?: number[] }).border)).toEqual([0x2a, 0x16, 0x1d]);
+  await page.getByRole('button', { name: 'Свернуть', exact: true }).click();
+  await page.getByRole('button', { name: 'Развернуть' }).click();
+  await expect(page.getByRole('button', { name: 'Свернуть в окно' })).toBeVisible();
+  await expect(page.locator('#window-maximize .glyph-restore')).toBeVisible();
+  await expect(page.locator('#window-maximize .glyph-maximize')).toBeHidden();
+  await page.getByRole('button', { name: 'Свернуть в окно' }).click();
+  await expect(page.getByRole('button', { name: 'Развернуть' })).toBeVisible();
+  await page.screenshot({ path: '../../.cache/screenshots/caption.png' });
+  // A modal dialog makes the page inert; the caption moves into it instead.
+  await page.locator('#create').click();
+  await expect(page.locator('#create-dialog #window-chrome')).toHaveCount(1);
+  await page.screenshot({ path: '../../.cache/screenshots/caption-modal.png' });
+  await page.locator('#create-dialog #window-close').click();
+  expect(await page.evaluate(() => (window as unknown as { calls: unknown[] }).calls)).toEqual(['minimize', 'maximize', 'maximize', 'close']);
+  await page.keyboard.press('Escape');
+  await expect(page.locator('#app > #window-chrome')).toHaveCount(1);
+  await page.setViewportSize({ width: 720, height: 560 });
+  await page.screenshot({ path: '../../.cache/screenshots/caption-narrow.png' });
+});
+
 test('accent swatches recolor the app, persist and hand over to the custom editor', async ({ page }) => {
   await page.addInitScript(() => {
     const fixture = { steam: 'online', steam_id: '2', nickname: 'Guest', relay: 'Ok', networks: [], friends: [], events: [], sent: 0, received: 0, dropped: 0 };
