@@ -108,6 +108,14 @@ test('first run, keyboard create flow, browser fallback and responsive layout', 
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
   await page.screenshot({ path: '../../.cache/screenshots/mobile.png', fullPage: true });
   await page.locator('#settings').click();
+  // Below 760px the rail stacks on top of the page column; that column must
+  // still end at the window edge and scroll, not run off the bottom unseen.
+  await page.setViewportSize({ width: 720, height: 520 });
+  const scroller = await page.locator('#content').evaluate(el => ({ bottom: el.getBoundingClientRect().bottom, scrollable: el.scrollHeight > el.clientHeight }));
+  expect(scroller).toEqual({ bottom: 520, scrollable: true });
+  await page.locator('#content').evaluate(el => { el.scrollTop = el.scrollHeight; });
+  await expect(page.locator('#quit')).toBeInViewport();
+  await page.screenshot({ path: '../../.cache/screenshots/narrow-scroll.png' });
   await page.getByRole('button', { name: 'Диагностика' }).click();
   await expect(page.getByRole('heading', { name: 'Диагностика' })).toBeVisible();
   await expect(page.getByText('Браузерный просмотр — Steam недоступен')).toBeVisible();
